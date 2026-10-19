@@ -5,6 +5,7 @@
   ※本家 XRift（app.xrift.net）を SteamVR で遊ぶための非公式テストクライアントです。XRift 公式とは関係ありません。
 </p>
 <p align="center">
+  <a href="https://github.com/KinuX2/XRift-Client/releases/latest/download/XRift-Client-win-x64.zip"><img src="https://img.shields.io/badge/DOWNLOAD-WINDOWS%20(ZIP)-565b63?style=for-the-badge&logo=download" alt="Windows 版をダウンロード"></a>
   <a href="https://github.com/KinuX2/XRift-Client/blob/main/LICENSE"><img src="https://img.shields.io/github/license/KinuX2/XRift-Client?style=for-the-badge" alt="ライセンス"></a>
   <img src="https://img.shields.io/badge/PLATFORM-WINDOWS%20%2B%20STEAMVR-565b63?style=for-the-badge" alt="Windows + SteamVR">
   <img src="https://img.shields.io/badge/STATUS-TEST-c08a2b?style=for-the-badge" alt="テスト版">
@@ -12,12 +13,12 @@
 
 # XRift-Client
 ### -XRift クライアント（非公式テスト）-
+  <a href="https://github.com/KinuX2/XRift-Client/releases/latest"><img src="https://img.shields.io/github/v/release/KinuX2/XRift-Client?style=for-the-badge&label=VERSION" alt="最新リリース"></a>
 
 - 本家フロントエンド（app.xrift.net）をそのまま表示する専用ブラウザ。ログイン・インスタンス・マルチプレイ・ボイス・アバター・UI は本家のまま
 - ページの WebXR（`navigator.xr`）を差し替えて、SteamVR（OpenVR）へ出力。VRChat などと同じ経路なので ALVR でも表示できる
 - 解像度は SteamVR の推奨値どおり（SteamVR の解像度設定に従う）
-- SteamVR のライブラリから起動できる（`npm run register`）
-- おまけ: Node.js + WebGPU（Dawn）+ three.js XRManager で公開ワールドを直接描く実験モード
+- SteamVR のライブラリから起動できる（アプリのメニューから登録）
 
 ## 動作確認した環境
 
@@ -32,8 +33,15 @@
 
 ## インストール
 
-必要なもの: Windows 10/11（x64）、SteamVR、Node.js 22.15 以上。
-ビルドに Visual Studio 2022（C++ によるデスクトップ開発）、CMake、Windows SDK が必要です。
+1. 上のボタン（または [Releases](https://github.com/KinuX2/XRift-Client/releases/latest)）から `XRift-Client-win-x64.zip` をダウンロードして、好きな場所に解凍
+2. SteamVR を起動しておく
+3. `XRiftVR.exe` を起動し、メニュー「XRift」→「SteamVR のライブラリに登録」（初回のみ）
+
+必要なもの: Windows 10/11（x64）、SteamVR。
+
+### ソースからビルドする場合
+
+Node.js 22.15 以上、Visual Studio 2022（C++ によるデスクトップ開発）、CMake、Windows SDK が必要です。
 
 ```powershell
 git clone https://github.com/KinuX2/XRift-Client.git
@@ -42,6 +50,8 @@ npm install
 node node_modules/electron/install.js   # Electron 本体の取得（npm のインストールスクリプトが無効な環境のみ）
 npm run build:native                     # bin/xrift_openxr.node と XRiftVR.exe をビルド
 npm run register                         # SteamVR のライブラリに「XRift VR」を登録（SteamVR を起動しておく）
+npm start                                # 起動
+npm run package                          # 配布用 zip（dist/XRift-Client-win-x64.zip）を作る
 ```
 
 ## 使い方
@@ -56,8 +66,7 @@ npm run register                         # SteamVR のライブラリに「XRift
 | `--world <ワールドID>` | そのワールドのページを開く |
 | `--scale <倍率>` | SteamVR 推奨解像度に対する倍率（既定 1） |
 | `--backend openxr` | OpenVR ではなく OpenXR で出力する（既定は openvr） |
-| `npm run register -- --world <ID>` | SteamVR から起動したときに開くワールドを固定 |
-| `npm run register -- --remove` | SteamVR の登録を解除 |
+| `--register` / `--unregister` | ウィンドウを出さずに SteamVR へ登録 / 解除して終了（`--world` と組み合わせると開くワールドを固定） |
 
 ログイン状態は Electron のユーザーデータ（`%APPDATA%\XRift VR`）に保存され、リポジトリには含まれません。
 動作ログは `%LOCALAPPDATA%\xrift-openxr-client\browser.log` に出ます（不具合の報告に使えますが、公開する前に中身を確認してください）。
@@ -88,17 +97,6 @@ SteamVR（OpenVR）→ ALVR など
 - コントローラの「指す向き」は OpenVR のコントローラ姿勢をそのまま使っているため、ブラウザ版とレーザーの角度が少し違うことがあります
 - `--backend openxr` は環境によって SteamVR が表示状態に進まないことがあります（ALVR + SteamVR 2.17 で確認）。その場合は既定の OpenVR を使ってください
 
-## 実験モード（Node.js クライアント）
-
-Electron を使わず、Node.js + WebGPU（npm `webgpu` / Dawn）+ three.js の XRManager で公開ワールドを直接描きます。
-ログインが必要な機能（マルチプレイ・ボイスなど）はありません。
-
-```powershell
-npm run list                                   # 公開ワールドの一覧
-npm run native -- --world "XRift The Lobby"    # VR で入る
-node src/main.js --world <ID> --screenshot out.png   # HMD なしで描画を確認
-```
-
 ## テスト
 
 ```powershell
@@ -106,9 +104,10 @@ npm run browser:selftest                                         # three の Web
 npx electron . --selftest --selftest-page selftest-r3f.html       # 本家と同じ R3F + @react-three/xr 構成
 npx electron . --selftest --selftest-page selftest-heavy.html --selftest-seconds 60   # 負荷テスト
 node test/openvr-smoke.cjs                                       # ネイティブ層だけで SteamVR に単色を送る
+node test/native-smoke.cjs                                       # 同じく OpenXR 経路
 ```
 
-VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環境では、その変数を外してから `npx electron` を実行してください（`XRiftVR.exe` は自動で外します）。
+VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環境では、その変数を外してから `npx electron` を実行してください（配布版の `XRiftVR.exe` はこの変数を無視します）。
 
 ## 開発について
 

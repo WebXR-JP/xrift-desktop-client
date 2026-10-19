@@ -4,8 +4,7 @@
 //   npm run register -- --remove  登録解除
 //   npm run register -- --world <id>  既定で入るワールドを固定して登録
 //
-// SteamVR は node.exe を直接起動する（OpenXR アプリのプロセスと起動したプロセスが一致するので、
-// SteamVR 側で「起動中のアプリ」として正しく扱われる）。
+// SteamVR は Electron（専用ブラウザ）を直接起動する。
 
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -18,7 +17,7 @@ const require = createRequire(import.meta.url)
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const APP_KEY = 'net.xrift.openxr-client'
 
-const { values } = parseArgs({ options: { remove: { type: 'boolean' }, world: { type: 'string' }, scale: { type: 'string' }, native: { type: 'boolean' } } })
+const { values } = parseArgs({ options: { remove: { type: 'boolean' }, world: { type: 'string' }, scale: { type: 'string' } } })
 
 function findSteamVR() {
   const vrpath = join(process.env.LOCALAPPDATA ?? '', 'openvr', 'openvrpaths.vrpath')
@@ -77,11 +76,9 @@ mkdirSync(assets, { recursive: true })
 const icon = join(assets, 'steamvr-library.png')
 makeIcon(icon)
 
-// 既定は専用ブラウザ（Electron で本家 app.xrift.net）。--native で Node.js クライアント
-const electronExe = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
-const binary = values.native ? process.execPath : electronExe
+const binary = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
 if (!existsSync(binary)) throw new Error(`起動ファイルがありません: ${binary}（npm install を実行してください）`)
-const args = values.native ? [`"${join(root, 'src', 'main.js')}"`] : [`"${root}"`]
+const args = [`"${root}"`]
 if (values.world) args.push('--world', `"${values.world}"`)
 if (values.scale) args.push('--scale', values.scale)
 

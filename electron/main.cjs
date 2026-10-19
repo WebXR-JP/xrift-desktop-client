@@ -107,6 +107,30 @@ function buildMenu(win) {
         },
         { label: 'VR を終了', accelerator: 'CmdOrCtrl+Shift+X', click: () => wc.executeJavaScript('navigator.xr && navigator.xr._active && navigator.xr._active.end()') },
         { type: 'separator' },
+        {
+          label: 'SteamVR のライブラリに登録',
+          click: () => {
+            try {
+              const file = require('./steamvr-register.cjs').registerSteamVR()
+              logLine('[xrift] registered to SteamVR: ' + file)
+              dialog.showMessageBox(win, { type: 'info', title: 'XRift VR', message: 'SteamVR のライブラリに「XRift VR」を登録しました。' })
+            } catch (err) {
+              dialog.showMessageBox(win, { type: 'error', title: 'XRift VR', message: '登録できませんでした: ' + err.message + '（SteamVR を起動してから試してください）' })
+            }
+          },
+        },
+        {
+          label: 'SteamVR の登録を解除',
+          click: () => {
+            try {
+              require('./steamvr-register.cjs').unregisterSteamVR()
+              dialog.showMessageBox(win, { type: 'info', title: 'XRift VR', message: '登録を解除しました。' })
+            } catch (err) {
+              dialog.showMessageBox(win, { type: 'error', title: 'XRift VR', message: '解除できませんでした: ' + err.message })
+            }
+          },
+        },
+        { type: 'separator' },
         { role: 'togglefullscreen', label: 'フルスクリーン' },
         { role: 'toggleDevTools', label: '開発者ツール', accelerator: 'F12' },
         { type: 'separator' },
@@ -184,7 +208,8 @@ async function createWindow() {
     await win.loadFile(path.join(__dirname, page[0]), page[1] ? { search: page[1] } : undefined)
     setTimeout(async () => {
       const img = await win.webContents.capturePage()
-      require('node:fs').writeFileSync(path.join(__dirname, '..', 'test', 'browser-selftest.png'), img.toPNG())
+      const out = app.isPackaged ? path.join(app.getPath('temp'), 'xrift-browser-selftest.png') : path.join(__dirname, '..', 'test', 'browser-selftest.png')
+      require('node:fs').writeFileSync(out, img.toPNG())
       console.log('[xrift] selftest capture saved')
       await win.webContents.executeJavaScript('navigator.xr._active && navigator.xr._active.end()')
       setTimeout(() => app.quit(), 1500)
@@ -214,5 +239,21 @@ app.on('second-instance', () => {
     w.focus()
   }
 })
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  // XRiftVR.exe --register / --unregister: ウィンドウを出さずに SteamVR へ登録して終了
+  if (argv.includes('--register') || argv.includes('--unregister')) {
+    try {
+      const reg = require('./steamvr-register.cjs')
+      if (argv.includes('--unregister')) reg.unregisterSteamVR()
+      else logLine('[xrift] registered to SteamVR: ' + reg.registerSteamVR({ world }))
+      app.exit(0)
+    } catch (err) {
+      logLine('[xrift] register failed: ' + err.message)
+      dialog.showErrorBox('XRift VR', '登録できませんでした: ' + err.message)
+      app.exit(1)
+    }
+    return
+  }
+  createWindow()
+})
 app.on('window-all-closed', () => app.quit())

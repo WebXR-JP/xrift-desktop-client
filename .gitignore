@@ -9,3 +9,4 @@ test/*.png
 *.log
 *.dmp
 .env*
+/dist/
