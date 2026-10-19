@@ -106,7 +106,7 @@ SteamVR（OpenVR）→ ALVR など
 
 - `src/` が TypeScript のソースです（`src/electron/*.cts`、`src/scripts/*.ts`、`src/test/*.cts`）。`tsc` でビルドすると `electron/`、`scripts/`、`test/` に同じ配置の `.cjs`/`.js` を生成します
 - 生成物（`electron/main.cjs`、`electron/preload.cjs`、`electron/steamvr-register.cjs`、`scripts/*.js`、`test/*.cjs`）はリポジトリで管理しないので、直接編集しないでください
-- `electron/webxr-mainworld.cjs` だけは例外です。`executeInMainWorld` に渡す関数は自己完結している必要があるため手書きのままで、ビルド対象外です（`test/mainworld-contract.cjs` が形を固定しています）
+- `electron/webxr-mainworld.cjs` だけは例外です。`executeInMainWorld` に渡す関数は自己完結している必要があるため手書きのままで、ビルド対象外です（`test/mainworld-contract.cjs` が外部モジュールに依存しない形とインストール動作を検査しています）
 
 ## 困ったとき
 

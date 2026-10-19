@@ -77,7 +77,7 @@ const icon = join(assets, 'steamvr-library.png')
 makeIcon(icon)
 
 const binary = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
-if (!existsSync(binary)) throw new Error(`起動ファイルがありません: ${binary}（pnpm install を実行してください）`)
+if (!existsSync(binary)) throw new Error(`起動ファイルがありません: ${binary}（pnpm install と pnpm electron:install を実行してください）`)
 const args = [`"${root}"`]
 if (values.world) args.push('--world', `"${values.world}"`)
 if (values.scale) args.push('--scale', values.scale)

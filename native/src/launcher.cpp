@@ -43,7 +43,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   {
     std::wstring electron = root + L"\\node_modules\\electron\\dist\\electron.exe";
     if (!FileExists(electron)) {
-      MessageBoxW(nullptr, L"Electron が見つかりません。プロジェクトのフォルダで npm install を実行してください。", L"XRift VR", MB_ICONERROR);
+      MessageBoxW(nullptr, L"Electron が見つかりません。プロジェクトのフォルダで pnpm install と pnpm electron:install を実行してください。", L"XRift VR", MB_ICONERROR);
       return 1;
     }
     std::wstring cmdline = L"\"" + electron + L"\" \"" + root + L"\"";

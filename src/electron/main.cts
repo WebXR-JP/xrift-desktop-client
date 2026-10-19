@@ -198,12 +198,10 @@ async function createWindow(): Promise<BrowserWindow> {
       shell.openExternal(url)
     }
   })
-  // console-message の引数形は Electron の版で変わるため、実行時と同じ単一引数の受け方に絞って型を付ける。
-  // ADR: Electron 44 の型は (event, details) だが、実行時の挙動（先頭引数から message/level を読む）を保つため
-  // unknown 受け＋最小限の構造キャストに留める。ログ条件式自体は変更しない。
-  win.webContents.on('console-message', (e: unknown) => {
-    const m = e as { message?: unknown; level?: unknown }
-    if (typeof m.message === 'string' && (m.message.includes('[XRift VR]') || m.level === 'error')) logLine(m.message.replace(/%c|color:#a07cff/g, '').trim().slice(0, 2000))
+  // Electron 44 の型は先頭引数 Event<WebContentsConsoleMessageEventParams> で message/level を持つ。
+  // 移行前と同じく先頭引数から読む。ログ条件式は変更しない。
+  win.webContents.on('console-message', (details) => {
+    if (typeof details.message === 'string' && (details.message.includes('[XRift VR]') || details.level === 'error')) logLine(details.message.replace(/%c|color:#a07cff/g, '').trim().slice(0, 2000))
   })
   win.webContents.on('render-process-gone', (_e, d) => logLine(`[xrift] renderer gone: ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
   app.on('child-process-gone', (_e, d) => logLine(`[xrift] child process gone: ${d.type} ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
