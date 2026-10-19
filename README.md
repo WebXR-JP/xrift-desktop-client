@@ -50,11 +50,14 @@ git clone https://github.com/KinuX2/XRift-Client.git
 cd XRift-Client
 pnpm install
 pnpm electron:install   # Electron 本体の取得（pnpm のインストールでは取得されないため）
+pnpm build              # src/ の TypeScript から実行用の .cjs/.js を生成（下のコマンドは実行前に自動生成される）
 pnpm build:native                     # bin/xrift_openxr.node と XRiftVR.exe をビルド
 pnpm register                         # SteamVR のライブラリに「XRift VR」を登録（SteamVR を起動しておく）
 pnpm start                                # 起動
 pnpm package                          # 配布用 zip（dist/XRift-Client-win-x64.zip）を作る
 ```
+
+型チェックだけなら `pnpm typecheck`、ビルドと contract テスト（下記）をまとめて行うなら `pnpm verify` を使います。
 
 ## 使い方
 
@@ -99,6 +102,12 @@ SteamVR（OpenVR）→ ALVR など
 - SteamVR は提出やフレーム待ちの中でアプリの D3D11 コンテキストを使うため、D3D11 のマルチスレッド保護を有効にしています
 - 5秒ごとのログには、`submitTiming`（描画終了→SteamVR の Submit、upload 完了→Submit、Submit/Handoff の内訳）と `frameTiming`（SteamVR 側の GPU・コンポジタ・転送）も出ます。`renderToSubmit` は描画終了タグが有効なフレームだけの平均です
 
+### ソースの構成
+
+- `src/` が TypeScript のソースです（`src/electron/*.cts`、`src/scripts/*.ts`、`src/test/*.cts`）。`tsc` でビルドすると `electron/`、`scripts/`、`test/` に同じ配置の `.cjs`/`.js` を生成します
+- 生成物（`electron/main.cjs`、`electron/preload.cjs`、`electron/steamvr-register.cjs`、`scripts/*.js`、`test/*.cjs`）はリポジトリで管理しないので、直接編集しないでください
+- `electron/webxr-mainworld.cjs` だけは例外です。`executeInMainWorld` に渡す関数は自己完結している必要があるため手書きのままで、ビルド対象外です（`test/mainworld-contract.cjs` が形を固定しています）
+
 ## 困ったとき
 
 | 症状 | 対処 |
@@ -123,6 +132,8 @@ pnpm exec electron . --selftest --selftest-page selftest-heavy.html --selftest-s
 node test/openvr-smoke.cjs                                       # ネイティブ層だけで SteamVR に単色を送る
 node test/native-smoke.cjs                                       # 同じく OpenXR 経路
 ```
+
+`browser:selftest` は実行前に自動でビルドされます。`pnpm exec electron ...` で直接起動する場合は、先に `pnpm build` が必要です。
 
 VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環境では、その変数を外してから `pnpm exec electron` を実行してください（配布版の `XRiftVR.exe` はこの変数を無視します）。
 

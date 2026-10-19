@@ -22,7 +22,7 @@ for (const f of ['bin/xrift_openxr.node', 'bin/openxr_loader.dll', 'bin/openvr_a
 }
 
 // exe のアイコン（PNG を埋め込んだ ICO）
-async function makeIco(png, out) {
+async function makeIco(png: string | Buffer, out: string): Promise<void> {
   const img = await loadImage(readFileSync(png))
   const sizes = [256, 64, 48, 32, 16]
   const pngs = sizes.map((s) => {
@@ -50,7 +50,7 @@ async function makeIco(png, out) {
 
 mkdirSync(dist, { recursive: true })
 const ico = join(dist, 'icon.ico')
-await makeIco(join(root, 'assets', 'icon.png'), ico)
+await makeIco(readFileSync(join(root, 'assets', 'icon.png')), ico)
 
 const keep = [/^\/package\.json$/, /^\/electron(\/|$)/, /^\/bin(\/|$)/, /^\/assets(\/|$)/, /^\/LICENSE$/, /^\/README\.md$/]
 const [appDir] = await packager({

@@ -19,9 +19,9 @@ const APP_KEY = 'net.xrift.openxr-client'
 
 const { values } = parseArgs({ options: { remove: { type: 'boolean' }, world: { type: 'string' }, scale: { type: 'string' } } })
 
-function findSteamVR() {
+function findSteamVR(): string {
   const vrpath = join(process.env.LOCALAPPDATA ?? '', 'openvr', 'openvrpaths.vrpath')
-  const candidates = []
+  const candidates: string[] = []
   if (existsSync(vrpath)) {
     try {
       candidates.push(...(JSON.parse(readFileSync(vrpath, 'utf8')).runtime ?? []))
@@ -35,7 +35,7 @@ function findSteamVR() {
   throw new Error('SteamVR が見つかりません（openvrpaths.vrpath / 既定のインストール先）')
 }
 
-function makeIcon(file) {
+function makeIcon(file: string): void {
   // SteamVR のライブラリ用サムネイル（460x215 推奨）
   const c = createCanvas(460, 215)
   const ctx = c.getContext('2d')

@@ -12,7 +12,7 @@ for (let y = 0; y < info.height; y++) for (let x = 0; x < info.width * 2; x++) {
     for (const e of s.pollEvents()) console.log('event', e)
     let a = performance.now(); const fs = await s.waitFrame(); tw += performance.now() - a
     s.beginFrame(); const lv = s.locateViews(); const inp = s.syncInput()
-    if (n === 100) console.log('views', lv.valid, [...lv.views[0].position].map(v => v.toFixed(2)), 'fov', [...lv.views[0].fov].map(v => v.toFixed(2)), 'hands', inp.map(h => `${h.handedness}:${h.connected}:${h.profile}`))
+    if (n === 100) console.log('views', lv.valid, [...lv.views[0].position].map((v: number) => v.toFixed(2)), 'fov', [...lv.views[0].fov].map((v: number) => v.toFixed(2)), 'hands', inp.map((h: { handedness: string; connected: boolean; profile: string }) => `${h.handedness}:${h.connected}:${h.profile}`))
     if (fs.shouldRender) ok++
     a = performance.now(); s.submitLatched(buf.buffer, 0, info.width * 4, pitch, lv.seq); ts += performance.now() - a
     s.endFrame(); n++

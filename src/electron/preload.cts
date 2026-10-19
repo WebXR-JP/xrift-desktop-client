@@ -3,10 +3,10 @@
 // ページ（app.xrift.net）にはユーザーが作ったワールドのコードも載るので、Node の機能は渡さない。
 // 公開するのはフレームループに必要な関数（姿勢の取得、ピクセルの送信、振動など）だけ。
 
-const { contextBridge } = require('electron')
-const path = require('node:path')
+import { contextBridge } from 'electron'
+import path = require('node:path')
 
-const arg = (name, def) => {
+const arg = (name: string, def: string): string => {
   const hit = process.argv.find((a) => a.startsWith(`--xrift-${name}=`))
   return hit ? hit.slice(`--xrift-${name}=`.length) : def
 }
@@ -17,17 +17,28 @@ const forceRender = arg('force-render', '0') === '1'
 const backend = arg('backend', 'openvr')
 const addonPath = arg('addon', path.join(__dirname, '..', 'bin', 'xrift_openxr.node'))
 
-let native = null
-let session = null
-const loadNative = () => (native ??= require(addonPath))
+// ネイティブアドオンに型定義は無いため any 境界とする（呼び出し側も any として扱う）。
+let native: any = null
+let session: any = null
+const loadNative = (): any => (native ??= require(addonPath))
 
 // ---- キャンバス → OpenXR（Chromium の WebGPU で GPU 上コピー → 非同期読み戻し）
 // DOM 要素は分離ワールドとも共有されるので、ページのキャンバスをここで直接読める。
-let gpuDevice = null
-let staging = null // { texture, buffers: [GPUBuffer, GPUBuffer], w, h, bpr }
+let gpuDevice: GPUDevice | null = null
+/** mapAsync 中の再利用を避ける使用中フラグを付けた読み戻しバッファ。 */
+type StagingBuffer = GPUBuffer & { __busy?: boolean }
+/** 読み戻し用のテクスチャとリングバッファ。作り直しと破棄は ensureStaging が行う。 */
+interface Staging {
+  texture: GPUTexture
+  buffers: StagingBuffer[]
+  w: number
+  h: number
+  bpr: number
+}
+let staging: Staging | null = null // { texture, buffers: [GPUBuffer, GPUBuffer], w, h, bpr }
 let ring = 0
 
-async function prepareGPU() {
+async function prepareGPU(): Promise<{ ok: boolean; error?: string }> {
   if (gpuDevice) return { ok: true }
   if (!navigator.gpu) return { ok: false, error: 'navigator.gpu がありません' }
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
@@ -41,8 +52,10 @@ async function prepareGPU() {
   return { ok: true }
 }
 
-function ensureStaging(w, h) {
+function ensureStaging(w: number, h: number): Staging {
   if (staging && staging.w === w && staging.h === h) return staging
+  // gpuDevice が null でないことは呼び出し元の present が保証する（先頭でガード済み）。
+  const device = gpuDevice as GPUDevice
   if (staging) {
     staging.texture.destroy()
     staging.buffers.forEach((b) => b.destroy())
@@ -52,19 +65,34 @@ function ensureStaging(w, h) {
     w,
     h,
     bpr,
-    texture: gpuDevice.createTexture({
+    texture: device.createTexture({
       size: [w, h],
       format: 'rgba8unorm',
       usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
     }),
-    buffers: [0, 1, 2].map(() => gpuDevice.createBuffer({ size: bpr * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })),
+    buffers: [0, 1, 2].map(() => device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })),
   }
   return staging
 }
 
 // 読み戻し → スワップチェーン書き込みは前のフレームのものと直列につなぐ（描画とは並行に進む）
-let chain = Promise.resolve()
-const stats = {
+let chain: Promise<unknown> = Promise.resolve()
+/** 5秒ごとの計測値。stats() が読み出して初期化する。 */
+interface BridgeStats {
+  dropped: number
+  n: number
+  map: number
+  sub: number
+  wait: number
+  notify: number
+  frames: number
+  detail: Record<string, number>
+  onTime: number
+  late: number
+  submitTiming: { n: number; renderToSubmit: number; uploadToSubmit: number; call: number; first: number; handoff: number; calls: number; lastSeq: number }
+  frameTiming: { n: number; appFrame: number; preSubmitGpu: number; submitFrame: number; idle: number; compositorGpu: number; transfer: number; clientInterval: number; droppedFrames: number; misPresented: number; lastFrameIndex: number }
+}
+const stats: BridgeStats = {
   dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0, detail: {}, onTime: 0, late: 0,
   submitTiming: { n: 0, renderToSubmit: 0, uploadToSubmit: 0, call: 0, first: 0, handoff: 0, calls: 0, lastSeq: 0 },
   frameTiming: {
@@ -79,7 +107,7 @@ const stats = {
  * seq は locateViews() が返した、その画像を描いたときの姿勢の番号。
  * 先頭で取る QPC 時刻は「描画終了 → SteamVR の Submit」を測るためのタグ
  */
-function present(canvas, eyeW, eyeH, seq) {
+function present(canvas: HTMLCanvasElement, eyeW: number, eyeH: number, seq: number): Promise<unknown> | null {
   if (!gpuDevice || !session) return null
   // 古いアドオンでは nowQpcMs が無い。その場合はタグなし（計測だけ無効）
   const tag = typeof session.nowQpcMs === 'function' ? session.nowQpcMs() : 0
@@ -111,7 +139,7 @@ function present(canvas, eyeW, eyeH, seq) {
       const data = buf.getMappedRange()
       if (typeof s.submitLatchedAsync === 'function') {
         // コピーはネイティブの別スレッドで行い、ページのメインスレッドを空ける
-        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq, tag).then((r) => {
+        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq, tag).then((r: Record<string, number>) => {
           stats.sub += performance.now() - t2
           stats.n++
           if (r) for (const [k, v] of Object.entries(r)) stats.detail[k] = (stats.detail[k] || 0) + v
@@ -136,14 +164,14 @@ function present(canvas, eyeW, eyeH, seq) {
 const bridge = {
   prepareGPU,
   present,
-  probe() {
+  probe(): { ok: boolean; error?: string } {
     try {
       return backend === 'openxr' ? loadNative().probeRuntime() : loadNative().probeOpenVR()
     } catch (err) {
-      return { ok: false, error: String(err && err.message) }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   },
-  createSession() {
+  createSession(): { error?: string } {
     try {
       if (session) session.destroy()
       const n = loadNative()
@@ -152,11 +180,11 @@ const bridge = {
       return session.getInfo()
     } catch (err) {
       session = null
-      return { error: String(err && err.message) }
+      return { error: err instanceof Error ? err.message : String(err) }
     }
   },
   pollEvents: () => (session ? session.pollEvents() : [{ type: 'exit', detail: 'no session' }]),
-  async waitFrame() {
+  async waitFrame(): Promise<{ shouldRender: boolean; predictedDisplayPeriodMs: number }> {
     const fs = await session.waitFrame()
     if (fs.fresh === true) stats.onTime++
     else if (fs.fresh === false) stats.late++
@@ -201,18 +229,18 @@ const bridge = {
   locateViews: () => session.locateViews(),
   syncInput: () => session.syncInput(),
   // 両眼が横並びになった 1 枚の RGBA（上の行から）を受け取り、左右のスワップチェーンへ送る
-  submitStereo(pixels, eyeWidth, rowPitch) {
+  submitStereo(pixels: BufferSource, eyeWidth: number, rowPitch: number): void {
     session.submit(0, pixels, 0, rowPitch)
     session.submit(1, pixels, eyeWidth * 4, rowPitch)
   },
-  setLatencyMode(immediate) {
+  setLatencyMode(immediate: boolean): void {
     if (session && typeof session.setLatencyMode === 'function') session.setLatencyMode(!!immediate)
   },
-  stats() {
+  stats(): Record<string, unknown> {
     const f = stats.frames || 1
     const st = stats.submitTiming
     const ft = stats.frameTiming
-    const avg = (v, n) => (n ? +(v / n).toFixed(2) : null)
+    const avg = (v: number, n: number): number | null => (n ? +(v / n).toFixed(2) : null)
     const r = {
       dropped: stats.dropped,
       map: stats.n ? +(stats.map / stats.n).toFixed(1) : 0,
@@ -256,9 +284,9 @@ const bridge = {
     return r
   },
   endFrame: () => session.endFrame(),
-  haptics: (hand, amplitude, durationMs) => session && session.applyHaptics(hand, amplitude, durationMs),
+  haptics: (hand: unknown, amplitude: number, durationMs: number) => session && session.applyHaptics(hand, amplitude, durationMs),
   requestExit: () => session && session.requestExit(),
-  destroy() {
+  destroy(): void {
     if (session) {
       try {
         session.destroy()

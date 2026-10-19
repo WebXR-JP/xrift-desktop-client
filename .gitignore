@@ -5,6 +5,12 @@ native/build/
 /xrift.vrmanifest
 assets/steamvr-library.png
 test/*.png
+# TypeScript のビルド生成物（src/ が原本。webxr-mainworld.cjs は手書きのまま追跡する）
+/electron/main.cjs
+/electron/preload.cjs
+/electron/steamvr-register.cjs
+/scripts/*.js
+/test/*.cjs
 # ログ・ダンプ・ローカル設定（個人の環境情報を含むので公開しない）
 *.log
 *.dmp

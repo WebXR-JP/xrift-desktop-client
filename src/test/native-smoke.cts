@@ -3,7 +3,7 @@ const { OpenXRSession } = require('../bin/xrift_openxr.node')
 const s = new OpenXRSession({ appName: 'XRift smoke test', resolutionScale: 0.5 })
 const info = s.getInfo()
 console.log(info)
-const bufs = [0, 1].map((eye) => {
+const bufs = [0, 1].map((eye: number) => {
   const b = new Uint8Array(info.width * info.height * 4)
   const c = eye === 0 ? [40, 90, 220, 255] : [230, 140, 40, 255]
   if (info.colorFormat === 'bgra8unorm') [c[0], c[2]] = [c[2], c[0]]
