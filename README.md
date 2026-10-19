@@ -97,6 +97,7 @@ SteamVR（OpenVR）→ ALVR など
 - WebXR の `local-floor` の原点は、ブラウザと同じく「VR に入ったときの立ち位置と向き」にしています（SteamVR のプレイエリアの中心ではない）
 - コントローラのビームの向きは SteamVR のレンダーモデルの `tip`、握りの位置は `handgrip` の姿勢を使っています（WebXR の targetRaySpace / gripSpace に相当）
 - SteamVR は提出やフレーム待ちの中でアプリの D3D11 コンテキストを使うため、D3D11 のマルチスレッド保護を有効にしています
+- 5秒ごとのログには、`submitTiming`（描画終了→SteamVR の Submit、upload 完了→Submit、Submit/Handoff の内訳）と `frameTiming`（SteamVR 側の GPU・コンポジタ・転送）も出ます。`renderToSubmit` は描画終了タグが有効なフレームだけの平均です
 
 ## 困ったとき
 
