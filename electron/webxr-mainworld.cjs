@@ -102,16 +102,17 @@ module.exports = function installXRiftWebXR() {
     constructor(session, fn) { super(); this._session = session; this._fn = fn }
     _poseInApp(frame) { return this._fn(frame) }
   }
+  // 基準空間: base(frame) がアプリ空間（SteamVR の立位空間）でのこの空間の原点、offset はさらにずらす量
   class XRReferenceSpace extends XRSpace {
-    constructor(session, type, origin = IDENTITY) {
-      super(session, () => origin)
+    constructor(session, type, base = () => IDENTITY, offset = IDENTITY) {
+      super(session, (f) => multiply(base(f), offset))
       this.type = type
-      this._origin = origin
+      this._base = base
+      this._offset = offset
       this.onreset = null
     }
     getOffsetReferenceSpace(originOffset) {
-      const s = new XRReferenceSpace(this._session, this.type, multiply(this._origin, matrixOf(originOffset)))
-      s._fn = this._viewer ? this._fn : s._fn
+      const s = new XRReferenceSpace(this._session, this.type, this._base, multiply(this._offset, matrixOf(originOffset)))
       return s
     }
   }
@@ -273,15 +274,26 @@ module.exports = function installXRiftWebXR() {
     }
     updateTargetFrameRate() { return Promise.resolve() }
     async requestReferenceSpace(type) {
-      if (type === 'viewer') {
-        const v = new XRReferenceSpace(this, 'viewer')
-        v._viewer = true
-        v._fn = (f) => f._d.head
-        return v
-      }
-      if (type === 'local' || type === 'local-floor' || type === 'unbounded') return new XRReferenceSpace(this, type)
+      // WebXR と同じく local / local-floor は「VR に入ったときの立ち位置と向き」が原点（local は目の高さ、
+      // local-floor は床の高さ）。bounded-floor / unbounded は SteamVR のプレイエリア（立位空間）のまま
+      if (type === 'viewer') return new XRReferenceSpace(this, 'viewer', (f) => f._d.head)
+      if (type === 'local') return new XRReferenceSpace(this, type, () => this._localOrigin(true))
+      if (type === 'local-floor') return new XRReferenceSpace(this, type, () => this._localOrigin(false))
+      if (type === 'unbounded') return new XRReferenceSpace(this, type)
       if (type === 'bounded-floor') return new XRBoundedReferenceSpace(this, type)
       throw new DOMException(`reference space "${type}" is not supported`, 'NotSupportedError')
+    }
+    // 最初に頭の位置が取れたフレームで、立ち位置（水平位置）と向き（ヨーだけ）を記録する
+    _captureOrigin(head) {
+      if (this._origin) return
+      const yaw = Math.atan2(head[8], head[10])
+      const c = Math.cos(yaw), s = Math.sin(yaw)
+      this._origin = { x: head[12], y: head[13], z: head[14], c, s }
+    }
+    _localOrigin(eyeLevel) {
+      const o = this._origin
+      if (!o) return IDENTITY
+      return new Float32Array([o.c, 0, -o.s, 0, 0, 1, 0, 0, o.s, 0, o.c, 0, o.x, eyeLevel ? o.y : 0, o.z, 1])
     }
     requestAnimationFrame(cb) { const h = this._handle++; this._callbacks.set(h, cb); return h }
     cancelAnimationFrame(h) { this._callbacks.delete(h) }
@@ -336,6 +348,7 @@ module.exports = function installXRiftWebXR() {
         grip: h.grip ? quatToMat(h.grip.position, h.grip.orientation) : null,
         aim: h.aim ? quatToMat(h.aim.position, h.aim.orientation) : null,
       }))
+      if (lv.valid) this._captureOrigin(head)
       const frame = new XRFrame(this, { time: performance.now(), viewsValid: lv.valid, positionTracked: lv.positionTracked, views, head, hands })
       this._inputs(hands, frame)
       const layer = this.renderState.baseLayer
