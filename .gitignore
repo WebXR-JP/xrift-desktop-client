@@ -1,0 +1,11 @@
+node_modules/
+native/build/
+/bin/
+/XRiftVR.exe
+/xrift.vrmanifest
+assets/steamvr-library.png
+test/*.png
+# ログ・ダンプ・ローカル設定（個人の環境情報を含むので公開しない）
+*.log
+*.dmp
+.env*

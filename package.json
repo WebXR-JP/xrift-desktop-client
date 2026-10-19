@@ -1,0 +1,44 @@
+{
+  "name": "xrift-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "XRift クライアント（非公式テスト）: 本家 app.xrift.net を SteamVR で遊ぶ専用ブラウザ",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build:native": "node scripts/build-native.js",
+    "start": "electron .",
+    "list": "node src/main.js --list",
+    "register": "node scripts/register-steamvr.js",
+    "setup": "npm run build:native && npm run register",
+    "browser": "electron .",
+    "browser:selftest": "electron . --selftest",
+    "native": "node src/main.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.11",
+    "@pmndrs/uikit": "^1.0.77",
+    "@react-three/drei": "^10.7.9",
+    "@react-three/fiber": "^9.8.2",
+    "@react-three/rapier": "^2.2.0",
+    "@react-three/uikit": "^1.0.77",
+    "@xrift/world-components": "^0.57.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "three": "^0.186.1",
+    "webgpu": "^0.6.2"
+  },
+  "devDependencies": {
+    "cmake-js": "^8.0.0",
+    "electron": "^44.9.0",
+    "node-addon-api": "^8.9.2"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KinuX2/XRift-Client.git"
+  }
+}

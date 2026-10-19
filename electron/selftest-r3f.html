@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRift VR selftest (R3F + @react-three/xr)</title>
+<style>html,body,#root{margin:0;height:100%;background:#111;overflow:hidden}</style>
+<script type="importmap">{ "imports": {
+  "react": "https://esm.sh/react@19.1.1",
+  "react/jsx-runtime": "https://esm.sh/react@19.1.1/jsx-runtime",
+  "react-dom/client": "https://esm.sh/react-dom@19.1.1/client?deps=react@19.1.1",
+  "three": "https://esm.sh/three@0.185.0",
+  "@react-three/fiber": "https://esm.sh/@react-three/fiber@9.3.0?deps=react@19.1.1,react-dom@19.1.1,three@0.185.0",
+  "@react-three/xr": "https://esm.sh/@react-three/xr@6.6.32?deps=react@19.1.1,react-dom@19.1.1,three@0.185.0,@react-three/fiber@9.3.0"
+} }</script>
+<div id="root"></div>
+<script type="module">
+import { createElement as h, useRef } from 'react'
+import { createRoot } from 'react-dom/client'
+import { Canvas, useFrame } from '@react-three/fiber'
+import { XR, createXRStore } from '@react-three/xr'
+window.addEventListener('error', (e) => console.log('[XRift VR] page error', e.message))
+window.addEventListener('unhandledrejection', (e) => console.log('[XRift VR] page rejection', e.reason?.stack || e.reason))
+const store = createXRStore()
+let frames = 0
+function Spin() { const r = useRef(); useFrame((_, d) => { r.current.rotation.y += d; frames++ }); return h('mesh', { ref: r, position: [0, 1.5, -1.5] }, h('boxGeometry', { args: [0.4, 0.4, 0.4] }), h('meshStandardMaterial', { color: 'orange' })) }
+createRoot(document.getElementById('root')).render(
+  h(Canvas, null, h(XR, { store }, h('color', { attach: 'background', args: ['#335577'] }), h('hemisphereLight', { args: ['#fff', '#445', 2.5] }), h(Spin), h('mesh', { rotation: [-Math.PI / 2, 0, 0] }, h('planeGeometry', { args: [20, 20] }), h('meshStandardMaterial', { color: '#777' }))))
+)
+setTimeout(async () => {
+  try { await store.enterVR(); console.log('[XRift VR] r3f selftest entered VR', !!store.getState().session) } catch (e) { console.log('[XRift VR] r3f enterVR failed', e?.stack || e) }
+}, 3000)
+setInterval(() => { const s = store.getState(); console.log('[XRift VR] r3f frames', frames, 'session', !!s.session, 'controllers', s.session ? s.session.inputSources.length : 0) }, 3000)
+</script>

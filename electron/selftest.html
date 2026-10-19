@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRift VR selftest</title>
+<style>html,body{margin:0;height:100%;background:#111;overflow:hidden}canvas{display:block;width:100vw!important;height:100vh!important}</style>
+<script type="importmap">{ "imports": { "three": "../node_modules/three/build/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three'
+window.addEventListener('error', (e) => console.log('[XRift VR] page error', e.message))
+window.addEventListener('unhandledrejection', (e) => console.log('[XRift VR] page rejection', e.reason && e.reason.stack || e.reason))
+let xrFrames = 0
+
+setInterval(() => console.log('[XRift VR] selftest xr frames', xrFrames, 'presenting', renderer.xr.isPresenting), 3000)
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setSize(innerWidth, innerHeight)
+renderer.xr.enabled = true
+renderer.toneMapping = THREE.ACESFilmicToneMapping
+document.body.appendChild(renderer.domElement)
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x335577)
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 2.5))
+const cam = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100)
+const head = new THREE.Group(); scene.add(head)
+const mk = (c, x, y, z) => { const m = new THREE.Mesh(new THREE.SphereGeometry(0.1), new THREE.MeshStandardMaterial({ color: c })); m.position.set(x, y, z); head.add(m) }
+mk(0xff0000, 0.5, 0, -2); mk(0x00ff00, 0, 0.5, -2); mk(0x0000ff, 0, 0, -2)
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshStandardMaterial({ color: 0x777777 })); floor.rotation.x = -Math.PI / 2; scene.add(floor)
+renderer.setAnimationLoop((t, frame) => {
+  if (frame) xrFrames++
+  if (frame) { const xc = renderer.xr.getCamera(); head.position.copy(xc.position); head.quaternion.copy(xc.quaternion) }
+  renderer.render(scene, cam)
+})
+console.log('[XRift VR] selftest supported:', await navigator.xr.isSessionSupported('immersive-vr'), 'XRWebGLBinding:', typeof XRWebGLBinding)
+const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'hand-tracking', 'layers'] })
+await renderer.xr.setSession(session)
+console.log('[XRift VR] selftest session started, layer', session.renderState.baseLayer?.framebufferWidth)
+</script>
