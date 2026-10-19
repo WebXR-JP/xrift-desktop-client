@@ -7,9 +7,10 @@
   "main": "electron/main.cjs",
   "scripts": {
     "build:native": "node scripts/build-native.js",
+    "electron:install": "install-electron",
     "start": "electron .",
     "register": "node scripts/register-steamvr.js",
-    "setup": "npm run build:native && npm run register",
+    "setup": "pnpm electron:install && pnpm build:native && pnpm register",
     "browser": "electron .",
     "browser:selftest": "electron . --selftest",
     "package": "node scripts/package.js"
@@ -24,8 +25,10 @@
     "three": "^0.186.1"
   },
   "engines": {
-    "node": ">=22.15"
+    "node": ">=22.15",
+    "pnpm": ">=10"
   },
+  "packageManager": "pnpm@10.29.3",
   "license": "MIT",
   "repository": {
     "type": "git",

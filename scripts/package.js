@@ -1,9 +1,9 @@
 // 配布用パッケージを作る: dist/XRift-Client-win-x64.zip
 //
-//   npm run build:native && npm run package
+//   pnpm build:native && pnpm package
 //
 // 専用ブラウザ（Electron）だけを同梱する。main / preload は Node の組み込みと electron しか使わないので、
-// npm の依存パッケージは入れない（Node.js クライアントはソースから使う）。
+// pnpm の依存パッケージは入れない（Node.js クライアントはソースから使う）。
 
 import { packager } from '@electron/packager'
 import { flipFuses, FuseVersion, FuseV1Options } from '@electron/fuses'
@@ -18,7 +18,7 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const dist = join(root, 'dist')
 
 for (const f of ['bin/xrift_openxr.node', 'bin/openxr_loader.dll', 'bin/openvr_api.dll']) {
-  if (!existsSync(join(root, f))) throw new Error(`${f} がありません。先に npm run build:native を実行してください`)
+  if (!existsSync(join(root, f))) throw new Error(`${f} がありません。先に pnpm build:native を実行してください`)
 }
 
 // exe のアイコン（PNG を埋め込んだ ICO）

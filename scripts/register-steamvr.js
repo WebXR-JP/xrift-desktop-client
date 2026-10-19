@@ -1,8 +1,8 @@
 // SteamVR のライブラリに「XRift VR」を登録する
 //
-//   npm run register              登録（SteamVR を起動しておくこと）
-//   npm run register -- --remove  登録解除
-//   npm run register -- --world <id>  既定で入るワールドを固定して登録
+//   pnpm register              登録（SteamVR を起動しておくこと）
+//   pnpm register -- --remove  登録解除
+//   pnpm register -- --world <id>  既定で入るワールドを固定して登録
 //
 // SteamVR は Electron（専用ブラウザ）を直接起動する。
 
@@ -77,7 +77,7 @@ const icon = join(assets, 'steamvr-library.png')
 makeIcon(icon)
 
 const binary = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
-if (!existsSync(binary)) throw new Error(`起動ファイルがありません: ${binary}（npm install を実行してください）`)
+if (!existsSync(binary)) throw new Error(`起動ファイルがありません: ${binary}（pnpm install を実行してください）`)
 const args = [`"${root}"`]
 if (values.world) args.push('--world', `"${values.world}"`)
 if (values.scale) args.push('--scale', values.scale)

@@ -48,12 +48,12 @@ Node.js 22.15 以上、Visual Studio 2022（C++ によるデスクトップ開�
 ```powershell
 git clone https://github.com/KinuX2/XRift-Client.git
 cd XRift-Client
-npm install
-node node_modules/electron/install.js   # Electron 本体の取得（npm のインストールスクリプトが無効な環境のみ）
-npm run build:native                     # bin/xrift_openxr.node と XRiftVR.exe をビルド
-npm run register                         # SteamVR のライブラリに「XRift VR」を登録（SteamVR を起動しておく）
-npm start                                # 起動
-npm run package                          # 配布用 zip（dist/XRift-Client-win-x64.zip）を作る
+pnpm install
+pnpm electron:install   # Electron 本体の取得（pnpm のインストールでは取得されないため）
+pnpm build:native                     # bin/xrift_openxr.node と XRiftVR.exe をビルド
+pnpm register                         # SteamVR のライブラリに「XRift VR」を登録（SteamVR を起動しておく）
+pnpm start                                # 起動
+pnpm package                          # 配布用 zip（dist/XRift-Client-win-x64.zip）を作る
 ```
 
 ## 使い方
@@ -117,14 +117,14 @@ SteamVR（OpenVR）→ ALVR など
 ## テスト
 
 ```powershell
-npm run browser:selftest                                         # three の WebGL ページで VR に入り、デスクトップのミラーを保存
-npx electron . --selftest --selftest-page selftest-r3f.html       # 本家と同じ R3F + @react-three/xr 構成
-npx electron . --selftest --selftest-page selftest-heavy.html --selftest-seconds 60   # 負荷テスト
+pnpm browser:selftest                                         # three の WebGL ページで VR に入り、デスクトップのミラーを保存
+pnpm exec electron . --selftest --selftest-page selftest-r3f.html       # 本家と同じ R3F + @react-three/xr 構成
+pnpm exec electron . --selftest --selftest-page selftest-heavy.html --selftest-seconds 60   # 負荷テスト
 node test/openvr-smoke.cjs                                       # ネイティブ層だけで SteamVR に単色を送る
 node test/native-smoke.cjs                                       # 同じく OpenXR 経路
 ```
 
-VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環境では、その変数を外してから `npx electron` を実行してください（配布版の `XRiftVR.exe` はこの変数を無視します）。
+VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環境では、その変数を外してから `pnpm exec electron` を実行してください（配布版の `XRiftVR.exe` はこの変数を無視します）。
 
 ## 開発について
 
