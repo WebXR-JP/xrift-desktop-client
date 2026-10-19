@@ -448,18 +448,23 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       bool hasStick = false, hasPad = false, stickClick = false, padClick = false, primary = false, secondary = false, menu = false;
       std::string type;
       if (ok) {
-        auto p = ToPose(poses_[idx].mDeviceToAbsoluteTracking);
-        auto grip = Napi::Object::New(env);
-        SetPose(env, grip, p);
-        auto aim = Napi::Object::New(env);
-        SetPose(env, aim, p);
-        h.Set("grip", grip);
-        h.Set("aim", aim);
         char buf[128] = {};
         system_->GetStringTrackedDeviceProperty(idx, vr::Prop_ControllerType_String, buf, sizeof(buf));
         type = buf;
         vr::VRControllerState_t st{};
-        if (system_->GetControllerState(idx, &st, sizeof(st))) {
+        const bool hasState = system_->GetControllerState(idx, &st, sizeof(st));
+        // ビームの向き（WebXR の targetRaySpace）はレンダーモデルの "tip"、握り（gripSpace）は "handgrip" の姿勢。
+        // 部品が取れないコントローラはデバイスの姿勢をそのまま使う
+        const auto& dev = poses_[idx].mDeviceToAbsoluteTracking;
+        auto aimM = ComponentPose(idx, vr::k_pch_Controller_Component_Tip, hasState ? &st : nullptr, dev);
+        auto gripM = ComponentPose(idx, vr::k_pch_Controller_Component_HandGrip, hasState ? &st : nullptr, dev);
+        auto grip = Napi::Object::New(env);
+        SetPose(env, grip, ToPose(gripM));
+        auto aim = Napi::Object::New(env);
+        SetPose(env, aim, ToPose(aimM));
+        h.Set("grip", grip);
+        h.Set("aim", aim);
+        if (hasState) {
           int triggers = 0;
           for (int a = 0; a < static_cast<int>(vr::k_unControllerStateAxisCount); ++a) {
             int at = system_->GetInt32TrackedDeviceProperty(idx, static_cast<vr::ETrackedDeviceProperty>(vr::Prop_Axis0Type_Int32 + a));
@@ -520,6 +525,20 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       out.Set(i, h);
     }
     return out;
+  }
+
+  // デバイスの姿勢 × レンダーモデルの部品（tip / handgrip）の局所変換。取れなければデバイスの姿勢
+  vr::HmdMatrix34_t ComponentPose(vr::TrackedDeviceIndex_t idx, const char* component, const vr::VRControllerState_t* st,
+                                  const vr::HmdMatrix34_t& device) {
+    auto* models = vr::VRRenderModels();
+    if (!models || !st) return device;
+    char name[256] = {};
+    system_->GetStringTrackedDeviceProperty(idx, vr::Prop_RenderModelName_String, name, sizeof(name));
+    if (!name[0]) return device;
+    vr::RenderModel_ControllerMode_State_t mode{};
+    vr::RenderModel_ComponentState_t cs{};
+    if (!models->GetComponentState(name, component, st, &mode, &cs)) return device;
+    return Mul(device, cs.mTrackingToComponentLocal);
   }
 
   // 両眼の画素をステージングへ並列コピー → 目のテクスチャへ GPU コピー → 姿勢付きで Submit

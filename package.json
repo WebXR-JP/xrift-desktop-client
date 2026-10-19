@@ -1,6 +1,6 @@
 {
   "name": "xrift-client",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "XRift クライアント（非公式テスト）: 本家 app.xrift.net を SteamVR で遊ぶ専用ブラウザ",
   "type": "module",
