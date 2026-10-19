@@ -82,6 +82,7 @@ await flipFuses(exe, {
 
 // 解凍してすぐ読めるように
 copyFileSync(join(root, 'LICENSE'), join(appDir, 'LICENSE.txt'))
+copyFileSync(join(root, 'THIRD_PARTY_NOTICES.md'), join(appDir, 'THIRD_PARTY_NOTICES.md'))
 writeFileSync(
   join(appDir, 'はじめにお読みください.txt'),
   [

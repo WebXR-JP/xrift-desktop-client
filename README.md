@@ -6,14 +6,14 @@
 </p>
 <p align="center">
   <a href="https://github.com/KinuX2/XRift-Client/releases/latest/download/XRift-Client-win-x64.zip"><img src="https://img.shields.io/badge/DOWNLOAD-WINDOWS%20(ZIP)-565b63?style=for-the-badge&logo=download" alt="Windows 版をダウンロード"></a>
-  <a href="https://github.com/KinuX2/XRift-Client/blob/main/LICENSE"><img src="https://img.shields.io/github/license/KinuX2/XRift-Client?style=for-the-badge" alt="ライセンス"></a>
+  <a href="https://github.com/KinuX2/XRift-Client/blob/main/LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-565b63?style=for-the-badge" alt="ライセンス"></a>
   <img src="https://img.shields.io/badge/PLATFORM-WINDOWS%20%2B%20STEAMVR-565b63?style=for-the-badge" alt="Windows + SteamVR">
   <img src="https://img.shields.io/badge/STATUS-TEST-c08a2b?style=for-the-badge" alt="テスト版">
 </p>
 
 # XRift-Client
 ### -XRift クライアント（非公式テスト）-
-  <a href="https://github.com/KinuX2/XRift-Client/releases/latest"><img src="https://img.shields.io/github/v/release/KinuX2/XRift-Client?style=for-the-badge&label=VERSION" alt="最新リリース"></a>
+  <a href="https://github.com/KinuX2/XRift-Client/releases/latest"><img src="https://img.shields.io/github/v/release/KinuX2/XRift-Client?include_prereleases&style=for-the-badge&label=VERSION" alt="最新リリース"></a>
 
 - 本家フロントエンド（app.xrift.net）をそのまま表示する専用ブラウザ。ログイン・インスタンス・マルチプレイ・ボイス・アバター・UI は本家のまま
 - ページの WebXR（`navigator.xr`）を差し替えて、SteamVR（OpenVR）へ出力。VRChat などと同じ経路なので ALVR でも表示できる
@@ -131,5 +131,5 @@ VS Code のターミナルなど `ELECTRON_RUN_AS_NODE=1` が設定された環�
 
 ## ライセンス
 
-MIT License（[LICENSE](LICENSE)）。同梱の OpenXR SDK（Apache-2.0）と OpenVR SDK（BSD-3-Clause）はそれぞれのライセンスに従います。
+MIT License（[LICENSE](LICENSE)）。同梱の OpenXR SDK（Apache-2.0）と OpenVR SDK（BSD-3-Clause）はそれぞれのライセンスに従います（[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）。
 XRift は XRift 運営の、SteamVR は Valve の、ALVR は ALVR プロジェクトの、それぞれ商標・著作物です。

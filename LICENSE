@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----------------------------------------------------------------------------
-同梱しているサードパーティのファイル（それぞれのライセンスに従います）
-
-- native/third_party/openxr  … Khronos OpenXR SDK（ヘッダ・ローダ）: Apache License 2.0
-  （native/third_party/openxr/LICENSE）
-- native/third_party/openvr  … Valve OpenVR SDK（ヘッダ・ライブラリ）: BSD 3-Clause
-  （native/third_party/openvr/LICENSE）
