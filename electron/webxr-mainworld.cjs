@@ -261,7 +261,9 @@ module.exports = function installXRiftWebXR() {
       this.domOverlayState = null
       this.renderState = { depthNear: 0.1, depthFar: 1000, inlineVerticalFieldOfView: null, baseLayer: null }
       for (const k of ['end', 'inputsourceschange', 'select', 'selectstart', 'selectend', 'squeeze', 'squeezestart', 'squeezeend', 'visibilitychange', 'frameratechange']) this['on' + k] = null
-      this._stats = { n: 0, t: performance.now(), cb: 0, rb: 0, wait: 0, maxCb: 0, slow: 0 }
+      this._stats = { n: 0, t: performance.now(), cb: 0, rb: 0, wait: 0, maxCb: 0, slow: 0, chain: 0, chainN: 0 }
+      // 低遅延: 描いたフレームを同じフレーム内に提出する（間に合わないフレームだけ次のフレームで出す）
+      B.setLatencyMode && B.setLatencyMode(true)
       this._loop = this._run()
     }
     get inputSources() { return this._sources.filter(Boolean) }
@@ -319,7 +321,9 @@ module.exports = function installXRiftWebXR() {
     async _frame() {
       const tw0 = performance.now()
       const fs = await B.waitFrame()
-      this._stats.wait += performance.now() - tw0
+      const frameStart = performance.now()
+      this._stats.wait += frameStart - tw0
+      const period = fs.predictedDisplayPeriodMs || 13.9
       B.beginFrame()
       const lv = B.locateViews()
       const input = B.syncInput()
@@ -345,6 +349,8 @@ module.exports = function installXRiftWebXR() {
         const t1 = performance.now()
         // コールバックと同じタスクのうちに渡す（キャンバスの描画内容が有効なうちに GPU コピーを積む）。
         // 読み戻しとスワップチェーンへの書き込みは裏で進み、終わった画像が次以降の endFrame で出る
+        // 読み戻しと転送は裏で進む。提出はネイティブのフレーム待ちスレッドが行う
+        // （このフレームの転送が次のフレーム開始の少し前までに終われば遅れ 0、間に合わなければ最新の画像）
         layer._present(lv.seq)
         const st = this._stats
         st.cb += t1 - t0
@@ -358,7 +364,7 @@ module.exports = function installXRiftWebXR() {
       const now = performance.now()
       if (now - st.t > 5000) {
         log(`${((st.n * 1000) / (now - st.t)).toFixed(1)} fps | page render ${(st.cb / st.n).toFixed(1)}ms (max ${st.maxCb.toFixed(1)}, >12ms: ${st.slow}) | wait ${(st.wait / st.n).toFixed(1)}ms | enqueue ${(st.rb / st.n).toFixed(2)}ms | ${JSON.stringify(B.stats())}`)
-        st.n = 0; st.cb = 0; st.rb = 0; st.wait = 0; st.maxCb = 0; st.slow = 0; st.t = now
+        st.n = 0; st.cb = 0; st.rb = 0; st.wait = 0; st.maxCb = 0; st.slow = 0; st.chain = 0; st.chainN = 0; st.t = now
       }
     }
     _inputs(hands, frame) {

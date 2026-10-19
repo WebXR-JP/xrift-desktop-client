@@ -22,8 +22,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 namespace {
@@ -112,6 +116,9 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       InstanceMethod("submit", &VrSessionWrap::Submit),
       InstanceMethod("submitLatched", &VrSessionWrap::SubmitLatched),
       InstanceMethod("submitLatchedAsync", &VrSessionWrap::SubmitLatchedAsync),
+      InstanceMethod("setLatencyMode", &VrSessionWrap::SetLatencyMode),
+      InstanceMethod("fillFrame", &VrSessionWrap::FillFrame),
+      InstanceMethod("markPending", &VrSessionWrap::MarkPending),
       InstanceMethod("endFrame", &VrSessionWrap::EndFrame),
       InstanceMethod("applyHaptics", &VrSessionWrap::ApplyHaptics),
       InstanceMethod("requestExit", &VrSessionWrap::RequestExit),
@@ -129,6 +136,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       auto o = info[0].As<Napi::Object>();
       if (o.Has("resolutionScale")) scale = o.Get("resolutionScale").ToNumber().DoubleValue();
     }
+    if (const char* m = std::getenv("XRIFT_SUBMIT_MARGIN_MS")) submitMarginMs_ = std::atof(m);
     std::string err = InitAll(scale);
     if (!err.empty()) {
       Cleanup();
@@ -199,6 +207,11 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     system_->GetRecommendedRenderTargetSize(&rw, &rh);
     recW_ = rw;
     recH_ = rh;
+    {
+      vr::ETrackedPropertyError pe = vr::TrackedProp_Success;
+      float hz = system_->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &pe);
+      if (pe == vr::TrackedProp_Success && hz > 30.0f) displayHz_ = hz;
+    }
     int w = static_cast<int>(std::lround(rw * scale));
     int h = static_cast<int>(std::lround(rh * scale));
     width_ = std::max(64, ((w + 63) / 64) * 64);
@@ -214,12 +227,15 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       td.SampleDesc.Count = 1;
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+      // 共有可能にしておくと、SteamVR は Submit 時にコピーせずこのテクスチャを直接使える
+      td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
       for (int i = 0; i < 2; ++i) {
         if (FAILED(device_->CreateTexture2D(&td, nullptr, &eyeTex_[eye][i]))) return "CreateTexture2D(eye) failed";
       }
       D3D11_TEXTURE2D_DESC sd = td;
       sd.Usage = D3D11_USAGE_STAGING;
       sd.BindFlags = 0;
+      sd.MiscFlags = 0;
       sd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
       for (int i = 0; i < 2; ++i) {
         if (FAILED(device_->CreateTexture2D(&sd, nullptr, &staging_[eye][i]))) return "CreateTexture2D(staging) failed";
@@ -327,11 +343,33 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     WaitWorker(Napi::Env env, VrSessionWrap* s) : Napi::AsyncWorker(env), s_(s), d_(Napi::Promise::Deferred::New(env)) {}
     Napi::Promise Promise() { return d_.Promise(); }
     void Execute() override {
+      using clock = std::chrono::steady_clock;
+      // 1) この枠の提出（枠ごとにちょうど 1 回）。
+      //    いま描いているフレームの転送が「次のフレーム開始の少し前」までに終われば、それを出す（遅れ 0）。
+      //    間に合わなければ、その時点の最新の画像を出す（fps は落とさない。新しい画像は次の枠で出る）
+      {
+        std::unique_lock<std::mutex> lk(s_->frameMtx_);
+        if (s_->haveTiming_) {
+          const auto period = std::chrono::duration<double, std::milli>(1000.0 / s_->displayHz_ - s_->submitMarginMs_);
+          const auto deadline = s_->lastWaitReturn_ + std::chrono::duration_cast<clock::duration>(period);
+          s_->frameCv_.wait_until(lk, deadline, [&] { return !s_->uploadPending_; });
+        }
+        if (s_->hasImage_ && s_->initialized_) {
+          fresh_ = s_->publishedGen_ != s_->submittedGen_;
+          s_->SubmitLatest();
+        }
+      }
+      // 2) 次のフレームの開始まで待つ
       LARGE_INTEGER f, a, b;
       QueryPerformanceFrequency(&f);
       QueryPerformanceCounter(&a);
       err_ = s_->compositor_->WaitGetPoses(s_->poses_, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
       QueryPerformanceCounter(&b);
+      {
+        std::lock_guard<std::mutex> lk(s_->frameMtx_);
+        s_->lastWaitReturn_ = clock::now();
+        s_->haveTiming_ = true;
+      }
       waitMs_ = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
       doneQpc_ = b.QuadPart;
     }
@@ -339,12 +377,12 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       Napi::Env env = Env();
       auto o = Napi::Object::New(env);
       o.Set("shouldRender", err_ == vr::VRCompositorError_None);
-      o.Set("predictedDisplayPeriodMs", 1000.0 / 90.0);
+      o.Set("predictedDisplayPeriodMs", 1000.0 / s_->displayHz_);
       LARGE_INTEGER f, now;
       QueryPerformanceFrequency(&f);
       QueryPerformanceCounter(&now);
-      // 定刻に提出する: 最新の画像（1〜2 フレーム前に描いたもの）をその姿勢付きで出す
-      if (s_->latchedMode_ && err_ == vr::VRCompositorError_None) s_->SubmitLatest();
+      s_->waitInFlight_ = false;
+      o.Set("fresh", fresh_);
       o.Set("nativeWaitMs", waitMs_);
       o.Set("notifyDelayMs", static_cast<double>(now.QuadPart - doneQpc_) * 1000.0 / f.QuadPart);
       d_.Resolve(o);
@@ -357,11 +395,13 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     vr::EVRCompositorError err_ = vr::VRCompositorError_None;
     double waitMs_ = 0;
     LONGLONG doneQpc_ = 0;
+    bool fresh_ = false;
   };
 
   Napi::Value WaitFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     EnsureAlive(env);
+    waitInFlight_ = true;
     auto* w = new WaitWorker(env, this);
     auto p = w->Promise();
     w->Queue();
@@ -530,10 +570,18 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       data_ = static_cast<const uint8_t*>(ab.Data());
       pose_ = s->hmdRing_[seq % kRing];
       // 提出中の（最新の）スロットには書かない
+      std::lock_guard<std::mutex> lk(s->frameMtx_);
       slot_ = s->hasImage_ ? (s->lastSlot_ ^ 1) : 0;
     }
     Napi::Promise Promise() { return d_.Promise(); }
+    static double NowMs() {
+      LARGE_INTEGER f, t;
+      QueryPerformanceFrequency(&f);
+      QueryPerformanceCounter(&t);
+      return static_cast<double>(t.QuadPart) * 1000.0 / f.QuadPart;
+    }
     void Execute() override {
+      t0_ = NowMs();
       auto* ctx = s_->context_;
       D3D11_MAPPED_SUBRESOURCE mapped[2] = {};
       for (int eye = 0; eye < 2; ++eye) {
@@ -549,26 +597,44 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
         auto* dst = static_cast<uint8_t*>(mapped[eye].pData);
         for (int y = 0; y < h; ++y) memcpy(dst + y * mapped[eye].RowPitch, src + static_cast<size_t>(y) * pitch_, static_cast<size_t>(w) * 4);
       };
+      t1_ = NowMs();
       std::thread other(copyEye, 1);
       copyEye(0);
       other.join();
+      t2_ = NowMs();
       for (int eye = 0; eye < 2; ++eye) {
         ctx->Unmap(s_->staging_[eye][slot_], 0);
         ctx->CopyResource(s_->eyeTex_[eye][slot_], s_->staging_[eye][slot_]);
       }
       ctx->Flush();
+      t3_ = NowMs();
+      // 転送できたら「最新の画像」として公開し、提出を待っているフレーム待ちスレッドを起こす
+      {
+        std::lock_guard<std::mutex> lk(s_->frameMtx_);
+        s_->lastSlot_ = slot_;
+        s_->lastPose_ = pose_;
+        s_->hasImage_ = true;
+        s_->latchedMode_ = true;
+        s_->publishedGen_++;
+        s_->uploadPending_ = false;
+      }
+      s_->frameCv_.notify_all();
     }
     void OnOK() override {
       s_->uploadBusy_ = false;
-      // 提出は次の WaitGetPoses 直後に行う（ここでは「最新の画像」を差し替えるだけ）
-      s_->lastSlot_ = slot_;
-      s_->lastPose_ = pose_;
-      s_->hasImage_ = true;
-      s_->latchedMode_ = true;
-      d_.Resolve(Env().Undefined());
+      auto r = Napi::Object::New(Env());
+      r.Set("mapWaitMs", t1_ - t0_);
+      r.Set("memcpyMs", t2_ - t1_);
+      r.Set("gpuCopyMs", t3_ - t2_);
+      d_.Resolve(r);
     }
     void OnError(const Napi::Error& e) override {
       s_->uploadBusy_ = false;
+      {
+        std::lock_guard<std::mutex> lk(s_->frameMtx_);
+        s_->uploadPending_ = false;
+      }
+      s_->frameCv_.notify_all();
       d_.Reject(e.Value());
     }
 
@@ -581,6 +647,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     uint32_t pitch_;
     vr::HmdMatrix34_t pose_{};
     int slot_ = 0;
+    double t0_ = 0, t1_ = 0, t2_ = 0, t3_ = 0;
   };
 
   Napi::Value SubmitLatchedAsync(const Napi::CallbackInfo& info) {
@@ -614,6 +681,27 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     }
     compositor_->PostPresentHandoff();
     submittedThisFrame_ = true;
+    submittedSinceWait_ = true;
+    submittedGen_ = publishedGen_;
+  }
+
+  Napi::Value FillFrame(const Napi::CallbackInfo& info) { return info.Env().Undefined(); }
+
+  // markPending(true): このフレームの画像を読み戻し中（提出はその転送完了を締め切りまで待つ）
+  // markPending(false): 読み戻しを諦めた（待たずに最新の画像を出してよい）
+  Napi::Value MarkPending(const Napi::CallbackInfo& info) {
+    {
+      std::lock_guard<std::mutex> lk(frameMtx_);
+      uploadPending_ = info[0].ToBoolean().Value();
+    }
+    frameCv_.notify_all();
+    return info.Env().Undefined();
+  }
+
+  // setLatencyMode(immediate: boolean)
+  Napi::Value SetLatencyMode(const Napi::CallbackInfo& info) {
+    immediate_ = info[0].ToBoolean().Value();
+    return info.Env().Undefined();
   }
 
   static void CheckBuffer(Napi::Env env, size_t len, const size_t offs[2], uint32_t pitch, int w, int h) {
@@ -736,6 +824,19 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
   bool submittedThisFrame_ = false;
   bool uploadBusy_ = false;
   bool latchedMode_ = false;
+  bool immediate_ = false;
+  bool submittedSinceWait_ = false;
+  bool waitInFlight_ = false;
+  uint64_t onTimeSubmits_ = 0, lateSubmits_ = 0;
+  uint64_t publishedGen_ = 0, submittedGen_ = 0;
+  // フレーム待ちスレッドと転送スレッドの受け渡し
+  double submitMarginMs_ = 4.0;  // 次のフレーム開始の何 ms 前を提出の締め切りにするか（実測で決定。XRIFT_SUBMIT_MARGIN_MS で変更可）
+  std::mutex frameMtx_;
+  std::condition_variable frameCv_;
+  bool uploadPending_ = false;
+  bool haveTiming_ = false;
+  std::chrono::steady_clock::time_point lastWaitReturn_{};
+  float displayHz_ = 90.0f;
   vr::HmdMatrix34_t lastPose_{};
   vr::TrackedDevicePose_t poses_[vr::k_unMaxTrackedDeviceCount] = {};
   vr::HmdMatrix34_t hmdRing_[kRing] = {};

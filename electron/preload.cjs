@@ -64,7 +64,7 @@ function ensureStaging(w, h) {
 
 // 読み戻し → スワップチェーン書き込みは前のフレームのものと直列につなぐ（描画とは並行に進む）
 let chain = Promise.resolve()
-const stats = { dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0 }
+const stats = { dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0, detail: {}, onTime: 0, late: 0 }
 
 /**
  * 横並び両眼が描かれたキャンバスを OpenXR の左右スワップチェーンへ送る（非同期）。
@@ -72,16 +72,18 @@ const stats = { dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0 
  * seq は locateViews() が返した、その画像を描いたときの姿勢の番号
  */
 function present(canvas, eyeW, eyeH, seq) {
-  if (!gpuDevice || !session) return false
+  if (!gpuDevice || !session) return null
   const w = canvas.width
   const h = canvas.height
   const st = ensureStaging(w, h)
   const buf = st.buffers.find((b) => b.mapState === 'unmapped' && !b.__busy)
   if (!buf) {
     stats.dropped++
-    return false
+    return null
   }
   buf.__busy = true
+  // このフレームの画像を読み戻し中。フレーム待ちスレッドは締め切りまでその転送完了を待って提出する
+  if (typeof session.markPending === 'function') session.markPending(true)
   gpuDevice.queue.copyExternalImageToTexture({ source: canvas }, { texture: st.texture }, [w, h])
   const enc = gpuDevice.createCommandEncoder()
   enc.copyTextureToBuffer({ texture: st.texture }, { buffer: buf, bytesPerRow: st.bpr, rowsPerImage: h }, [w, h])
@@ -99,21 +101,26 @@ function present(canvas, eyeW, eyeH, seq) {
       const data = buf.getMappedRange()
       if (typeof s.submitLatchedAsync === 'function') {
         // コピーはネイティブの別スレッドで行い、ページのメインスレッドを空ける
-        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq).then(() => {
+        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq).then((r) => {
           stats.sub += performance.now() - t2
           stats.n++
+          if (r) for (const k of ['memcpyMs']) stats.detail[k] = (stats.detail[k] || 0) + r[k]
         })
       }
       s.submitLatched(data, 0, eyeW * 4, st.bpr, seq)
       stats.sub += performance.now() - t2
       stats.n++
     })
-    .catch((err) => console.error('[XRift VR] present failed', err && err.message))
+    .catch((err) => {
+      console.error('[XRift VR] present failed', err && err.message)
+      if (s && typeof s.markPending === 'function') s.markPending(false)
+    })
     .finally(() => {
       if (buf.mapState === 'mapped') buf.unmap()
       buf.__busy = false
     })
-  return true
+  // 転送（低遅延モードなら提出まで）が終わったら解決する
+  return chain
 }
 
 const bridge = {
@@ -141,6 +148,8 @@ const bridge = {
   pollEvents: () => (session ? session.pollEvents() : [{ type: 'exit', detail: 'no session' }]),
   async waitFrame() {
     const fs = await session.waitFrame()
+    if (fs.fresh === true) stats.onTime++
+    else if (fs.fresh === false) stats.late++
     stats.wait += fs.nativeWaitMs || 0
     stats.notify += fs.notifyDelayMs || 0
     stats.frames++
@@ -154,6 +163,9 @@ const bridge = {
     session.submit(0, pixels, 0, rowPitch)
     session.submit(1, pixels, eyeWidth * 4, rowPitch)
   },
+  setLatencyMode(immediate) {
+    if (session && typeof session.setLatencyMode === 'function') session.setLatencyMode(!!immediate)
+  },
   stats() {
     const f = stats.frames || 1
     const r = {
@@ -162,7 +174,12 @@ const bridge = {
       submit: stats.n ? +(stats.sub / stats.n).toFixed(1) : 0,
       vrWait: +(stats.wait / f).toFixed(1),
       notifyDelay: +(stats.notify / f).toFixed(1),
+      onTime: stats.onTime,
+      late: stats.late,
+      upload: Object.fromEntries(Object.entries(stats.detail).map(([k, v]) => [k, +(v / (stats.n || 1)).toFixed(2)])),
     }
+    stats.detail = {}
+    stats.onTime = stats.late = 0
     stats.n = stats.map = stats.sub = stats.wait = stats.notify = stats.frames = 0
     return r
   },
