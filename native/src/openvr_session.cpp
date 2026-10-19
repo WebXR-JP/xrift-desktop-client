@@ -21,6 +21,7 @@
 #include <openvr.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -94,6 +95,25 @@ void SetPose(Napi::Env env, Napi::Object o, const Pose& p) {
   o.Set("orientation", ori);
 }
 
+// QPC をミリ秒に変換する。周波数はプロセス内で不変なので一度だけ取得する。
+// JS の描画終了タグと Submit 時刻を同じ時計で比較するために使う。
+double NowMs() {
+  static const double freq = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return static_cast<double>(f.QuadPart);
+  }();
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return static_cast<double>(t.QuadPart) * 1000.0 / freq;
+}
+
+// スコープを抜けたらフラグを戻す。早期 return や例外でも確実に戻すために使う
+struct FlagGuard {
+  std::atomic<bool>& flag;
+  ~FlagGuard() { flag = false; }
+};
+
 const char* ProfileFor(const std::string& controllerType) {
   if (controllerType == "oculus_touch") return "/interaction_profiles/oculus/touch_controller";
   if (controllerType == "knuckles") return "/interaction_profiles/valve/index_controller";
@@ -124,6 +144,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       InstanceMethod("requestExit", &VrSessionWrap::RequestExit),
       InstanceMethod("destroy", &VrSessionWrap::Destroy),
       InstanceMethod("getInfo", &VrSessionWrap::GetInfo),
+      InstanceMethod("nowQpcMs", &VrSessionWrap::NowQpcMs),
     });
     exports.Set("OpenVRSession", func);
     exports.Set("probeOpenVR", Napi::Function::New(env, Probe));
@@ -256,6 +277,11 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
   }
 
   void Cleanup() {
+    // 転送・フレーム待ちスレッドが compositor やテクスチャを使っている間に解放すると落ちる。
+    // 終了を止めないよう最大 2 秒だけ待つ
+    const auto waitUntil = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((waitRunning_.load() || uploadRunning_.load()) && std::chrono::steady_clock::now() < waitUntil)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     for (auto& e : eyeTex_) for (auto& t : e) Release(t);
     for (auto& e : staging_) for (auto& t : e) Release(t);
     Release(context_);
@@ -295,6 +321,11 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     }
     o.Set("recommended", rec);
     return o;
+  }
+
+  // JS が描画終了のタグを付けるための単調時計（QPC ミリ秒）。差だけを使う
+  Napi::Value NowQpcMs(const Napi::CallbackInfo& info) {
+    return Napi::Number::New(info.Env(), NowMs());
   }
 
   // OpenXR 版と同じ形のイベントを返す（最初の呼び出しで ready → begin → focused）
@@ -338,11 +369,25 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     return arr;
   }
 
+  // SubmitLatest が返す計測値。valid は描画終了タグがあり、その画像を提出した場合だけ true
+  struct SubmitTiming {
+    bool ran = false;
+    bool valid = false;
+    double renderToSubmitMs = 0;
+    double uploadToSubmitMs = 0;
+    double submitCallMs = 0;
+    double submitFirstMs = 0;
+    double handoffMs = 0;
+    double submitAtMs = 0;
+    uint64_t seq = 0;
+  };
+
   class WaitWorker : public Napi::AsyncWorker {
    public:
     WaitWorker(Napi::Env env, VrSessionWrap* s) : Napi::AsyncWorker(env), s_(s), d_(Napi::Promise::Deferred::New(env)) {}
     Napi::Promise Promise() { return d_.Promise(); }
     void Execute() override {
+      [[maybe_unused]] FlagGuard running{s_->waitRunning_};
       using clock = std::chrono::steady_clock;
       // 1) この枠の提出（枠ごとにちょうど 1 回）。
       //    いま描いているフレームの転送が「次のフレーム開始の少し前」までに終われば、それを出す（遅れ 0）。
@@ -356,35 +401,58 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
         }
         if (s_->hasImage_ && s_->initialized_) {
           fresh_ = s_->publishedGen_ != s_->submittedGen_;
-          s_->SubmitLatest();
+          submitTiming_ = s_->SubmitLatest();
         }
       }
       // 2) 次のフレームの開始まで待つ
-      LARGE_INTEGER f, a, b;
-      QueryPerformanceFrequency(&f);
-      QueryPerformanceCounter(&a);
+      const double waitStartMs = NowMs();
       err_ = s_->compositor_->WaitGetPoses(s_->poses_, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
-      QueryPerformanceCounter(&b);
+      doneMs_ = NowMs();
+      waitMs_ = doneMs_ - waitStartMs;
       {
         std::lock_guard<std::mutex> lk(s_->frameMtx_);
         s_->lastWaitReturn_ = clock::now();
         s_->haveTiming_ = true;
       }
-      waitMs_ = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
-      doneQpc_ = b.QuadPart;
+      // 直前に提出したフレームを SteamVR がどう扱ったか。取得できないランタイムでは false
+      frameTiming_ = {};
+      frameTiming_.m_nSize = static_cast<uint32_t>(sizeof(frameTiming_));
+      frameTimingValid_ = s_->compositor_->GetFrameTiming(&frameTiming_, 0);
     }
     void OnOK() override {
       Napi::Env env = Env();
       auto o = Napi::Object::New(env);
       o.Set("shouldRender", err_ == vr::VRCompositorError_None);
       o.Set("predictedDisplayPeriodMs", 1000.0 / s_->displayHz_);
-      LARGE_INTEGER f, now;
-      QueryPerformanceFrequency(&f);
-      QueryPerformanceCounter(&now);
       s_->waitInFlight_ = false;
       o.Set("fresh", fresh_);
       o.Set("nativeWaitMs", waitMs_);
-      o.Set("notifyDelayMs", static_cast<double>(now.QuadPart - doneQpc_) * 1000.0 / f.QuadPart);
+      o.Set("notifyDelayMs", NowMs() - doneMs_);
+      auto submit = Napi::Object::New(env);
+      submit.Set("ran", submitTiming_.ran);
+      submit.Set("valid", fresh_ && submitTiming_.valid);
+      submit.Set("renderToSubmitMs", submitTiming_.renderToSubmitMs);
+      submit.Set("uploadToSubmitMs", submitTiming_.uploadToSubmitMs);
+      submit.Set("submitCallMs", submitTiming_.submitCallMs);
+      submit.Set("submitFirstMs", submitTiming_.submitFirstMs);
+      submit.Set("handoffMs", submitTiming_.handoffMs);
+      submit.Set("seq", static_cast<double>(submitTiming_.seq));
+      o.Set("submitTiming", submit);
+      auto frame = Napi::Object::New(env);
+      frame.Set("valid", frameTimingValid_);
+      if (frameTimingValid_) {
+        frame.Set("frameIndex", static_cast<double>(frameTiming_.m_nFrameIndex));
+        frame.Set("appFrameMs", frameTiming_.m_flNewFrameReadyMs - frameTiming_.m_flWaitGetPosesCalledMs);
+        frame.Set("preSubmitGpuMs", frameTiming_.m_flPreSubmitGpuMs);
+        frame.Set("submitFrameMs", frameTiming_.m_flSubmitFrameMs);
+        frame.Set("compositorIdleCpuMs", frameTiming_.m_flCompositorIdleCpuMs);
+        frame.Set("compositorRenderGpuMs", frameTiming_.m_flCompositorRenderGpuMs);
+        frame.Set("transferLatencyMs", frameTiming_.m_flTransferLatencyMs);
+        frame.Set("clientFrameIntervalMs", frameTiming_.m_flClientFrameIntervalMs);
+        frame.Set("droppedFrames", static_cast<double>(frameTiming_.m_nNumDroppedFrames));
+        frame.Set("misPresented", static_cast<double>(frameTiming_.m_nNumMisPresented));
+      }
+      o.Set("frameTiming", frame);
       d_.Resolve(o);
     }
     void OnError(const Napi::Error& e) override { d_.Reject(e.Value()); }
@@ -394,7 +462,10 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     Napi::Promise::Deferred d_;
     vr::EVRCompositorError err_ = vr::VRCompositorError_None;
     double waitMs_ = 0;
-    LONGLONG doneQpc_ = 0;
+    double doneMs_ = 0;
+    SubmitTiming submitTiming_;
+    vr::Compositor_FrameTiming frameTiming_{};
+    bool frameTimingValid_ = false;
     bool fresh_ = false;
   };
 
@@ -404,6 +475,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     waitInFlight_ = true;
     auto* w = new WaitWorker(env, this);
     auto p = w->Promise();
+    waitRunning_ = true;
     w->Queue();
     return p;
   }
@@ -541,6 +613,13 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     return Mul(device, cs.mTrackingToComponentLocal);
   }
 
+  // 描画終了タグを持たない同期パスの画像で、前回のタグを誤用しないようにする
+  void ForgetUploadTiming() {
+    lastUploadTagMs_ = 0;
+    lastUploadDoneMs_ = 0;
+    lastUploadSeq_ = 0;
+  }
+
   // 両眼の画素をステージングへ並列コピー → 目のテクスチャへ GPU コピー → 姿勢付きで Submit
   void Upload(Napi::Env env, const uint8_t* data, const size_t offs[2], uint32_t pitch, const vr::HmdMatrix34_t& pose) {
     const int slot = slot_;
@@ -575,6 +654,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       compositor_->Submit(static_cast<vr::EVREye>(eye), &tex, &bounds, vr::Submit_TextureWithPose);
     }
     lastSlot_ = slot;
+    ForgetUploadTiming();
     hasImage_ = true;
     submittedThisFrame_ = true;
   }
@@ -583,8 +663,8 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
   // ArrayBuffer は Promise が解決するまで有効であること（WebGPU の mapped range をそのまま渡せる）
   class UploadWorker : public Napi::AsyncWorker {
    public:
-    UploadWorker(Napi::Env env, VrSessionWrap* s, Napi::ArrayBuffer ab, size_t offL, size_t offR, uint32_t pitch, uint64_t seq)
-        : Napi::AsyncWorker(env), s_(s), d_(Napi::Promise::Deferred::New(env)), offs_{offL, offR}, pitch_(pitch) {
+    UploadWorker(Napi::Env env, VrSessionWrap* s, Napi::ArrayBuffer ab, size_t offL, size_t offR, uint32_t pitch, uint64_t seq, double tagMs)
+        : Napi::AsyncWorker(env), s_(s), d_(Napi::Promise::Deferred::New(env)), offs_{offL, offR}, pitch_(pitch), seq_(seq), tagMs_(tagMs) {
       ref_ = Napi::Persistent(ab);
       data_ = static_cast<const uint8_t*>(ab.Data());
       pose_ = s->hmdRing_[seq % kRing];
@@ -593,13 +673,8 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       slot_ = s->hasImage_ ? (s->lastSlot_ ^ 1) : 0;
     }
     Napi::Promise Promise() { return d_.Promise(); }
-    static double NowMs() {
-      LARGE_INTEGER f, t;
-      QueryPerformanceFrequency(&f);
-      QueryPerformanceCounter(&t);
-      return static_cast<double>(t.QuadPart) * 1000.0 / f.QuadPart;
-    }
     void Execute() override {
+      [[maybe_unused]] FlagGuard running{s_->uploadRunning_};
       t0_ = NowMs();
       auto* ctx = s_->context_;
       D3D11_MAPPED_SUBRESOURCE mapped[2] = {};
@@ -632,6 +707,9 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
         std::lock_guard<std::mutex> lk(s_->frameMtx_);
         s_->lastSlot_ = slot_;
         s_->lastPose_ = pose_;
+        s_->lastUploadTagMs_ = tagMs_;
+        s_->lastUploadDoneMs_ = NowMs();
+        s_->lastUploadSeq_ = seq_;
         s_->hasImage_ = true;
         s_->latchedMode_ = true;
         s_->publishedGen_++;
@@ -644,7 +722,8 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
       auto r = Napi::Object::New(Env());
       r.Set("mapWaitMs", t1_ - t0_);
       r.Set("memcpyMs", t2_ - t1_);
-      r.Set("gpuCopyMs", t3_ - t2_);
+      // CopyResource と Flush の CPU 時間。GPU コピーの完了時間ではない
+      r.Set("copyResourceCpuMs", t3_ - t2_);
       d_.Resolve(r);
     }
     void OnError(const Napi::Error& e) override {
@@ -664,11 +743,15 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     const uint8_t* data_ = nullptr;
     size_t offs_[2];
     uint32_t pitch_;
+    uint64_t seq_;
+    double tagMs_;
     vr::HmdMatrix34_t pose_{};
     int slot_ = 0;
     double t0_ = 0, t1_ = 0, t2_ = 0, t3_ = 0;
   };
 
+  // submitLatchedAsync(pixels, offsetLeft, offsetRight, rowPitch, seq, tagMs)
+  // tagMs は描画終了時刻（QPC ミリ秒）。計測だけに使い、省略時は 0（計測なし）
   Napi::Value SubmitLatchedAsync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     EnsureAlive(env);
@@ -677,31 +760,50 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
     size_t offs[2] = {static_cast<size_t>(info[1].ToNumber().Int64Value()), static_cast<size_t>(info[2].ToNumber().Int64Value())};
     uint32_t pitch = info[3].ToNumber().Uint32Value();
     uint64_t seq = static_cast<uint64_t>(info[4].ToNumber().Int64Value());
+    double tagMs = info.Length() > 5 ? info[5].ToNumber().DoubleValue() : 0.0;
     CheckBuffer(env, ab.ByteLength(), offs, pitch, width_, height_);
     if (uploadBusy_) throw Napi::Error::New(env, "an upload is already in flight");
     uploadBusy_ = true;
-    auto* w = new UploadWorker(env, this, ab, offs[0], offs[1], pitch, seq);
+    auto* w = new UploadWorker(env, this, ab, offs[0], offs[1], pitch, seq, tagMs);
     auto p = w->Promise();
+    uploadRunning_ = true;
     w->Queue();
     return p;
   }
 
   // 直近に転送し終えた両眼の画像を、それを描いたときの姿勢で提出する（毎フレーム WaitGetPoses 直後に呼ぶ）
-  void SubmitLatest() {
-    if (!hasImage_ || !initialized_) return;
+  // 2 回目の Submit が SteamVR の frame ready なので、描画終了タグからの経過をそこで記録する
+  SubmitTiming SubmitLatest() {
+    SubmitTiming timing;
+    if (!hasImage_ || !initialized_) return timing;
+    timing.ran = true;
+    timing.seq = lastUploadSeq_;
+    const double submitStartMs = NowMs();
     for (int eye = 0; eye < 2; ++eye) {
+      if (eye == 1) timing.submitAtMs = NowMs();
       vr::VRTextureWithPose_t tex{};
       tex.handle = eyeTex_[eye][lastSlot_];
       tex.eType = vr::TextureType_DirectX;
       tex.eColorSpace = vr::ColorSpace_Auto;
       tex.mDeviceToAbsoluteTracking = lastPose_;
       vr::VRTextureBounds_t bounds{0.0f, 0.0f, 1.0f, 1.0f};
+      const double submitMs = NowMs();
       compositor_->Submit(static_cast<vr::EVREye>(eye), &tex, &bounds, vr::Submit_TextureWithPose);
+      if (eye == 0) timing.submitFirstMs = NowMs() - submitMs;
     }
+    const double handoffStartMs = NowMs();
     compositor_->PostPresentHandoff();
+    timing.handoffMs = NowMs() - handoffStartMs;
+    timing.submitCallMs = NowMs() - submitStartMs;
+    if (lastUploadTagMs_ > 0) {
+      timing.valid = true;
+      timing.renderToSubmitMs = timing.submitAtMs - lastUploadTagMs_;
+      timing.uploadToSubmitMs = lastUploadDoneMs_ > 0 ? timing.submitAtMs - lastUploadDoneMs_ : 0;
+    }
     submittedThisFrame_ = true;
     submittedSinceWait_ = true;
     submittedGen_ = publishedGen_;
+    return timing;
   }
 
   Napi::Value FillFrame(const Napi::CallbackInfo& info) { return info.Env().Undefined(); }
@@ -796,6 +898,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
         compositor_->Submit(static_cast<vr::EVREye>(e), &tex, &bounds, vr::Submit_TextureWithPose);
       }
       pending_[0] = pending_[1] = nullptr;
+      ForgetUploadTiming();
       hasImage_ = true;
       submittedThisFrame_ = true;
     }
@@ -846,8 +949,13 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
   bool immediate_ = false;
   bool submittedSinceWait_ = false;
   bool waitInFlight_ = false;
+  std::atomic<bool> waitRunning_{false};
+  std::atomic<bool> uploadRunning_{false};
   uint64_t onTimeSubmits_ = 0, lateSubmits_ = 0;
   uint64_t publishedGen_ = 0, submittedGen_ = 0;
+  double lastUploadTagMs_ = 0;   // JS が付けた描画終了時刻（QPC ミリ秒）
+  double lastUploadDoneMs_ = 0;  // 転送が完了して公開した時刻（QPC ミリ秒）
+  uint64_t lastUploadSeq_ = 0;
   // フレーム待ちスレッドと転送スレッドの受け渡し
   double submitMarginMs_ = 4.0;  // 次のフレーム開始の何 ms 前を提出の締め切りにするか（実測で決定。XRIFT_SUBMIT_MARGIN_MS で変更可）
   std::mutex frameMtx_;

@@ -64,15 +64,25 @@ function ensureStaging(w, h) {
 
 // 読み戻し → スワップチェーン書き込みは前のフレームのものと直列につなぐ（描画とは並行に進む）
 let chain = Promise.resolve()
-const stats = { dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0, detail: {}, onTime: 0, late: 0 }
+const stats = {
+  dropped: 0, n: 0, map: 0, sub: 0, wait: 0, notify: 0, frames: 0, detail: {}, onTime: 0, late: 0,
+  submitTiming: { n: 0, renderToSubmit: 0, uploadToSubmit: 0, call: 0, first: 0, handoff: 0, calls: 0, lastSeq: 0 },
+  frameTiming: {
+    n: 0, appFrame: 0, preSubmitGpu: 0, submitFrame: 0, idle: 0, compositorGpu: 0,
+    transfer: 0, clientInterval: 0, droppedFrames: 0, misPresented: 0, lastFrameIndex: 0,
+  },
+}
 
 /**
  * 横並び両眼が描かれたキャンバスを OpenXR の左右スワップチェーンへ送る（非同期）。
  * キャンバスの内容が有効なうちに GPU コピーだけを積んで即座に戻る。
- * seq は locateViews() が返した、その画像を描いたときの姿勢の番号
+ * seq は locateViews() が返した、その画像を描いたときの姿勢の番号。
+ * 先頭で取る QPC 時刻は「描画終了 → SteamVR の Submit」を測るためのタグ
  */
 function present(canvas, eyeW, eyeH, seq) {
   if (!gpuDevice || !session) return null
+  // 古いアドオンでは nowQpcMs が無い。その場合はタグなし（計測だけ無効）
+  const tag = typeof session.nowQpcMs === 'function' ? session.nowQpcMs() : 0
   const w = canvas.width
   const h = canvas.height
   const st = ensureStaging(w, h)
@@ -101,10 +111,10 @@ function present(canvas, eyeW, eyeH, seq) {
       const data = buf.getMappedRange()
       if (typeof s.submitLatchedAsync === 'function') {
         // コピーはネイティブの別スレッドで行い、ページのメインスレッドを空ける
-        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq).then((r) => {
+        return s.submitLatchedAsync(data, 0, eyeW * 4, st.bpr, seq, tag).then((r) => {
           stats.sub += performance.now() - t2
           stats.n++
-          if (r) for (const k of ['memcpyMs']) stats.detail[k] = (stats.detail[k] || 0) + r[k]
+          if (r) for (const [k, v] of Object.entries(r)) stats.detail[k] = (stats.detail[k] || 0) + v
         })
       }
       s.submitLatched(data, 0, eyeW * 4, st.bpr, seq)
@@ -153,6 +163,38 @@ const bridge = {
     stats.wait += fs.nativeWaitMs || 0
     stats.notify += fs.notifyDelayMs || 0
     stats.frames++
+    // Submit はネイティブのフレーム待ちスレッドで起きるので、その計測値もここで集計する
+    const st = fs.submitTiming
+    if (st) {
+      if (st.ran) {
+        stats.submitTiming.calls++
+        stats.submitTiming.call += st.submitCallMs || 0
+        stats.submitTiming.first += st.submitFirstMs || 0
+        stats.submitTiming.handoff += st.handoffMs || 0
+        stats.submitTiming.lastSeq = st.seq || 0
+      }
+      if (st.valid) {
+        stats.submitTiming.n++
+        stats.submitTiming.renderToSubmit += st.renderToSubmitMs || 0
+        stats.submitTiming.uploadToSubmit += st.uploadToSubmitMs || 0
+      }
+    }
+    // SteamVR 自身のフレーム計測（Compositor_FrameTiming）。取れないランタイムでは来ない
+    const ft = fs.frameTiming
+    if (ft && ft.valid) {
+      const f = stats.frameTiming
+      f.n++
+      f.appFrame += ft.appFrameMs
+      f.preSubmitGpu += ft.preSubmitGpuMs
+      f.submitFrame += ft.submitFrameMs
+      f.idle += ft.compositorIdleCpuMs
+      f.compositorGpu += ft.compositorRenderGpuMs
+      f.transfer += ft.transferLatencyMs
+      f.clientInterval += ft.clientFrameIntervalMs
+      f.droppedFrames += ft.droppedFrames
+      f.misPresented += ft.misPresented
+      f.lastFrameIndex = ft.frameIndex
+    }
     return { shouldRender: fs.shouldRender || forceRender, predictedDisplayPeriodMs: fs.predictedDisplayPeriodMs }
   },
   beginFrame: () => session.beginFrame(),
@@ -168,6 +210,9 @@ const bridge = {
   },
   stats() {
     const f = stats.frames || 1
+    const st = stats.submitTiming
+    const ft = stats.frameTiming
+    const avg = (v, n) => (n ? +(v / n).toFixed(2) : null)
     const r = {
       dropped: stats.dropped,
       map: stats.n ? +(stats.map / stats.n).toFixed(1) : 0,
@@ -177,10 +222,37 @@ const bridge = {
       onTime: stats.onTime,
       late: stats.late,
       upload: Object.fromEntries(Object.entries(stats.detail).map(([k, v]) => [k, +(v / (stats.n || 1)).toFixed(2)])),
+      submitTiming: st.calls ? {
+        renderToSubmit: avg(st.renderToSubmit, st.n),
+        uploadToSubmit: avg(st.uploadToSubmit, st.n),
+        submitCall: avg(st.call, st.calls),
+        submitFirst: avg(st.first, st.calls),
+        handoff: avg(st.handoff, st.calls),
+        n: st.n,
+        lastSeq: st.lastSeq,
+      } : null,
+      frameTiming: ft.n ? {
+        appFrame: avg(ft.appFrame, ft.n),
+        preSubmitGpu: avg(ft.preSubmitGpu, ft.n),
+        submitFrame: avg(ft.submitFrame, ft.n),
+        compositorIdle: avg(ft.idle, ft.n),
+        compositorGpu: avg(ft.compositorGpu, ft.n),
+        transfer: avg(ft.transfer, ft.n),
+        clientInterval: avg(ft.clientInterval, ft.n),
+        droppedFrames: ft.droppedFrames,
+        misPresented: ft.misPresented,
+        frameIndex: ft.lastFrameIndex,
+        n: ft.n,
+      } : null,
     }
     stats.detail = {}
     stats.onTime = stats.late = 0
     stats.n = stats.map = stats.sub = stats.wait = stats.notify = stats.frames = 0
+    st.n = st.renderToSubmit = st.uploadToSubmit = st.call = st.first = st.handoff = st.calls = 0
+    st.lastSeq = 0
+    ft.n = ft.appFrame = ft.preSubmitGpu = ft.submitFrame = ft.idle = ft.compositorGpu = 0
+    ft.transfer = ft.clientInterval = ft.droppedFrames = ft.misPresented = 0
+    ft.lastFrameIndex = 0
     return r
   },
   endFrame: () => session.endFrame(),
