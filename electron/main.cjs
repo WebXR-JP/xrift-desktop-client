@@ -201,6 +201,22 @@ async function createWindow() {
   win.webContents.on('render-process-gone', (_e, d) => logLine(`[xrift] renderer gone: ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
   app.on('child-process-gone', (_e, d) => logLine(`[xrift] child process gone: ${d.type} ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
   logLine(`[xrift] start url=${startUrl} backend=${backend} scale=${scale}`)
+  // VR の 1 フレームの持ち時間（72Hz なら 13.9ms）に収まるよう、ページと GPU のプロセスを優先度「高」にする
+  const os = require('node:os')
+  const boost = () => {
+    const pids = new Set([process.pid, win.webContents.getOSProcessId()])
+    for (const p of app.getAppMetrics()) if (p.type === 'GPU' || p.type === 'Tab') pids.add(p.pid)
+    for (const pid of pids) {
+      try {
+        if (pid) os.setPriority(pid, os.constants.priority.PRIORITY_HIGH)
+      } catch (err) {
+        logLine('[xrift] priority boost failed for ' + pid + ': ' + err.message)
+      }
+    }
+  }
+  win.webContents.on('did-finish-load', boost)
+  app.on('child-process-gone', () => setTimeout(boost, 2000))
+  setTimeout(boost, 3000)
 
   if (selftest) {
     // 自己テスト: ローカルの three r185 ページで VR セッションを開始し、デスクトップのミラーを保存して終了
