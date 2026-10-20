@@ -55,6 +55,7 @@ export function installM5XR(): void {
     onInput(cb: (snap: { left: M5Hand; right: M5Hand; latchLeft?: string; latchRight?: string }) => void): void;
     haptic(hand: number, intensity: number, durationMs: number): void;
     probe(): Promise<{ ok: boolean }>;
+    sessionActive(active: boolean): void;
   }
   const bridge = (window as unknown as { __xriftXR?: M5Bridge }).__xriftXR;
   if (!bridge || (window as unknown as { __xriftM5Installed?: boolean }).__xriftM5Installed) return;
@@ -67,6 +68,9 @@ export function installM5XR(): void {
   // `native_new/src/transfer/xr_transfer_app.cpp` の kBlockOrg*（A=(64,64)、
   // B=(128,64)、マーカーは左 (160,8)・右 (右半分起点+160,8)、各 32x32）である。
   // DOM の overlay canvas に 2D で描き、Chromium の合成で OSR 共有テクスチャに載せる。
+  // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに使った
+  // record のタグに限る（painted 画像の内容とタグが同一 record に対応する）。
+  // ページが rAF を呼ばなかった record では更新しない（描画していないため）。
   // 計算式は `src/m2codec.ts`（= harness の m2-codec.js = C++ の PoseTag）と同一であり、
   // 変えたら両方を同時に更新する。注入関数は自己完結のため import できず同等品を持つ。
   const M2_AX = 64, M2_BX = 128, M2_BY = 64, M2_CELL = 4;
@@ -690,13 +694,24 @@ export function installM5XR(): void {
           canvas.style.height = `${targetH}px`;
         }
         // M2 制御ブロック（renderId/pose タグ・左右マーカー）を overlay に描く。
-        // 合成で OSR 共有テクスチャに載り、exe が画像から ID 照合する。
+        // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに
+        // 使った record のタグに限る（painted 画像の内容とタグが同一 record に対応する）。
+        // ページが rAF を呼ばなかった record ではタグを更新しない（描画していないため）。
         // 失敗しても XR 駆動は止めない。
+        const cbs = [...this._callbacks.values()];
+        this._callbacks.clear();
+        // 再入（コールバック内の requestAnimationFrame）で二重駆動しないよう先に立てる。
+        if (cbs.length > 0) this._served = true;
+        for (const cb of cbs) {
+          try { cb(t0, frame); } catch (err) { console.error('[XRift M5] XR frame callback error', err); }
+        }
         let stamp: { id16: number; tag: number } | null = null;
-        try {
-          stamp = this._drawM5Blocks(rec, canvas, eyeW, eyeH);
-        } catch (err) {
-          console.error('[XRift M5] block overlay failed', err);
+        if (cbs.length > 0) {
+          try {
+            stamp = this._drawM5Blocks(rec, canvas, eyeW, eyeH);
+          } catch (err) {
+            console.error('[XRift M5] block overlay failed', err);
+          }
         }
         // 最初の数回だけ、record と canvas の対応を記録する（窓側は main が出す）。
         // rAF ポンプで同一 record を繰り返すため、ID が変わったときだけ数える。
@@ -708,13 +723,6 @@ export function installM5XR(): void {
             ? ` id16=0x${stamp.id16.toString(16).padStart(4, '0')} tag=0x${stamp.tag.toString(16).padStart(4, '0')}`
             : ' stamp=none';
           log(`record #${this._recordLogs} id=${rec.renderId}${tagNote} eye=${eyeW}x${eyeH} canvas=${canvas.width}x${canvas.height}`);
-        }
-        const cbs = [...this._callbacks.values()];
-        this._callbacks.clear();
-        // 再入（コールバック内の requestAnimationFrame）で二重駆動しないよう先に立てる。
-        if (cbs.length > 0) this._served = true;
-        for (const cb of cbs) {
-          try { cb(t0, frame); } catch (err) { console.error('[XRift M5] XR frame callback error', err); }
         }
         const st = this._stats;
         const dt = performance.now() - t0;
@@ -764,6 +772,8 @@ export function installM5XR(): void {
       }
       xr._active = null;
       log('session ended');
+      // ADR: main の xrActive を落とすため終了を通知する。届かなくても描画は止まるため例外にしない。
+      try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
       this._emit('end', new XRSessionEvent('end', { session: this }));
     }
   }
@@ -808,10 +818,23 @@ export function installM5XR(): void {
       }
       const enabled = ['viewer', 'local', ...new Set([...(init.requiredFeatures || []), ...(init.optionalFeatures || [])].filter((f) => SUPPORTED.has(f)))];
       log(`requestSession('${mode}') 要求あり（exe の描画要求待ち。最大 20 秒）`);
+      // ADR: main の xrActive を要求時点で立てる。main はこの通知まで record を
+      // 転送しないため、解決待ちの前に通知しないと record が来ず deadlock する。
+      // 失敗時は落として返す。
+      try { if (typeof B.sessionActive === 'function') B.sessionActive(true); } catch { /* 通知失敗時は無視 */ }
       // exe は main 起動時に既に動いているはずであり、ここでは最初の record を待つ。
       // 非装着でも RenderRequest の 1 件目が来れば解決する（準備後の解決）。
-      const rec = await nextRecord(20000);
-      if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
+      let rec: M5Record;
+      try {
+        rec = await nextRecord(20000);
+      } catch (e) {
+        try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
+        throw e;
+      }
+      if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) {
+        try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
+        throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
+      }
       if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
       const info: SessionInfo = {
         width: rec.reqWidth, height: rec.reqHeight,

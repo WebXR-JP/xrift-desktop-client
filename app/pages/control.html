@@ -1,0 +1,164 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRift control</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0b0e;color:#ddd;font:13px/1.5 monospace}
+  body{display:flex;flex-direction:column}
+  #status{display:flex;gap:16px;align-items:center;padding:6px 12px;background:#16161c;
+    border-bottom:1px solid #2a2a33;white-space:nowrap;overflow:hidden}
+  #status b{color:#fff;font-weight:normal}
+  #wrap{position:relative;flex:1;background:#000;min-height:0}
+  #mirror{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair}
+  #hint{position:absolute;right:8px;bottom:6px;color:rgba(255,255,255,.45);font-size:11px;pointer-events:none}
+</style>
+<div id="status">
+  <span>接続 <b id="st-conn">-</b></span>
+  <span>VR <b id="st-vr">-</b></span>
+  <span>paint <b id="st-fps">-</b></span>
+  <span>mirror <b id="st-mfps">-</b></span>
+  <span>capture <b id="st-cap">-</b></span>
+  <span>OSR <b id="st-osr">-</b></span>
+</div>
+<div id="wrap">
+  <canvas id="mirror" tabindex="0"></canvas>
+  <div id="hint">click/key → OSR へ転送（黒帯は無視）</div>
+</div>
+<script src="./mirror-map.js"></script>
+<script>
+(function () {
+  'use strict';
+  const bridge = window.__xriftMirror;
+  const errBox = (m) => console.log('[control]', m);
+  if (!bridge) { errBox('bridge が無い（preload 未適用）'); return; }
+  const map = window.__mirrorMap;
+  if (!map) { errBox('mirror-map.js が読めない'); return; }
+
+  let osrW = 1280, osrH = 800;
+  const canvas = document.getElementById('mirror');
+  const ctx = canvas.getContext('2d');
+  const off = document.createElement('canvas');
+  let hasFrame = false;
+
+  const el = (id) => document.getElementById(id);
+  const stConn = el('st-conn'), stVr = el('st-vr'), stFps = el('st-fps'),
+    stMfps = el('st-mfps'), stCap = el('st-cap'), stOsr = el('st-osr');
+
+  function resize() {
+    const r = canvas.parentElement.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(r.width)), h = Math.max(1, Math.floor(r.height));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  function draw() {
+    const w = canvas.width, h = canvas.height;
+    if (!(w > 0) || !(h > 0)) return;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+    if (!hasFrame) {
+      ctx.fillStyle = '#888';
+      ctx.font = '14px monospace';
+      ctx.fillText('OSR のミラー待ち…', 16, 28);
+      return;
+    }
+    // アスペクト維持で等倍率に収め、余白は黒帯のまま残す。
+    const lb = map.computeLetterbox(osrW, osrH, w, h);
+    if (lb === null) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(off, lb.ox, lb.oy, lb.dw, lb.dh);
+  }
+
+  bridge.onFrame((f) => {
+    if (!f || typeof f.width !== 'number' || typeof f.height !== 'number' || !f.data) return;
+    if (!(f.width > 0) || !(f.height > 0)) return;
+    // main の toBitmap() は BGRA 生配列。canvas の putImageData は RGBA のため、
+    // B と R を戻してから載せる（main 側では素通しし、変換はここに集約する）。
+    const src = f.data instanceof Uint8ClampedArray ? f.data : new Uint8ClampedArray(f.data);
+    if (src.length < f.width * f.height * 4) return;
+    const rgba = new Uint8ClampedArray(f.width * f.height * 4);
+    for (let i = 0; i < rgba.length; i += 4) {
+      rgba[i] = src[i + 2]; rgba[i + 1] = src[i + 1]; rgba[i + 2] = src[i]; rgba[i + 3] = src[i + 3];
+    }
+    off.width = f.width; off.height = f.height;
+    off.getContext('2d').putImageData(new ImageData(rgba, f.width, f.height), 0, 0);
+    hasFrame = true;
+    draw();
+  });
+
+  bridge.onStatus((s) => {
+    if (!s || typeof s !== 'object') return;
+    if (typeof s.osrW === 'number' && s.osrW > 0) osrW = Math.floor(s.osrW);
+    if (typeof s.osrH === 'number' && s.osrH > 0) osrH = Math.floor(s.osrH);
+    stConn.textContent = s.connected ? '○' : '×';
+    stVr.textContent = s.vr ? '中' : '待機';
+    stFps.textContent = typeof s.fps === 'number' ? s.fps.toFixed(0) + 'fps' : '-';
+    stMfps.textContent = typeof s.mirrorFps === 'number' ? s.mirrorFps.toFixed(1) + 'fps' : '-';
+    stCap.textContent = typeof s.captureMsAvg === 'number' ? s.captureMsAvg.toFixed(1) + 'ms' : '-';
+    stOsr.textContent = `${osrW}x${osrH}`;
+    draw();
+  });
+
+  // canvas 上の点（CSS 画素）を OSR content 座標へ直して送る。黒帯上は捨てる。
+  function toOsr(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!(r.width > 0) || !(r.height > 0)) return null;
+    const p = map.canvasToOsr(e.clientX - r.left, e.clientY - r.top, osrW, osrH, r.width, r.height);
+    return p;
+  }
+  function modifiersOf(e) {
+    const m = [];
+    if (e.shiftKey) m.push('shift');
+    if (e.ctrlKey) m.push('control');
+    if (e.altKey) m.push('alt');
+    if (e.metaKey) m.push('meta');
+    return m;
+  }
+
+  canvas.addEventListener('mousemove', (e) => {
+    const p = toOsr(e);
+    if (p === null) return;
+    bridge.sendInput({ kind: 'mouseMove', x: p.x, y: p.y });
+  });
+  canvas.addEventListener('mousedown', (e) => {
+    canvas.focus();
+    const p = toOsr(e);
+    if (p === null) return;
+    const button = e.button === 1 ? 'middle' : e.button === 2 ? 'right' : 'left';
+    bridge.sendInput({ kind: 'mouseDown', x: p.x, y: p.y, button, clickCount: e.detail >= 1 ? e.detail : 1 });
+  });
+  window.addEventListener('mouseup', (e) => {
+    const p = toOsr(e);
+    if (p === null) return;
+    const button = e.button === 1 ? 'middle' : e.button === 2 ? 'right' : 'left';
+    bridge.sendInput({ kind: 'mouseUp', x: p.x, y: p.y, button, clickCount: e.detail >= 1 ? e.detail : 1 });
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const p = toOsr(e);
+    if (p === null) return;
+    bridge.sendInput({ kind: 'mouseWheel', x: p.x, y: p.y, deltaX: e.deltaX, deltaY: e.deltaY });
+  }, { passive: false });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  window.addEventListener('keydown', (e) => {
+    // 開発者ツールの呼び出しは奪わない。
+    if (e.key === 'F12') return;
+    if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) return;
+    if (typeof e.key !== 'string' || e.key === '') return;
+    e.preventDefault();
+    const modifiers = modifiersOf(e);
+    bridge.sendInput({ kind: 'keyDown', keyCode: e.key, modifiers });
+    // 印字可能文字は char も送る（ログイン等のテキスト入力用）。
+    if (e.key.length === 1) bridge.sendInput({ kind: 'char', keyCode: e.key });
+  });
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'F12') return;
+    if (typeof e.key !== 'string' || e.key === '') return;
+    e.preventDefault();
+    bridge.sendInput({ kind: 'keyUp', keyCode: e.key, modifiers: modifiersOf(e) });
+  });
+
+  resize();
+  canvas.focus();
+})();
+</script>

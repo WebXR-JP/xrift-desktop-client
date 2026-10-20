@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRift mirror test</title>
+<style>
+  html,body{margin:0;min-height:100%;background:#14141c;color:#fff;font:16px/1.7 sans-serif}
+  main{max-width:900px;margin:0 auto;padding:48px 24px}
+  #btn{font-size:28px;padding:18px 48px;border:0;border-radius:12px;background:#e03030;color:#fff;cursor:pointer}
+  #result{margin-top:16px;font-size:22px;font-weight:bold}
+  #name{font-size:20px;padding:8px 12px;margin-top:16px;width:320px}
+  .swatches{display:flex;gap:16px;margin-top:32px}
+  .sw{width:96px;height:96px;border-radius:8px}
+</style>
+<main>
+  <h1>ミラーテスト</h1>
+  <button id="btn" type="button">押してね</button>
+  <div id="result">まだ押されていない</div>
+  <label>名前 <input id="name" type="text" value="" autocomplete="off"></label>
+  <div class="swatches">
+    <div class="sw" id="sw-r" style="background:#ff0000"></div>
+    <div class="sw" id="sw-g" style="background:#00ff00"></div>
+    <div class="sw" id="sw-b" style="background:#0000ff"></div>
+  </div>
+</main>
+<script>
+let n = 0;
+const btn = document.getElementById('btn')
+const result = document.getElementById('result')
+btn.addEventListener('click', () => {
+  n++
+  result.textContent = `押された ${n}回`
+  document.body.style.background = `hsl(${(n * 60) % 360} 40% 16%)`
+})
+window.__mirrorTest = { get count() { return n } }
+</script>

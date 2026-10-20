@@ -258,6 +258,19 @@ int RunM2SelfTest() {
     Check(base[kInputHand0 + kInputHandButtons] == kBtnPrimary, "buttons 欄は従来どおり");
   }
 
+  // 13b. TTL 設定の上書き（--record-ttl-ms の実行値）。既定 500ms は変えない。
+  {
+    RenderLedger custom(1, 7, 2000000u);
+    const RenderRecord& c =
+        custom.Issue(43, left, right, lf, rf, 2048, 1024, t0);
+    const uint16_t cid16 = static_cast<uint16_t>(c.renderId & 0xFFFFu);
+    const uint16_t ctag = PoseTag(c.renderId, c.connEpoch, c.spaceEpoch, c.left, c.right);
+    Check(custom.maxAgeUs() == 2000000u, "TTL 設定値の保持");
+    Check(custom.Accept(cid16, ctag, 7, t0 + 600000) == RejectReason::Accepted,
+          "TTL 2s では 600ms の画像も受理");
+    Check(custom.Accept(cid16, ctag, 7, t0 + 2000001) == RejectReason::Expired,
+          "TTL 2s 超の画像は棄却");
+  }
   // 13. M5: InputState のコントローラ pose（左右の grip/aim）の往復。
   // 配置は protocol.h の kInput*（C++ と JS の一致は protocol-test.js で行う）。
   // 有効性は手 flags が表し、無効時の値は 0 のままである。

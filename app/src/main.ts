@@ -4,7 +4,7 @@
  *
  * 役割: パイプサーバ + 借用台帳 + `release()` 専任。提出には関与しない。
  *  - OSR ウィンドウ（show:false、offscreen useSharedTexture）で paint を受ける
- *  - 借用は「処理中 1 枚 + 保留 1 枚」まで。超過した古い保留は即 release する
+ *  - 借用は処理中 1 枚まで。未処理の Offer がある間の paint は stale として即 release する
  *  - Done を受けたらその借用だけ release する（二重 release しない）
  *  - exe の終了・切断時は、未 offer の保留だけ release する。offer 済み未 ACK は
  *    GPU 完了の証拠が無いため release せず隔離する。Electron 終了で回収する
@@ -13,7 +13,7 @@
  *
  * @packageDocumentation
  */
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, type NativeImage } from 'electron';
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
@@ -23,8 +23,9 @@ import {
   TYPE_DONE, TYPE_RENDER_REQUEST, TYPE_INPUT_STATE,
   STATUS_OK, FORMAT_BGRA,
   decodeRecord, decodeInput, makeOffer, makeHaptic,
-  type InputSnapshot,
+  type InputSnapshot, type XrRecord,
 } from './protocol';
+import { toOsrInputEvent } from './mirror-input';
 
 // VR 中はデスクトップのウィンドウが隠れていても描画・タイマーを止めない。
 // appendSwitch は ready より前に呼ぶ（ready 後に足しても効かない）。
@@ -45,9 +46,12 @@ function arg(name: string, def: string): string {
 const EXE_PATH = arg('exe', path.join(__dirname, '..', '..', 'native_new', 'build', 'windows', 'Release', 'xrift_new.exe'));
 const PIPE_PATH = arg('pipe', `\\\\.\\pipe\\xrift_m5_${process.pid}`);
 const RENDER_SCALE = arg('render-scale', '0.5');
+const RECORD_TTL_MS = Math.max(1, parseInt(arg('record-ttl-ms', '2000'), 10) || 2000);
 const SECONDS = Math.max(0, parseInt(arg('seconds', '0'), 10) || 0);
-const WIN_W = parseInt(arg('width', '2048'), 10) || 2048;
-const WIN_H = parseInt(arg('height', '1024'), 10) || 1024;
+// C 案の OSR はブラウジング中 1280x800。VR 開始（RenderRequest）で
+// 2*eye × eye へ広げる（forwardRecord が担う）。--width/--height で上書き可。
+const WIN_W = parseInt(arg('width', '1280'), 10) || 1280;
+const WIN_H = parseInt(arg('height', '800'), 10) || 800;
 const SPACE = arg('space', 'auto');
 const PAGE_ARG = arg('page', '');
 const URL_ARG = arg('url', '');
@@ -98,6 +102,43 @@ if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
 // 指定時刻に webContents.capturePage() で PNG を保存する。描画経路には入れない。
 const CAPTURE_AT_LIST: { ms: number; file: string }[] = (() => {
   const raw = arg('capture-at', '');
+  if (raw === '') return [];
+  const out: { ms: number; file: string }[] = [];
+  for (const s of raw.split(';')) {
+    const t = s.trim();
+    if (t === '') continue;
+    const i = t.indexOf(',');
+    if (i <= 0) continue;
+    const ms = Math.max(0, parseInt(t.slice(0, i).trim(), 10) || 0);
+    const file = t.slice(i + 1).trim();
+    if (!(ms > 0) || file === '') continue;
+    out.push({ ms, file });
+  }
+  return out;
+})();
+// C 案（OSR のミラー + 入力転送）の設定。exe 無しでもミラー検証ができるよう
+// `--no-exe` では exe の spawn・パイプサーバを飛ばす。`--self-test` は
+// ミラー・入力転送・VR リサイズの自動検証を行い、結果で終了する（HMD 不要）。
+// 検証専用の pace 無効化（`--no-pace-records`）。exe への `--pace-records` を
+// 渡さず、従来どおり毎フレーム発行させる。遅いページでの受理率の on/off 比較用。
+// 通常運用では付けない（既定は pace on）。
+const NO_PACE = process.argv.slice(2).includes('--no-pace-records');
+const NO_EXE = process.argv.slice(2).includes('--no-exe');
+const SELF_TEST = process.argv.slice(2).includes('--self-test');
+const MIRROR_FPS = Math.min(30, Math.max(1, parseInt(arg('mirror-fps', '10'), 10) || 10));
+// ADR: VR 中のミラーは既定で停止する（0=停止）。ブラウジング中は 10fps のまま。
+// 0 を許すため下限は 0 とし、数値以外は既定 0 に倒す。
+const MIRROR_VR_FPS = (() => {
+  const raw = arg('mirror-vr-fps', '0');
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(30, Math.max(0, Math.trunc(n)));
+})();
+const CTL_W = parseInt(arg('control-width', '960'), 10) || 960;
+const CTL_H = parseInt(arg('control-height', '600'), 10) || 600;
+// 検証専用のコントロール窓 capture（--control-capture-at=Ms,path。複数は ; 区切り）。
+const CONTROL_CAPTURE_AT_LIST: { ms: number; file: string }[] = (() => {
+  const raw = arg('control-capture-at', '');
   if (raw === '') return [];
   const out: { ms: number; file: string }[] = [];
   for (const s of raw.split(';')) {
@@ -197,12 +238,11 @@ let nextBorrowId = 1;
 const held = new Map<number, SharedTexture>(); // borrowId -> texture（release 前に保持）
 const quarantined = new Map<number, SharedTexture>(); // borrowId -> texture（完了未確認。触らない）
 let inFlight: number | null = null; // offer 済み・ACK 待ちの borrowId（最大 1）
-let pending: number | null = null; // 保留（最大 1）。offer 前なら即 release 可
-const MAX_HELD = 2; // 同時保持の上限（処理中 1 + 保留 1）
+const MAX_HELD = 1; // 同時保持の上限（処理中 1 枚のみ。未処理がある間の paint は stale として即返す）
 let stopping = false; // 計測終了後。新規 paint は即 release する
 let finished = false;
 const stats = {
-  offers: 0, dones: 0, drops: 0, offerFailures: 0, staleDones: 0,
+  offers: 0, dones: 0, drops: 0, droppedStale: 0, offerFailures: 0, staleDones: 0,
   quarantined: 0, releasedPending: 0, maxHeld: 0,
   statusOk: 0, statusCopyFailed: 0, statusVerifyFailed: 0,
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
@@ -212,6 +252,13 @@ const stats = {
   lastInput: null as InputSnapshot | null, // 最後に受けた InputState の要約（統計用）。
   hapticSent: 0, // exe へ送った HapticCommand の件数。
   captures: 0, // 検証専用の --capture-at で保存した PNG の枚数（描画経路に影響しない）。
+  controlCaptures: 0, // --control-capture-at・self-test で保存したコントロール窓 PNG の枚数。
+  mirrorFrames: 0, // コントロール窓へ送ったミラーの枚数。
+  mirrorErrors: 0, // ミラー capture・送信の失敗回数。
+  mirrorCaptureAvgMs: 0, // capturePage の平均所要（終了時に確定）。
+  mirrorCaptureMaxMs: 0, // capturePage の最大所要。
+  inputForwarded: 0, // OSR へ転送した入力イベントの件数。
+  inputErrors: 0, // 破棄・失敗した入力転送の件数。
   releaseAttempts: 0, // release() の試行回数。
 };
 const handleCounts = new Map<string, number>();
@@ -222,6 +269,107 @@ let winRef: BrowserWindow | null = null; // レコード転送先（createWindow
 let stopTimer: NodeJS.Timeout | null = null;
 let graceTimer: NodeJS.Timeout | null = null;
 const captureTimers: NodeJS.Timeout[] = [];
+const controlCaptureTimers: NodeJS.Timeout[] = [];
+// ---- C 案のミラー状態。OSR（不可視）の capturePage をタイマーで拾い、
+// 可視のコントロール窓へ送る。VR 中は停止（既定）または節約間隔で VR の負荷を優先する。
+let controlRef: BrowserWindow | null = null; // ミラー表示・入力受付先（createControlWindow が設定する）。
+// ADR: VR の開始は renderer の requestSession 通知（xr:session）で決める。
+// exe は起動時から RenderRequest を送り続けるため、RenderRequest の到着だけでは
+// VR とみなさない。xrActive が false の間は VR サイズへ広げず renderer へも転送しない。
+let xrActive = false; // renderer が requestSession したら真、セッション終了で偽。
+let vrActive = false; // ミラー節約の旗。xrActive に追従する（開始で真、終了で偽）。
+let xrDroppedRecords = 0; // xrActive が false の間に受けて捨てた RenderRequest の件数。
+let mirrorTimer: NodeJS.Timeout | null = null;
+let mirrorStopped = false; // 終了処理後は再開しない（タイマー解除の証跡）。
+let mirrorNextAt = 0; // 次拍の予定時刻（固定レート維持用。遅延分を詰めて平均 fps を保つ）。
+let statusTimer: NodeJS.Timeout | null = null;
+let mirrorTotalMs = 0; // capturePage 所要の合計（平均用）。
+const mirrorTimes: number[] = []; // ミラー送信時刻（直近の fps 計算用。100 件で丸める）。
+// VR 中の 5 秒計測用。exe の stdout を main が中継する際に数える（提出・棄却の内訳）。
+// paint レート（OSR 側の描画）と受理率（exe 側の照合）を切り分けるため、5 秒ごとにログに出す。
+const vrMeter = {
+  submits: 0, // exe の M2 提出（受理して blit へ進んだ件数）。
+  unknownId: 0, // 棄却の内訳（保持に無い renderId）。
+  poseMismatch: 0, // 棄却の内訳（pose タグ不一致）。
+  spaceMismatch: 0, // 棄却の内訳（space 世代不一致）。
+  expired: 0, // 棄却の内訳（TTL 超過）。
+  lastPaints: 0, // 前回計測時の paints 累計（差分でレートを出す）。
+  lastSubmits: 0, // 前回計測時の提出累計。
+  lastUnknown: 0, lastPoseNg: 0, lastSpaceNg: 0, lastExpired: 0,
+  lastStale: 0, // 前回計測時の stale paint 累計（差分で捨て率を出す）。
+};
+let vrMeterTimer: NodeJS.Timeout | null = null;
+// exe の 1 チャンクから提出・棄却の行を数える。exe のログ形式
+// （`M2 提出:`・`M2 棄却: <理由>`）に依存するため、形式が変わればここも更新する。
+function countExeMeterChunk(text: string): void {
+  if (!text.includes('M2 ')) return;
+  // 提出は 1 行 1 件である。
+  let i = text.indexOf('M2 提出:');
+  while (i >= 0) {
+    vrMeter.submits++;
+    i = text.indexOf('M2 提出:', i + 1);
+  }
+  // 棄却は理由名で内訳を数える（render_record.h の RejectReasonName と一致）。
+  const reasons: [string, 'unknownId' | 'poseMismatch' | 'spaceMismatch' | 'expired'][] = [
+    ['M2 棄却: 不明ID', 'unknownId'],
+    ['M2 棄却: pose不一致', 'poseMismatch'],
+    ['M2 棄却: space世代不一致', 'spaceMismatch'],
+    ['M2 棄却: 失効', 'expired'],
+  ];
+  for (const [needle, key] of reasons) {
+    let j = text.indexOf(needle);
+    while (j >= 0) {
+      vrMeter[key]++;
+      j = text.indexOf(needle, j + 1);
+    }
+  }
+}
+// VR 中の 5 秒計測。paint レート（描画が遅いか）と受理率（転送が遅いか）を切り分ける。
+// xrActive が false の間は出さない（ブラウジング中の雑音にしない）。
+function logVrMeter(): void {
+  if (!xrActive) return;
+  const paints = paintTimes.length;
+  const dPaints = paints - vrMeter.lastPaints;
+  const dSub = vrMeter.submits - vrMeter.lastSubmits;
+  const dUnk = vrMeter.unknownId - vrMeter.lastUnknown;
+  const dPose = vrMeter.poseMismatch - vrMeter.lastPoseNg;
+  const dSpace = vrMeter.spaceMismatch - vrMeter.lastSpaceNg;
+  const dExp = vrMeter.expired - vrMeter.lastExpired;
+  const dStale = stats.droppedStale - vrMeter.lastStale;
+  vrMeter.lastPaints = paints;
+  vrMeter.lastSubmits = vrMeter.submits;
+  vrMeter.lastUnknown = vrMeter.unknownId;
+  vrMeter.lastPoseNg = vrMeter.poseMismatch;
+  vrMeter.lastSpaceNg = vrMeter.spaceMismatch;
+  vrMeter.lastExpired = vrMeter.expired;
+  vrMeter.lastStale = stats.droppedStale;
+  // 受理率: exe が判定した件数（提出+棄却）に占める提出の割合。窓 5 秒と累計の両方を出す。
+  // paint あたりの受理: paint 1 枚が何件の提出に結びついたか（1 を超えないことが期待値）。
+  const dRej = dUnk + dPose + dSpace + dExp;
+  const dDecided = dSub + dRej;
+  const winRate = dDecided > 0 ? `${(dSub / dDecided * 100).toFixed(1)}%` : '−';
+  const totDecided = vrMeter.submits + vrMeter.unknownId + vrMeter.poseMismatch +
+    vrMeter.spaceMismatch + vrMeter.expired;
+  const totRate = totDecided > 0 ? `${(vrMeter.submits / totDecided * 100).toFixed(1)}%` : '−';
+  const perPaint = dPaints > 0 ? (dSub / dPaints).toFixed(2) : '−';
+  log(`[M5 VR計測] paint=${dPaints}/5s（${(dPaints / 5).toFixed(1)}/s） ` +
+    `offers=${stats.offers} dones=${stats.dones} stalePaint+${dStale}（累計${stats.droppedStale}） ` +
+    `提出+${dSub}（累計${vrMeter.submits}） ` +
+    `棄却+${dRej}` +
+    `（不明ID+${dUnk} pose不一致+${dPose} 世代不一致+${dSpace} 失効+${dExp}） ` +
+    `受理率=${winRate}（窓5s）/${totRate}（累計） paintあたり受理=${perPaint}`);
+}
+function startVrMeter(): void {
+  if (vrMeterTimer !== null) return;
+  vrMeter.lastPaints = paintTimes.length;
+  vrMeterTimer = setInterval(logVrMeter, 5000);
+}
+function stopVrMeter(): void {
+  if (vrMeterTimer !== null) {
+    clearInterval(vrMeterTimer);
+    vrMeterTimer = null;
+  }
+}
 // 終了コード確定の状態。パイプ close で finish を確定し、後の exe 非ゼロを無視する競合をなくす。
 let exeCode: number | null = null; // exe の終了コード（signal 死は非ゼロ扱い）。未終了は null。
 let pipeClosed = false;
@@ -335,22 +483,6 @@ function makeOfferToExe(borrowId: number, width: number, height: number, ntHandl
   return true;
 }
 
-// inFlight が空いていれば保留を繰り上げる。複製失敗時はその借用を捨てて次を試す。
-// 停止中は登録・pump を止めるため何もしない。
-function pumpQueue(meta: Map<number, { width: number; height: number; ntHandle: Buffer }>): void {
-  if (stopping) return;
-  while (inFlight === null && pending !== null && socket !== null && !socket.destroyed) {
-    const b = pending;
-    pending = null;
-    const m = meta.get(b);
-    meta.delete(b);
-    if (m === undefined) continue;
-    if (makeOfferToExe(b, m.width, m.height, m.ntHandle)) {
-      inFlight = b;
-    }
-  }
-}
-
 function onPaint(details: unknown): void {
   paintTimes.push(Date.now());
   // 初回だけ paint の形状を記録する（版差の観測用。以後は出さない）。
@@ -393,50 +525,32 @@ function onPaint(details: unknown): void {
   const hex = (nt as Buffer).toString('hex');
   handleCounts.set(hex, (handleCounts.get(hex) || 0) + 1);
 
-  // 新規借用を登録する前に古い保留の release を済ませ、maxHeld が上限を超えない
-  // ようにする（登録後に追い出すと瞬間的に 3 枚になり maxHeld が汚れる）。
-  const meta = onPaintMeta;
-  if (inFlight !== null && pending !== null) {
-    const old = pending;
-    pending = null;
-    meta.delete(old);
-    stats.drops++;
-    releaseOnce(old, 'superseded');
+  // フロー制御: 未処理の Offer（inFlight）がある間の paint は古いため、
+  // duplicate/offer せず texture を即 release して捨てる。未処理の record に
+  // 対応しない paint であり、既存の drops と区別して droppedStale に数える。
+  // --pace-records の exe と対になり、発行と消費を 1:1 に保つ。
+  if (inFlight !== null) {
+    stats.droppedStale++;
+    releaseUnregistered(texture, 'stale-superseded');
+    return;
   }
 
   // 借用登録（release の所有権を台帳が持つ）。
   const borrowId = nextBorrowId++;
   held.set(borrowId, texture);
   noteHeld();
-  meta.set(borrowId, { width: coded.width, height: coded.height, ntHandle: Buffer.from(nt as Buffer) });
 
   if (socket === null || socket.destroyed) {
-    // exe 未接続。保留に積まず即返す（転送前 drop）。
-    meta.delete(borrowId);
+    // exe 未接続。即返す（転送前 drop）。
     stats.drops++;
     releaseOnce(borrowId, 'not-connected');
     return;
   }
-  if (inFlight === null) {
-    const m = meta.get(borrowId);
-    meta.delete(borrowId);
-    if (m !== undefined && makeOfferToExe(borrowId, m.width, m.height, m.ntHandle)) {
-      inFlight = borrowId;
-    }
-    return;
+  if (makeOfferToExe(borrowId, coded.width, coded.height, Buffer.from(nt as Buffer))) {
+    inFlight = borrowId;
   }
-  if (pending === null) {
-    pending = borrowId;
-    return;
-  }
-  // ここには来ないはず（登録前に古い保留を追い出している）。来たら異常として記録する。
-  log(`異常: 保留が二重になった borrow=${borrowId} old=${pending}`);
-  meta.delete(pending);
-  stats.drops++;
-  releaseOnce(pending, 'superseded-unexpected');
-  pending = borrowId;
+  // makeOfferToExe の失敗時は内部で release 済みのため何もしない。
 }
-const onPaintMeta = new Map<number, { width: number; height: number; ntHandle: Buffer }>();
 let paintShapeLogged = false;
 
 /** 版差の観測用に paint 引数の形状を 1 行で表す。借用には触らない。 */
@@ -460,8 +574,6 @@ function onDone(borrowId: number, status: number): void {
     else if (status === 2) stats.statusVerifyFailed++;
     else stats.statusCopyFailed++;
     releaseOnce(borrowId, 'done');
-    // 停止中は pump しない。
-    if (!stopping) pumpQueue(onPaintMeta);
     maybeFinish();
   } else {
     // 重複・遅延 ACK は無視する（台帳の直列化）。
@@ -474,8 +586,60 @@ function onDone(borrowId: number, status: number): void {
 // main プロセスは値を推測・付与しない。使用証拠は画素内の ID のみである。
 // OSR ウィンドウの content サイズは要求（眼ごと reqWidth/reqHeight）に追従させる。
 // 両眼横並びのため 2*reqWidth × reqHeight にする。初回とサイズ変更時のみ変える。
+// VR への切替は xrActive（renderer の requestSession 通知）で決める。
+// xrActive が false の間はリサイズも転送もしない（サイトを開いただけでは VR にしない）。
+// self-test の VR リサイズ検証もこの関数を通す（本番と同一経路）。
+function applyVrResize(reqW: number, reqH: number, renderId: string): void {
+  const osr = winRef;
+  if (osr === null || osr.isDestroyed()) return;
+  const targetW = reqW * 2;
+  const targetH = reqH;
+  const [curW, curH] = osr.getContentSize();
+  if (lastReqSize === null || lastReqSize.w !== targetW || lastReqSize.h !== targetH ||
+      curW !== targetW || curH !== targetH) {
+    try {
+      osr.setContentSize(targetW, targetH);
+      log(`window リサイズ: ${curW}x${curH} → ${targetW}x${targetH}（req ${reqW}x${reqH}/眼 renderId=${renderId}）`);
+    } catch (e) {
+      log(`window リサイズ失敗 ${targetW}x${targetH}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    lastReqSize = { w: targetW, h: targetH };
+  }
+  if (!vrActive) {
+    vrActive = true;
+    if (MIRROR_VR_FPS <= 0) {
+      log(`ミラー停止（VR 開始 renderId=${renderId}。既定 0 のため VR 中は止める）`);
+    } else {
+      log(`ミラー節約に切替: ${MIRROR_FPS}fps → ${MIRROR_VR_FPS}fps（VR 開始 renderId=${renderId}。VR の負荷を優先）`);
+    }
+    restartMirrorTimer();
+  }
+}
 let lastReqSize: { w: number; h: number } | null = null;
 let recordLogCount = 0;
+// ADR: xrActive が立つ前に届いた最新 1 件だけ保つ。exe は起動時から送り続けるため、
+// 通知より先に届いた要求を捨てると requestSession が解決できず deadlock する。
+// 有効化直後にこの 1 件を「次の record」として届け、以後は到着順に流す。
+// 終了通知で破棄する（古い要求を次の開始時に持ち越さない）。
+let bufferedRecord: XrRecord | null = null;
+// 復号済みレコードの配送（リサイズ＋転送）。xrActive が真のときだけ呼ぶ。
+function deliverRecord(rec: XrRecord, via: string): void {
+  if (rec.reqWidth > 0 && rec.reqHeight > 0 &&
+      winRef !== null && !winRef.isDestroyed()) {
+    applyVrResize(rec.reqWidth, rec.reqHeight, rec.renderId);
+    // 最初の数回だけ、要求と窓の対応を記録する（以後の canvas 側は renderer が出す）。
+    // ADR: 条件式で null・破棄済みを弾いているため、ここでは絞り込みが残る。
+    // 間に挟まるのは読み取り専用の参照渡しだけであり、winRef への代入は無い。
+    if (recordLogCount < 3 && winRef !== null && !winRef.isDestroyed()) {
+      recordLogCount++;
+      const [nowW, nowH] = winRef.getContentSize();
+      log(`[M5記録] #${recordLogCount} renderId=${rec.renderId} req=${rec.reqWidth}x${rec.reqHeight}/眼 window=${nowW}x${nowH} xrActive=true${via}`);
+    }
+    if (winRef !== null && !winRef.isDestroyed()) winRef.webContents.send('xr:record', rec);
+  } else if (winRef !== null && !winRef.isDestroyed()) {
+    winRef.webContents.send('xr:record', rec);
+  }
+}
 function forwardRecord(m: Buffer): void {
   const rec = decodeRecord(m);
   if (rec === null) {
@@ -483,30 +647,54 @@ function forwardRecord(m: Buffer): void {
     return;
   }
   stats.renderRequests++;
-  if (rec.reqWidth > 0 && rec.reqHeight > 0 &&
-      winRef !== null && !winRef.isDestroyed()) {
-    const targetW = rec.reqWidth * 2;
-    const targetH = rec.reqHeight;
-    const [curW, curH] = winRef.getContentSize();
-    if (lastReqSize === null || lastReqSize.w !== targetW || lastReqSize.h !== targetH ||
-        curW !== targetW || curH !== targetH) {
-      try {
-        winRef.setContentSize(targetW, targetH);
-        log(`window リサイズ: ${curW}x${curH} → ${targetW}x${targetH}（req ${rec.reqWidth}x${rec.reqHeight}/眼 renderId=${rec.renderId}）`);
-      } catch (e) {
-        log(`window リサイズ失敗 ${targetW}x${targetH}: ${e instanceof Error ? e.message : String(e)}`);
+  // ADR: xrActive が false の間は VR サイズへ広げず renderer へも転送しない。
+  // exe は起動時から送り続けるため、サイトを開いただけではブラウジング寸法のまま保つ。
+  // 最新 1 件だけ保ち、有効化直後に届ける（requestSession の解決用）。
+  if (!xrActive) {
+    xrDroppedRecords++;
+    bufferedRecord = rec;
+    if (xrDroppedRecords <= 3 || xrDroppedRecords % 500 === 0) {
+      const sizeNote = winRef !== null && !winRef.isDestroyed()
+        ? ` window=${winRef.getContentSize().join('x')} のまま`
+        : '';
+      log(`RenderRequest を保留（xrActive=false のため転送せず最新 1 件を保持 renderId=${rec.renderId} 累計${xrDroppedRecords}件${sizeNote}）`);
+    }
+    return;
+  }
+  deliverRecord(rec, '');
+}
+
+// renderer のセッション開始・終了の通知で xrActive を切り替える。
+// 開始時は保留中の最新 1 件から VR サイズへ広げて転送し、終了時はブラウジングに戻す。
+function setXrActive(active: boolean): void {
+  if (xrActive === active) return;
+  xrActive = active;
+  log(`xrActive=${active ? 'true（VR 開始。保留中の最新からリサイズ・転送する）' : 'false（セッション終了。転送を止める）'}`);
+  if (active) {
+    if (!vrActive) {
+      vrActive = true;
+      if (MIRROR_VR_FPS <= 0) {
+        log(`ミラー停止（VR 開始。既定 0 のため VR 中は止める）`);
+      } else {
+        log(`ミラー節約に切替: ${MIRROR_FPS}fps → ${MIRROR_VR_FPS}fps（VR 開始。VR の負荷を優先）`);
       }
-      lastReqSize = { w: targetW, h: targetH };
+      restartMirrorTimer();
     }
-    // 最初の数回だけ、要求と窓の対応を記録する（以後の canvas 側は renderer が出す）。
-    if (recordLogCount < 3) {
-      recordLogCount++;
-      const [nowW, nowH] = winRef.getContentSize();
-      log(`[M5記録] #${recordLogCount} renderId=${rec.renderId} req=${rec.reqWidth}x${rec.reqHeight}/眼 window=${nowW}x${nowH}`);
+    // 通知前に届いた最新 1 件を「次の record」として届ける。
+    // 無ければ以後の到着を待つ（requestSession の解決用）。
+    if (bufferedRecord !== null) {
+      const rec = bufferedRecord;
+      bufferedRecord = null;
+      log(`保留中の RenderRequest を転送（renderId=${rec.renderId}。有効化直後の 1 件）`);
+      deliverRecord(rec, '（保留分）');
     }
-    winRef.webContents.send('xr:record', rec);
-  } else if (winRef !== null && !winRef.isDestroyed()) {
-    winRef.webContents.send('xr:record', rec);
+  } else {
+    bufferedRecord = null;
+    if (vrActive) {
+      vrActive = false;
+      log(`ミラー復帰: ブラウジング ${MIRROR_FPS}fps に戻す（セッション終了）`);
+      restartMirrorTimer();
+    }
   }
 }
 
@@ -581,11 +769,420 @@ function scheduleCapture(win: BrowserWindow): void {
   }
 }
 
-function maybeFinish(): void {
-  if (!stopping || finished) return;
+/**
+ * C 案のミラー。OSR（不可視）の capturePage をタイマーで拾い、Bitmap を
+ * コントロール窓へ送る。VR 中は既定で止めて VR の負荷を優先する。
+ * 解像度は OSR の content サイズそのままであり、黒帯つきの等倍表示は
+ * コントロール側（pages/control.html）が担う。
+ */
+
+// 現在のミラー間隔（ms）。VR 中は節約間隔に切り替える。0 以下は停止の合図である。
+function currentMirrorInterval(): number {
+  const fps = vrActive ? MIRROR_VR_FPS : MIRROR_FPS;
+  if (!(fps > 0)) return 0;
+  return Math.round(1000 / fps);
+}
+
+// VR 中のミラー停止中か。間隔 0 のとき真である。
+function isMirrorPausedForVr(): boolean {
+  return vrActive && !(MIRROR_VR_FPS > 0);
+}
+
+// capturePage の結果から送信用の Bitmap を取り出す。
+// 版差に備え、形状は実行時に確認する（型注釈だけでは保証できない）。
+function extractMirrorBitmap(img: NativeImage): { width: number; height: number; data: Buffer } | null {
+  const size = img.getSize();
+  if (!(size.width > 0) || !(size.height > 0)) return null;
+  let raw: Buffer;
+  try {
+    raw = img.toBitmap();
+  } catch (e) {
+    log(`mirror toBitmap 失敗: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+  if (!Buffer.isBuffer(raw)) return null;
+  if (raw.length < size.width * size.height * 4) {
+    log(`mirror bitmap 不足: ${raw.length}B に対し ${size.width}x${size.height}x4 を期待`);
+    return null;
+  }
+  return { width: size.width, height: size.height, data: Buffer.from(raw) };
+}
+
+// ミラーの 1 拍。重なりを避けるため setTimeout 鎖で回す（setInterval にしない）。
+async function mirrorTick(): Promise<void> {
+  mirrorTimer = null;
+  const osr = winRef;
+  const ctl = controlRef;
+  if (mirrorStopped || osr === null || osr.isDestroyed() || ctl === null || ctl.isDestroyed()) return;
+  const t0 = performance.now();
+  try {
+    const img = await osr.webContents.capturePage();
+    const bmp = extractMirrorBitmap(img);
+    const spent = performance.now() - t0;
+    if (bmp === null) {
+      stats.mirrorErrors++;
+    } else {
+      mirrorTotalMs += spent;
+      if (spent > stats.mirrorCaptureMaxMs) stats.mirrorCaptureMaxMs = spent;
+      stats.mirrorFrames++;
+      mirrorTimes.push(Date.now());
+      if (mirrorTimes.length > 100) mirrorTimes.splice(0, mirrorTimes.length - 100);
+      if (!ctl.isDestroyed()) {
+        ctl.webContents.send('mirror:frame', { width: bmp.width, height: bmp.height, data: bmp.data });
+      }
+      if (stats.mirrorFrames <= 3 || stats.mirrorFrames % 100 === 0) {
+        log(`mirror frame #${stats.mirrorFrames} ${bmp.width}x${bmp.height} ` +
+          `capture=${spent.toFixed(1)}ms mode=${vrActive ? `vr(${MIRROR_VR_FPS}fps)` : `browse(${MIRROR_FPS}fps)`}`);
+      }
+    }
+  } catch (e) {
+    stats.mirrorErrors++;
+    log(`mirror capture 失敗: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!mirrorStopped) scheduleMirrorTick();
+}
+
+// 次拍を固定レートで予約する。1 拍の所要が間隔を超えた分は詰め、
+// 溜まった遅れは捨てる（最新優先。借用台帳と同じ考え方）。
+// VR 中の停止時（間隔 0）は予約しない。
+function scheduleMirrorTick(): void {
+  if (mirrorStopped || isMirrorPausedForVr()) return;
+  const interval = currentMirrorInterval();
+  if (!(interval > 0)) return;
+  mirrorNextAt += interval;
+  const now = Date.now();
+  // 1 拍分以上遅れたら backlog を捨てて今から取り直す（追いつき連打にしない）。
+  if (mirrorNextAt < now - interval) mirrorNextAt = now + interval;
+  mirrorTimer = setTimeout(() => { void mirrorTick(); }, Math.max(0, mirrorNextAt - now));
+}
+
+// ミラー開始。モード切替時（VR 開始）は restartMirrorTimer で間隔を変える。
+function startMirror(): void {
+  if (mirrorTimer !== null || mirrorStopped) return;
+  if (isMirrorPausedForVr()) {
+    log(`mirror 開始を保留（VR 中のため停止。ブラウジングに戻れば ${MIRROR_FPS}fps で再開）`);
+    return;
+  }
+  const interval = currentMirrorInterval();
+  log(`mirror 開始: ${MIRROR_FPS}fps（VR 中は ${MIRROR_VR_FPS <= 0 ? '停止' : `${MIRROR_VR_FPS}fps に節約`}）`);
+  mirrorNextAt = Date.now() + interval;
+  mirrorTimer = setTimeout(() => { void mirrorTick(); }, interval);
+}
+
+// 節約間隔への切替用。停止後は再開しない。VR 中の停止時はタイマーを解除するだけである。
+function restartMirrorTimer(): void {
+  if (mirrorStopped) return;
+  if (mirrorTimer !== null) {
+    clearTimeout(mirrorTimer);
+    mirrorTimer = null;
+  }
+  if (isMirrorPausedForVr()) return;
+  const interval = currentMirrorInterval();
+  if (!(interval > 0)) return;
+  mirrorNextAt = Date.now() + interval;
+  mirrorTimer = setTimeout(() => { void mirrorTick(); }, interval);
+}
+
+// ミラー停止。タイマー解除だけであり、送り済みフレームの後始末は要らない。
+// 終了処理・self-test の停止確認から呼ぶ（安全な多重呼び出し）。
+function stopMirror(): void {
+  mirrorStopped = true;
+  if (mirrorTimer !== null) {
+    clearTimeout(mirrorTimer);
+    mirrorTimer = null;
+  }
+}
+
+// 直近の paint fps（5 秒窓）。ミラー fps（10 秒窓）と合わせて状態行に載せる。
+function recentFps(times: readonly number[], windowMs: number): number {
+  const now = Date.now();
+  let n = 0;
+  for (let i = times.length - 1; i >= 0; i--) {
+    if (now - times[i] > windowMs) break;
+    n++;
+  }
+  return (n * 1000) / windowMs;
+}
+
+function broadcastMirrorStatus(): void {
+  const ctl = controlRef;
+  if (ctl === null || ctl.isDestroyed()) return;
+  const osr = winRef;
+  let osrW = 0, osrH = 0;
+  if (osr !== null && !osr.isDestroyed()) {
+    [osrW, osrH] = osr.getContentSize();
+  }
+  ctl.webContents.send('mirror:status', {
+    connected: socket !== null && !socket.destroyed,
+    vr: vrActive,
+    fps: recentFps(paintTimes, 5000),
+    mirrorFps: recentFps(mirrorTimes, 10000),
+    captureMsAvg: stats.mirrorFrames > 0 ? mirrorTotalMs / stats.mirrorFrames : 0,
+    osrW, osrH,
+  });
+}
+
+function startStatusBroadcast(): void {
+  if (statusTimer !== null) return;
+  statusTimer = setInterval(broadcastMirrorStatus, 1000);
+}
+
+// コントロール窓からの入力を OSR へ転送する。境界検証は mirror-input が担い、
+// ここでは OSR の生存確認・フォーカス・送信と件数の記録だけを行う。
+function handleMirrorInput(raw: unknown): void {
+  const osr = winRef;
+  if (osr === null || osr.isDestroyed()) {
+    stats.inputErrors++;
+    return;
+  }
+  const [osrW, osrH] = osr.getContentSize();
+  const ev = toOsrInputEvent(raw, osrW, osrH);
+  if (ev === null) {
+    stats.inputErrors++;
+    return;
+  }
+  try {
+    // ADR: sendInputEvent は対象 webContents の内部フォーカスを要するため、
+    // 転送の直前に focus する（OS のフォーカスはコントロール窓に残る）。
+    osr.webContents.focus();
+    osr.webContents.sendInputEvent(ev);
+    stats.inputForwarded++;
+  } catch (e) {
+    stats.inputErrors++;
+    log(`mirror 入力の送信に失敗: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+async function createControlWindow(): Promise<BrowserWindow> {
+  const win = new BrowserWindow({
+    width: CTL_W,
+    height: CTL_H,
+    show: true,
+    autoHideMenuBar: true,
+    title: 'XRift control（OSR ミラー）',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      preload: path.join(__dirname, 'control-preload.js'),
+      backgroundThrottling: false,
+    },
+  });
+  controlRef = win;
+  log(`control window created: ${CTL_W}x${CTL_H}（可視・ミラー表示 + 入力受付）`);
+  win.on('focus', () => {
+    // コントロール窓が触られたら OSR の内部フォーカスを戻す（キー転送用）。
+    const osr = winRef;
+    if (osr !== null && !osr.isDestroyed()) {
+      try { osr.webContents.focus(); } catch { /* 終了時は無視 */ }
+    }
+  });
+  win.on('closed', () => {
+    if (controlRef === win) controlRef = null;
+    log('control window closed（ミラー送信を止める）');
+  });
+  win.webContents.on('did-finish-load', () => {
+    log('control did-finish-load');
+  });
+  win.webContents.on('did-fail-load', (_event, code, desc, validatedUrl) => {
+    log(`control did-fail-load code=${code} desc=${desc} url=${validatedUrl}`);
+  });
+  await win.loadFile(path.join(__dirname, '..', 'pages', 'control.html'));
+  return win;
+}
+
+// 検証専用のコントロール窓 capture（--control-capture-at=Ms,path）。
+function scheduleControlCapture(win: BrowserWindow): void {
+  for (const c of CONTROL_CAPTURE_AT_LIST) {
+    log(`検証フック有効: --control-capture-at=${c.ms},${c.file}`);
+    controlCaptureTimers.push(setTimeout(() => {
+      void (async (): Promise<void> => {
+        try {
+          if (win.isDestroyed()) {
+            log(`control capture スキップ（window 破棄済み）: ${c.file}`);
+            return;
+          }
+          const img = await win.webContents.capturePage();
+          const out = path.isAbsolute(c.file) ? c.file : path.join(logDir, c.file);
+          const dir = path.dirname(out);
+          if (dir !== '' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(out, img.toPNG());
+          stats.controlCaptures++;
+          log(`control capture 保存: ${out}（${c.ms}ms 時点）`);
+        } catch (e) {
+          log(`control capture 失敗 ${c.file}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      })();
+    }, c.ms));
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// self-test（HMD 不要）。ミラー・入力転送・VR リサイズ・停止を本番経路で確かめる。
+// OSR には pages/mirror-test.html を開き、ボタン押下と文字入力を handleMirrorInput
+// 経由（= コントロール窓と同じ入口）で送り、DOM の変化と PNG で確認する。
+async function runSelfTest(osr: BrowserWindow, control: BrowserWindow): Promise<void> {
+  const failures: string[] = [];
+  const pass = (m: string): void => { log(`[SELFTEST] PASS ${m}`); };
+  const fail = (m: string): void => { log(`[SELFTEST] FAIL ${m}`); failures.push(m); };
+  log('[SELFTEST] 開始（mirror-test.html で検証する）');
+  try {
+    await sleepMs(1500);
+    if (osr.isDestroyed() || control.isDestroyed()) {
+      fail('window が検証前に破棄された');
+      finish(2);
+      return;
+    }
+    // ボタンの押下。コントロール窓と同じ入口（handleMirrorInput）を通す。
+    const rect = await osr.webContents.executeJavaScript(
+      `(() => { const r = document.getElementById('btn').getBoundingClientRect(); ` +
+      `return { x: r.x, y: r.y, width: r.width, height: r.height }; })()`,
+    ) as unknown;
+    if (rect === null || typeof rect !== 'object') {
+      fail('ボタンの矩形が取れない');
+    } else {
+      const r = rect as Record<string, unknown>;
+      const cx = (r.x as number) + (r.width as number) / 2;
+      const cy = (r.y as number) + (r.height as number) / 2;
+      handleMirrorInput({ kind: 'mouseMove', x: cx, y: cy });
+      await sleepMs(150);
+      handleMirrorInput({ kind: 'mouseDown', x: cx, y: cy, button: 'left', clickCount: 1 });
+      await sleepMs(100);
+      handleMirrorInput({ kind: 'mouseUp', x: cx, y: cy, button: 'left', clickCount: 1 });
+      await sleepMs(600);
+      const text = await osr.webContents.executeJavaScript(
+        `document.getElementById('result').textContent`,
+      ) as unknown;
+      if (typeof text === 'string' && text.includes('1回')) pass(`ボタン押下の転送 result=${text}`);
+      else fail(`ボタン押下が反映しない result=${String(text)}`);
+    }
+    // 文字入力。入力欄を押してから char を送る（ログイン等の等価確認）。
+    const nameRect = await osr.webContents.executeJavaScript(
+      `(() => { const r = document.getElementById('name').getBoundingClientRect(); ` +
+      `return { x: r.x, y: r.y, width: r.width, height: r.height }; })()`,
+    ) as unknown;
+    if (nameRect === null || typeof nameRect !== 'object') {
+      fail('入力欄の矩形が取れない');
+    } else {
+      const r = nameRect as Record<string, unknown>;
+      const cx = (r.x as number) + (r.width as number) / 2;
+      const cy = (r.y as number) + (r.height as number) / 2;
+      handleMirrorInput({ kind: 'mouseDown', x: cx, y: cy, button: 'left', clickCount: 1 });
+      await sleepMs(100);
+      handleMirrorInput({ kind: 'mouseUp', x: cx, y: cy, button: 'left', clickCount: 1 });
+      await sleepMs(200);
+      for (const ch of ['a', 'b']) {
+        handleMirrorInput({ kind: 'keyDown', keyCode: ch, modifiers: [] });
+        handleMirrorInput({ kind: 'char', keyCode: ch });
+        handleMirrorInput({ kind: 'keyUp', keyCode: ch, modifiers: [] });
+        await sleepMs(120);
+      }
+      const value = await osr.webContents.executeJavaScript(
+        `(document.getElementById('name')).value`,
+      ) as unknown;
+      if (value === 'ab') pass('文字入力の転送 value=ab');
+      else fail(`文字入力が反映しない value=${String(value)}`);
+    }
+    // ミラーが回っていること（画像が届いていること）。
+    if (stats.mirrorFrames > 0) {
+      const avg = mirrorTotalMs / stats.mirrorFrames;
+      pass(`ミラー送信 frames=${stats.mirrorFrames} capture平均=${avg.toFixed(1)}ms`);
+      log(`[SELFTEST] capturePage 平均=${avg.toFixed(1)}ms 最大=${stats.mirrorCaptureMaxMs.toFixed(1)}ms ` +
+        `（10fps 周期=100ms に対する余裕の目安）`);
+    } else {
+      fail('ミラーが 1 枚も送られていない');
+    }
+    // コントロール窓の capture を PNG に保存し、目視証拠にする。
+    try {
+      const img = await control.webContents.capturePage();
+      const out = path.join(logDir, 'mirror.png');
+      fs.writeFileSync(out, img.toPNG());
+      stats.controlCaptures++;
+      pass(`コントロール窓の保存 ${out}`);
+    } catch (e) {
+      fail(`コントロール窓の保存に失敗: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // VR 開始の等価確認。セッション開始の通知から RenderRequest と同じ関数で
+    // OSR を VR サイズへ広げ、ミラーが VR モード（既定は停止）でハングしないことを確かめる。
+    const framesBefore = stats.mirrorFrames;
+    // ADR: 本番では renderer の requestSession 通知で xrActive が立つため、
+    // self-test でも同一の入口（setXrActive）を通してからリサイズする。
+    setXrActive(true);
+    if (!xrActive) fail('setXrActive(true) で xrActive が立たない');
+    else pass('xrActive が立つ（セッション開始の通知）');
+    applyVrResize(640, 640, 'selftest');
+    await sleepMs(1500);
+    if (control.isDestroyed() || osr.isDestroyed()) {
+      fail('VR リサイズ後に window が破棄された');
+    } else {
+      const [vw, vh] = osr.getContentSize();
+      if (vw === 1280 && vh === 640) pass(`VR リサイズ window=${vw}x${vh}`);
+      else fail(`VR リサイズの寸法が違う window=${vw}x${vh}`);
+      if (MIRROR_VR_FPS <= 0) {
+        if (mirrorTimer === null) pass(`VR 中ミラー停止（既定 0。frames=${framesBefore}のまま）`);
+        else fail('VR 中ミラーが止まっていない（既定 0 なのにタイマーが残る）');
+      } else if (stats.mirrorFrames > framesBefore) {
+        pass(`節約ミラー継続 frames=${framesBefore}→${stats.mirrorFrames}`);
+      } else {
+        fail('節約ミラーが進んでいない（ハングの疑い）');
+      }
+      try {
+        const img = await control.webContents.capturePage();
+        const out = path.join(logDir, 'mirror-vr.png');
+        fs.writeFileSync(out, img.toPNG());
+        stats.controlCaptures++;
+        pass(`VR 中コントロール窓の保存 ${out}（黒帯つき維持の目視用）`);
+      } catch (e) {
+        fail(`VR 中コントロール窓の保存に失敗: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    // セッション終了の等価確認。xrActive を落とすとミラーがブラウジングに戻ること。
+    setXrActive(false);
+    if (xrActive) fail('setXrActive(false) で xrActive が落ちない');
+    else pass('xrActive が落ちる（セッション終了の通知）');
+    await sleepMs(600);
+    // コントロール窓のリサイズ追従。窓を細くしてから戻し、ミラーが続くことを確かめる。
+    // OSR 側のアスペクト追従は VR リサイズで済ませているため、ここでは窓側だけを見る。
+    try {
+      const [cw, ch] = control.getSize();
+      const framesMid = stats.mirrorFrames;
+      control.setSize(760, 500);
+      await sleepMs(900);
+      if (control.isDestroyed()) {
+        fail('リサイズでコントロール窓が壊れた');
+      } else if (stats.mirrorFrames <= framesMid) {
+        fail('リサイズ後にミラーが進んでいない');
+      } else {
+        const img = await control.webContents.capturePage();
+        const out = path.join(logDir, 'mirror-resize.png');
+        fs.writeFileSync(out, img.toPNG());
+        stats.controlCaptures++;
+        pass(`コントロール窓のリサイズ追従 ${cw}x${ch}→760x500（${out}）`);
+      }
+      if (!control.isDestroyed()) control.setSize(cw, ch);
+      await sleepMs(400);
+    } catch (e) {
+      fail(`リサイズ追従の確認に失敗: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // 停止処理の安全確認。タイマー解除後に破棄しても投げないこと。
+    stopMirror();
+    if (mirrorTimer === null && mirrorStopped) pass('ミラー停止（タイマー解除）');
+    else fail('ミラー停止が不完全');
+  } catch (e) {
+    fail(`例外: ${e instanceof Error ? e.stack : String(e)}`);
+  }
+  if (failures.length === 0) log('[SELFTEST] 全件通過');
+  else log(`[SELFTEST] ${failures.length} 件失敗: ${failures.join(' / ')}`);
+  finish(failures.length === 0 ? 0 : 2);
+}
+
+function maybeFinish(): void {  if (!stopping || finished) return;
   if (inFlight !== null) return;
   if (socket === null || socket.destroyed) return;
-  log('全借用の ACK が揃ったためソケットを閉じる（未 offer の保留は終了時に返却）');
+  log('全借用の ACK が揃ったためソケットを閉じる');
   try { socket.end(); } catch { /* 無視 */ }
 }
 
@@ -596,6 +1193,16 @@ function finish(code: number): void {
   stopping = true;
   for (const t of captureTimers) clearTimeout(t);
   captureTimers.length = 0;
+  for (const t of controlCaptureTimers) clearTimeout(t);
+  controlCaptureTimers.length = 0;
+  // ミラー停止（タイマー解除）。送り済みフレームの後始末は要らない。
+  stopMirror();
+  stopVrMeter();
+  if (statusTimer !== null) {
+    clearInterval(statusTimer);
+    statusTimer = null;
+  }
+  if (stats.mirrorFrames > 0) stats.mirrorCaptureAvgMs = mirrorTotalMs / stats.mirrorFrames;
   // XR ループは Offer 待ちで空フレームを回し続けるため、読取側を開いたままの
   // 半閉鎖では切断を検知できない。終了待ちの前に破棄して切断として知らせ、
   // exe に統計を出させる。未 ACK の借用は下で隔離し release しない。
@@ -606,13 +1213,9 @@ function finish(code: number): void {
   if (stopTimer) clearTimeout(stopTimer);
   if (graceTimer) clearTimeout(graceTimer);
   if (exeWaitTimer) clearTimeout(exeWaitTimer);
-  // 未 offer の保留だけ release する。offer 済み未 ACK は参照を held から外さず
-  // quarantined へ移して隔離する（release しない。参照を捨てない）。
-  if (pending !== null) {
-    onPaintMeta.delete(pending);
-    if (releaseOnce(pending, 'shutdown-pending')) stats.releasedPending++;
-    pending = null;
-  }
+  // offer 済み未 ACK は参照を held から外さず quarantined へ移して隔離する
+  // （release しない。参照を捨てない）。未処理 paint は stale として即返すため
+  // 未 offer の保留は残らない。
   if (inFlight !== null) {
     const tex = held.get(inFlight);
     held.delete(inFlight);
@@ -630,11 +1233,20 @@ function finish(code: number): void {
   stats.releaseAttempts = releaseAttempts;
   const summary = {
     exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
-    space: SPACE, renderScale: RENDER_SCALE, captureAt: CAPTURE_AT_LIST,
+    space: SPACE, renderScale: RENDER_SCALE, recordTtlMs: RECORD_TTL_MS,
+    captureAt: CAPTURE_AT_LIST,
     gpuPid: currentGpuPid(),
     paints: paintTimes.length,
     fps: total > 0 ? intervals.length / (total / 1000) : 0,
     paintIntervalMs: { min: q(0), p50: q(0.5), p95: q(0.95), max: q(1) },
+    exeSubmits: vrMeter.submits,
+    exeUnknownId: vrMeter.unknownId,
+    exePoseMismatch: vrMeter.poseMismatch,
+    exeSpaceMismatch: vrMeter.spaceMismatch,
+    exeExpired: vrMeter.expired,
+    xrActive,
+    xrDroppedRecords,
+    mirrorVrFps: MIRROR_VR_FPS,
     ...stats,
   };
   try {
@@ -662,10 +1274,21 @@ function finish(code: number): void {
   }
   flushLog();
   log(`M5 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
+    `stale=${stats.droppedStale} ` +
     `ok=${stats.statusOk} copyFail=${stats.statusCopyFailed} verifyFail=${stats.statusVerifyFailed} ` +
-    `records=${stats.renderRequests} inputs=${stats.inputStates} haptics=${stats.hapticSent} ` +
-    `maxHeld=${stats.maxHeld} quarantine=${stats.quarantined}`);
+    `records=${stats.renderRequests} xrDropped=${xrDroppedRecords} xrActive=${xrActive} ` +
+    `inputs=${stats.inputStates} haptics=${stats.hapticSent} ` +
+    `maxHeld=${stats.maxHeld} quarantine=${stats.quarantined} ` +
+    `mirror=${stats.mirrorFrames} mirrorErr=${stats.mirrorErrors} ` +
+    `capAvg=${stats.mirrorCaptureAvgMs.toFixed(1)}ms ` +
+    `fwd=${stats.inputForwarded} fwdErr=${stats.inputErrors}`);
   flushLog();
+  // コントロール窓を閉じる。破棄済み・終了中の作成失敗では何もしない。
+  try {
+    const ctl = controlRef;
+    controlRef = null;
+    if (ctl !== null && !ctl.isDestroyed()) ctl.close();
+  } catch { /* 終了時は無視 */ }
   // exe 側の最終統計の出力を待つため、正常終了を最大 3 秒待ってから kill する。
   // 既に終了していれば即座に抜ける。切断検知の直後に kill すると exe の統計が欠ける。
   const waitExe = new Promise<void>((resolve) => {
@@ -798,12 +1421,19 @@ async function createWindow(): Promise<BrowserWindow> {
   });
   win.webContents.on('did-finish-load', () => {
     log(`did-finish-load url=${win.webContents.getURL()}`);
+    // ADR: 遷移で renderer が作り直されると旧セッションは失われるため、
+    // xrActive を落としてブラウジングに戻す（VR サイズに固まる漏れの防止）。
+    // 初回読み込み時は既に false のため何も起きない。
+    setXrActive(false);
   });
   win.webContents.on('did-fail-load', (_event, code, desc, validatedUrl) => {
     log(`did-fail-load code=${code} desc=${desc} url=${validatedUrl}`);
   });
 
-  const target = resolveTarget();
+  // self-test では検証ページ（ボタン・入力欄つき）を強制する（引数の指定より優先）。
+  const target = SELF_TEST
+    ? { kind: 'file', file: path.join(__dirname, '..', 'pages', 'mirror-test.html') } as const
+    : resolveTarget();
   if (target.kind === 'url') {
     await win.loadURL(target.url);
     log(`loaded url=${target.url}`);
@@ -822,7 +1452,9 @@ async function createWindow(): Promise<BrowserWindow> {
       graceTimer = setTimeout(() => {
         log('grace 期限切れ。未 ACK を隔離して終了する');
         // 未 ACK が残る猶予切れは隔離（失敗）扱いのため終了 2 にする。残債が無ければ 3。
-        finish(inFlight !== null ? 2 : 3);
+        // ただし exe 無し動作（--no-exe・--self-test）はパイプが無いため猶予切れが
+        // 正常終了の経路になる。残債が無ければ 0 で終える（exe 有りは変えない）。
+        finish(inFlight !== null ? 2 : (NO_EXE || SELF_TEST ? 0 : 3));
       }, 8000);
     }, SECONDS * 1000);
   }
@@ -830,17 +1462,36 @@ async function createWindow(): Promise<BrowserWindow> {
 }
 
 function start(): void {
-  if (addon === null) {
+  // self-test は HMD・exe 無しで回すため、exe 不要扱いにする。
+  const noExeMode = NO_EXE || SELF_TEST;
+  // render-scale の範囲確認（0.2〜1.0。既定 0.5）。範囲外は exe が拒否するため先に落とす。
+  const scaleNum = Number(RENDER_SCALE);
+  if (!Number.isFinite(scaleNum) || scaleNum < 0.2 || scaleNum > 1.0) {
+    log(`unknown --render-scale=${RENDER_SCALE}（0.2〜1.0 の範囲であること）`);
+    finish(1);
+    return;
+  }
+  if (addon === null && !noExeMode) {
     log('addon が無いため起動しない');
     finish(1);
     return;
   }
+  // ADR: 下の exe 起動・パイプ部は既存の塊のまま条件で囲う（差分を小さく保つため再字下げしない）。
+  if (!noExeMode) {
   const exeArgs = [
     '--xr-transfer',
     `--pipe=${PIPE_PATH}`,
     `--render-scale=${RENDER_SCALE}`,
+    `--record-ttl-ms=${RECORD_TTL_MS}`,
     `--space=${SPACE}`,
     `--seconds=${SECONDS > 0 ? SECONDS + 30 : 3600}`,
+    // ADR: 静止ページで paint が止まっても Offer 途絶で終了しないよう無効化する。
+    // 終了はパイプ切断（finish 時の socket.destroy）で知らせる。
+    '--producer-idle-timeout-ms=0',
+    // フロー制御: 実パイプラインに合わせてレコード発行を抑える（exe 側は既定 off）。
+    // 未処理画像がある間は発行せず、Offer 処理後に次を発行する。ハーネスには渡さない。
+    // --no-pace-records（検証専用）のときは渡さず従来どおり毎フレーム発行させる。
+    ...(NO_PACE ? [] : ['--pace-records' as const]),
   ];
   log(`exe: ${EXE_PATH} ${exeArgs.join(' ')}`);
   // exe の出力をファイルへ保存する（受理/不明 ID の内訳用）。端末にもそのまま出す。
@@ -862,6 +1513,10 @@ function start(): void {
     const stream: fs.WriteStream = exeLogStream;
     const forward = (chunk: Buffer): void => {
       stream.write(chunk);
+      // VR 計測用に提出・棄却の行を数える（描画経路には触らない）。
+      try {
+        countExeMeterChunk(chunk.toString('utf8'));
+      } catch { /* 計測の失敗は本線にしない */ }
       try {
         process.stdout.write(chunk);
       } catch {
@@ -960,6 +1615,9 @@ function start(): void {
   server.listen(PIPE_PATH, () => {
     log(`pipe server listening: ${PIPE_PATH}`);
   });
+  } else {
+    log('exe 無し動作のため spawn・パイプサーバを飛ばす（ミラー・入力転送のみ）');
+  }
 
   // renderer からの haptics 要求を exe へ中継する。境界で数値を検証する。
   ipcMain.on('xr:haptic', (_event, ...args: unknown[]) => {
@@ -970,6 +1628,19 @@ function start(): void {
     }
     if (!Number.isFinite(hand) || !Number.isFinite(intensity) || !Number.isFinite(durationMs)) return;
     sendHaptic(Math.trunc(hand), intensity, Math.trunc(durationMs));
+  });
+  // コントロール窓からの入力転送を OSR へ渡す。境界検証は mirror-input が担う。
+  ipcMain.on('mirror:input', (_event, msg: unknown) => {
+    handleMirrorInput(msg);
+  });
+  // renderer のセッション開始・終了の通知。真で xrActive を立て、偽で落とす。
+  // 境界は真偽値だけを受け、他の型は破棄する。
+  ipcMain.on('xr:session', (_event, msg: unknown) => {
+    if (typeof msg !== 'boolean') {
+      log('xr:session 通知を破棄（真偽値ではない）');
+      return;
+    }
+    setXrActive(msg);
   });
   // ページの到達確認用。exe 生存とパイプ接続だけを見る（HMD 装着の有無は見ない）。
   // シムは準備前に最大 15 秒ポーリングするため、最初の数回と結果変化だけ記録する。
@@ -989,7 +1660,27 @@ function start(): void {
     return res;
   });
 
-  createWindow().catch((e: unknown) => {
+  createWindow().then((osr) => {
+    // OSR の後にコントロール窓を作り、ミラー・状態配信を開始する。
+    // self-test はここから自動検証に入り、結果で終了する。
+    createControlWindow().then((control) => {
+      scheduleControlCapture(control);
+      startMirror();
+      startStatusBroadcast();
+      startVrMeter();
+      if (SELF_TEST) {
+        // HARD TIMEOUT の前に終わらせるための保険（self-test 専用）。
+        setTimeout(() => {
+          log('[SELFTEST] 制限時間切れのため中断する');
+          finish(2);
+        }, 60000);
+        void runSelfTest(osr, control);
+      }
+    }).catch((e: unknown) => {
+      log('createControlWindow FAILED: ' + (e instanceof Error ? e.stack : String(e)));
+      if (SELF_TEST) finish(2);
+    });
+  }).catch((e: unknown) => {
     log('createWindow FAILED: ' + (e instanceof Error ? e.stack : String(e)));
     finish(1);
   });

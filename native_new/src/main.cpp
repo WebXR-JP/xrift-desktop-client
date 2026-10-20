@@ -30,11 +30,14 @@ void PrintHelp(const char* argv0) {
       "            --inject-unconfirmed=N は N 件目の Offer を完了未確認として扱う\n"
       "            検証フック（既定 0=無効。Done を送らず終了 2。import 資源は破棄しない）\n"
       "            --delay-ms=N は 1 フレームの処理前に N ミリ秒待つ検証フック（既定 0=無効）\n"
-      "  --xr-transfer --pipe=\\\\.\\pipe\\<名前> [--render-scale=<0.25〜1.0>]\n"
-      "            [--seconds=N] [--inject-stale-record=N] [--no-submit-verify] [--dump-submit=<dir>] [--dump-frame=N]\n"
+      "  --xr-transfer --pipe=\\\\.\\pipe\\<名前> [--render-scale=<0.2〜1.0>]\n"
+      "            [--record-ttl-ms=<ms>] [--seconds=N] [--inject-stale-record=N] [--no-submit-verify] [--dump-submit=<dir>] [--dump-frame=N]\n"
+      "            [--producer-idle-timeout-ms=<ms>] [--pace-records]\n"
       "            M2 の XR 提出モード。XR セッションを開始し、pose/FOV の描画レコードを\n"
       "            発行して RenderRequest を送り、受理画像だけを左右 swapchain へ blit する。\n"
-      "            --render-scale は既定 0.5。--inject-stale-record=N は N フレーム目の\n"
+      "            --render-scale は既定 0.5。--record-ttl-ms は描画レコードの失効上限\n"
+      "            （既定 500。実測: 本番サイトで 350〜500ms の遅延のため app 経由は暫定 2000）。\n"
+      "            --inject-stale-record=N は N フレーム目の\n"
       "            RenderRequest に旧 pose 混入の合図を載せる（harness 側フック用）。\n"
       "            --no-submit-verify で blit 後の左右分離 readback を止める\n"
       "            --dump-submit=<dir> は N 回目の提出時に両眼 swapchain を PPM 保存する\n"
@@ -49,6 +52,14 @@ void PrintHelp(const char* argv0) {
       "            適用する（spaceEpoch 更新・旧レコード失効の経路検証用。\n"
       "            実イベントではないことをログに明記し、統計の space変更に計上する。\n"
       "            既定 0=無効）\n"
+      "            --producer-idle-timeout-ms=<ms> は Offer 途絶で producer 終了とみなす\n"
+      "            無受信の上限（既定 5000。0 は無効でパイプ切断でのみ終了。\n"
+      "            app 経由の通常運用は 0 を渡し、静止ページで paint が止まっても\n"
+      "            終了しない。ハーネス向けの既定は保つ）\n"
+      "            --pace-records は実パイプラインに合わせた発行のフロー制御\n"
+      "            （既定 off。on のとき未処理の画像がある間は RenderRequest を送らず、\n"
+      "            Offer 処理後の次のフレームで発行する。500ms 停滞したら新しい\n"
+      "            レコードで詰まりを解く。app 経由の通常運用は on を渡す）\n"
       "            入力は毎秒サマリ（[M4入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
       "            状態変化のフレームで [M4エッジ] を出す。haptics 受信は XrResult を\n"
       "            ログに残す\n"
@@ -155,6 +166,16 @@ int main(int argc, char** argv) {
         opts.pipeName = argv[i] + std::strlen("--pipe=");
       } else if (StartsWith(argv[i], "--render-scale=")) {
         opts.renderScale = std::atof(argv[i] + std::strlen("--render-scale="));
+      } else if (StartsWith(argv[i], "--record-ttl-ms=")) {
+        // 描画レコードの失効上限（ms）。既定 500。正でなければ受け付けない。
+        const int ttl = std::atoi(argv[i] + std::strlen("--record-ttl-ms="));
+        if (ttl <= 0) {
+          xrift::Error("--record-ttl-ms は正の整数であること（指定=%s）",
+                       argv[i] + std::strlen("--record-ttl-ms="));
+          PrintHelp(argv[0]);
+          return 1;
+        }
+        opts.recordTtlMs = static_cast<uint64_t>(ttl);
       } else if (StartsWith(argv[i], "--seconds=")) {
         opts.seconds = std::atoi(argv[i] + std::strlen("--seconds="));
         if (opts.seconds < 0) {
@@ -199,6 +220,15 @@ int main(int argc, char** argv) {
         if (opts.injectSpaceChangeMs < 0) {
           opts.injectSpaceChangeMs = 0;
         }
+      } else if (StartsWith(argv[i], "--producer-idle-timeout-ms=")) {
+        // Offer 途絶の終了判定の上限。0 は無効（パイプ切断でのみ終了）。
+        opts.producerIdleTimeoutMs =
+            std::atoi(argv[i] + std::strlen("--producer-idle-timeout-ms="));
+        if (opts.producerIdleTimeoutMs < 0) {
+          opts.producerIdleTimeoutMs = 0;
+        }
+      } else if (std::strcmp(argv[i], "--pace-records") == 0) {
+        opts.paceRecords = true;
       } else {
         xrift::Error("不明な引数: %s", argv[i]);
         PrintHelp(argv[0]);
@@ -210,8 +240,8 @@ int main(int argc, char** argv) {
       PrintHelp(argv[0]);
       return 1;
     }
-    if (opts.renderScale < 0.25 || opts.renderScale > 1.0) {
-      xrift::Error("--render-scale は 0.25〜1.0 の範囲であること（指定=%f）", opts.renderScale);
+    if (opts.renderScale < 0.2 || opts.renderScale > 1.0) {
+      xrift::Error("--render-scale は 0.2〜1.0 の範囲であること（指定=%f）", opts.renderScale);
       PrintHelp(argv[0]);
       return 1;
     }

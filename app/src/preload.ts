@@ -50,6 +50,9 @@ const bridge = {
   probe(): Promise<{ ok: boolean }> {
     return ipcRenderer.invoke('xr:probe');
   },
+  sessionActive(active: boolean): void {
+    ipcRenderer.send('xr:session', active);
+  },
 };
 
 contextBridge.exposeInMainWorld('__xriftXR', bridge);

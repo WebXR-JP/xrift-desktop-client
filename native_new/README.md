@@ -214,6 +214,7 @@ HMD 脱着/再接続を実装する（DESIGN §10・§11 M4）。
 
 ```powershell
 build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
+  [--render-scale=<0.2〜1.0>] [--record-ttl-ms=<ms>]
   [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]
   [--inject-space-change=Ms]
 ```
@@ -221,6 +222,10 @@ build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
 - `--space`（既定 `auto`）… 参照空間の要求。起動時に `xrEnumerateReferenceSpaces` で
   availability を確認し、`auto` は local-floor→stage→local の順で後退する。
   明示指定が不可なら落とさず後退し、理由をログに出す。選択結果は起動ログに出る。
+- `--render-scale`（既定 `0.5`、範囲 `0.2`〜`1.0`）… 左右各眼の描画倍率。
+  本番サイトでは `0.35` 程度を試せる。
+- `--record-ttl-ms`（既定 `500`）… 描画レコードの失効上限（ms）。
+  実測: 本番サイトで 350〜500ms の遅延のため、app 経由の通常運用は暫定 `2000` で渡す。
 - `--inject-session-restart=Ms`（既定 0=無効）… 起動から Ms 後に意図的にセッション束を
   破棄・再生成する（復帰経路の検証用）。成功/失敗は統計に出る。
 - `--inject-space-change=Ms`（既定 0=無効）… 起動から Ms 後に模擬の space 変更を

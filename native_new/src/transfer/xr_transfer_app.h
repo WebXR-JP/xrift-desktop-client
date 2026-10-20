@@ -12,7 +12,10 @@ namespace xrift::transfer {
 
 struct XrTransferOptions {
   std::string pipeName;         // `\\.\pipe\<name>` 形式。必須。
-  double renderScale = 0.5;     // 左右各眼の描画倍率（0.25〜1.0）。既定 0.5。
+  double renderScale = 0.5;     // 左右各眼の描画倍率（0.2〜1.0）。既定 0.5。
+  uint64_t recordTtlMs = 500;   // 描画レコードの失効上限（ms）。既定 500。
+                                // 実測: 本番サイトで 350〜500ms の遅延のため、
+                                // app 経由の通常運用は暫定 2000 で渡す。
   int seconds = 0;              // 正ならその秒数で打ち切る。0 は HMD 終了まで。
   int injectStaleRecord = 0;    // N フレーム目の RenderRequest に旧 pose 混入の合図を載せる
                                 // （harness 側フック用。既定 0=無効）。
@@ -26,6 +29,13 @@ struct XrTransferOptions {
                                 // （spaceEpoch 更新・旧レコード失効の経路検証用。
                                 // 実イベントではないことをログに明記し、統計の space変更に計上する。
                                 // 既定 0=無効）。
+  int producerIdleTimeoutMs = 5000;  // Offer 途絶で producer 終了とみなす無受信の上限（ミリ秒）。
+                                     // 0 は無効（パイプ切断でのみ終了）。既定 5000 はハーネス向け。
+  bool paceRecords = false;  // 実パイプラインに合わせたレコード発行のフロー制御（既定 off）。
+                             // on のとき未処理の画像がある間は新しいレコードを発行せず、
+                             // Offer 処理後に次のフレームで発行する。応答停滞時は
+                             // 新しいレコードで詰まりを解く（DESIGN §7）。
+                             // off は現行どおり（ハーネスの 90fps 検証を保つ）。
 };
 
 // XR 提出ループを実行する。成功時は 0 を返す。

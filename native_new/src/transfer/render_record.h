@@ -13,11 +13,13 @@
 
 namespace xrift::transfer {
 
-// 画像年齢の上限。受理から 500ms を超えたレコードは失効として棄却する。
-// 値は仮ではなく M2 仕様の固定値である（変更時は README と selftest を更新する）。
+// 画像年齢の上限の既定値。受理から 500ms を超えたレコードは失効として棄却する。
+// 実行時は --record-ttl-ms で上書きできる（RenderLedger の保持値が正）。
+// 実測: 本番サイトで 350〜500ms の遅延のため、app 経由の通常運用は暫定 2s で渡す。
+// 既定値自体は M2 仕様の 500ms に保つ（変更時は README と selftest を更新する）。
 constexpr uint64_t kRenderRecordMaxAgeUs = 500000u;
 // 保持レコード数の上限。超えた古い分は失効扱いで捨てる（VRAM ではなく台帳の上限）。
-// 90Hz・500ms で 45 件のため余裕を見た 256 である。
+// 90Hz・2s で 180 件のため余裕を見た 256 である（既定 500ms では 45 件）。
 constexpr size_t kRenderRecordCapacity = 256;
 
 // 位置の量子化範囲。LOCAL 空間の頭部移動（±4m）を 8bit に写像する。
@@ -127,11 +129,14 @@ class RenderLedger {
     uint64_t evicted = 0;  // 容量超過で捨てた件数。
   };
 
-  RenderLedger(uint32_t connEpoch, uint32_t spaceEpoch)
-      : connEpoch_(connEpoch), spaceEpoch_(spaceEpoch) {}
+  RenderLedger(uint32_t connEpoch, uint32_t spaceEpoch,
+               uint64_t maxAgeUs = kRenderRecordMaxAgeUs)
+      : connEpoch_(connEpoch), spaceEpoch_(spaceEpoch), maxAgeUs_(maxAgeUs) {}
 
   uint32_t connEpoch() const { return connEpoch_; }
   uint32_t spaceEpoch() const { return spaceEpoch_; }
+  // 失効判定に使う画像年齢の上限（us）。--record-ttl-ms の実行値である。
+  uint64_t maxAgeUs() const { return maxAgeUs_; }
 
   // REFERENCE_SPACE_CHANGE_PENDING の適用時刻に従い世代を進める。
   // 旧世代のレコードは即座に失効させる（DESIGN §10。照合で弾く）。
@@ -195,7 +200,7 @@ class RenderLedger {
       if (static_cast<uint16_t>(it->renderId & 0xFFFFu) != renderId16) {
         continue;
       }
-      if (nowUs - it->issuedUs > kRenderRecordMaxAgeUs) {
+      if (nowUs - it->issuedUs > maxAgeUs_) {
         ++stats_.expired;
         return RejectReason::Expired;
       }
@@ -220,7 +225,7 @@ class RenderLedger {
 
   // 年限切れの掃除。毎フレーム呼ぶことを想定する（期限超過の返却ではなく台帳の掃除）。
   void SweepExpired(uint64_t nowUs) {
-    while (!records_.empty() && nowUs - records_.front().issuedUs > kRenderRecordMaxAgeUs) {
+    while (!records_.empty() && nowUs - records_.front().issuedUs > maxAgeUs_) {
       records_.pop_front();
     }
   }
@@ -231,6 +236,8 @@ class RenderLedger {
  private:
   uint32_t connEpoch_;
   uint32_t spaceEpoch_;
+  // 失効判定の上限（us）。既定は kRenderRecordMaxAgeUs（500ms）。
+  uint64_t maxAgeUs_;
   std::deque<RenderRecord> records_;
   Stats stats_{};
 };

@@ -53,12 +53,18 @@ constexpr uint8_t kStaleMarker = 0x5Au;
 // なお deadlineUs=0 は無期限待ちの意味であるため、ノンブロッキングのつもりで
 // 現在時刻や 0 をそのまま期限に渡さないこと。
 constexpr uint64_t kOfferPollWaitUs = 1000u;
-// Offer が途絶えた場合に producer 終了とみなす無受信の上限（5 秒は意図的な値）。
+// --pace-records の応答停滞の上限（500ms は意図的な値であり、仮置きではない）。
+// 未処理の画像がある間は新しいレコードを発行せず待ち、500ms 応答が無ければ
+// 同じレコードの再送ではなく新しいレコードを発行して詰まりを解く。
+// 古いレコードは TTL と掃除で失効させる。500ms は OSR の実測遅延（350〜500ms）の
+// 上端に合わせ、通常の paint 間隔（約 11ms・低速時約 135ms）より十分長い。
+constexpr uint64_t kPaceStallTimeoutUs = 500000u;
+// Offer 途絶で producer 終了とみなす無受信の上限の既定（5000ms は意図的な値）。
 // harness は計測終了で Offer を止めてから読取側を開いたままにし（socket.end の半閉鎖）、
 // 8 秒の猶予後に kill する。exe が受信待ちを続けると統計を出す前に殺されるため、
 // 通常時（約 90Hz で Offer が来る）では起きない 5 秒の途絶で新規受付を止めて終了する。
 // 初回 Offer 前は適用しない（起動直後の誤終了を避ける）。
-constexpr uint64_t kProducerIdleTimeoutUs = 5000000u;
+// 実行値は options.producerIdleTimeoutMs で上書きし、0 は無効（パイプ切断でのみ終了）。
 
 uint64_t NowUs() {
   return static_cast<uint64_t>(
@@ -661,6 +667,7 @@ struct XrStats {
   uint64_t blitUsMax = 0;
   uint64_t submitLayers = 0;
   uint64_t emptyFrames = 0;
+  uint64_t pacedWaits = 0;  // --pace-records で未処理待ちのため発行を見送ったフレーム数。
   uint64_t verifyOk = 0;
   uint64_t verifyNg = 0;
   uint64_t firstUs = 0;
@@ -682,6 +689,10 @@ struct XrStats {
          static_cast<unsigned long long>(requests), static_cast<unsigned long long>(offers),
          static_cast<unsigned long long>(doneOk));
     Info("XR転送統計: fps=%.2f（XR フレーム間隔からの算出）", fps);
+    Info("XR転送統計: 発行レコード=%llu 追い出し=%llu pace待機フレーム=%llu",
+         static_cast<unsigned long long>(ledger.issued),
+         static_cast<unsigned long long>(ledger.evicted),
+         static_cast<unsigned long long>(pacedWaits));
     Info("XR転送統計: 受理=%llu 不明ID=%llu pose不一致=%llu 世代不一致=%llu 失効=%llu",
          static_cast<unsigned long long>(ledger.accepted),
          static_cast<unsigned long long>(ledger.unknownId),
@@ -719,8 +730,22 @@ struct XrStats {
 }  // namespace
 
 int RunXrTransfer(const XrTransferOptions& options) {
-  Info("XR転送開始: pipe=%s render-scale=%.2f submit-verify=%s space=%s", options.pipeName.c_str(),
-       options.renderScale, options.submitVerify ? "on" : "off", options.space.c_str());
+  Info("XR転送開始: pipe=%s render-scale=%.2f record-ttl=%llums submit-verify=%s space=%s pace=%s",
+       options.pipeName.c_str(), options.renderScale,
+       static_cast<unsigned long long>(options.recordTtlMs),
+       options.submitVerify ? "on" : "off", options.space.c_str(),
+       options.paceRecords ? "on" : "off");
+  // ADR: Offer 途絶の終了判定は実行値で決める。0 は app 経由の通常運用（静止ページで
+  // paint が止まっても終了しない）のため無効とし、既定 5000 はハーネス向けに保つ。
+  const uint64_t idleTimeoutUs = options.producerIdleTimeoutMs <= 0
+                                     ? 0u
+                                     : static_cast<uint64_t>(options.producerIdleTimeoutMs) * 1000u;
+  if (idleTimeoutUs == 0u) {
+    Info("producer idle タイムアウト無効（--producer-idle-timeout-ms=0。パイプ切断でのみ終了）");
+  } else {
+    Info("producer idle タイムアウト %dms（途絶で producer 終了とみなす）",
+         options.producerIdleTimeoutMs);
+  }
   if (options.injectStaleRecord > 0) {
     Info("検証フック有効: --inject-stale-record=%d（そのフレームの要求に旧 pose 混入の合図）",
          options.injectStaleRecord);
@@ -772,7 +797,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   std::unique_ptr<BlitPass> blit;
   xr::InputManager input;
   uint32_t conn_epoch = 1;
-  RenderLedger ledger(conn_epoch, 1);
+  RenderLedger ledger(conn_epoch, 1, options.recordTtlMs * 1000u);
   XrStats stats{};
   stats.connEpoch = conn_epoch;
   try {
@@ -871,6 +896,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
   uint64_t lastOfferUs = NowUs();
   uint64_t frame_no = 0;
   uint64_t droppedIntermediate = 0;
+  // --pace-records の未処理レコードの有無と発行時刻。on のとき前回発行分の
+  // Offer 処理が済むまで新規発行を止め、500ms 停滞したら新しい分で解く。
+  bool paceOutstanding = false;
+  uint64_t paceIssuedUs = 0;
   const uint64_t deadlineUs =
       options.seconds > 0 ? NowUs() + static_cast<uint64_t>(options.seconds) * 1000000u : 0;
 
@@ -1209,13 +1238,18 @@ int RunXrTransfer(const XrTransferOptions& options) {
       // drain_offers が Done を返すため、消費して返せなくなることはない。
       // 以前はここで切断を見ず --seconds か kill 待ちでぶら下がったため、
       // harness 先死で統計を出さずに殺されていた（DESIGN §6③の違反）。
+      const uint64_t offersBeforeIdle = stats.offers;
       drain_offers();
+      if (stats.offers != offersBeforeIdle) {
+        paceOutstanding = false;
+      }
       ledger.SweepExpired(NowUs());
       if (quit) {
         break;
       }
-      if (haveOfferEver && NowUs() - lastOfferUs > kProducerIdleTimeoutUs) {
-        Info("Offer が 5 秒途絶えたため producer 終了とみなして統計を出して終了する");
+      if (haveOfferEver && idleTimeoutUs != 0u && NowUs() - lastOfferUs > idleTimeoutUs) {
+        Info("Offer が %dms 途絶えたため producer 終了とみなして統計を出して終了する",
+             options.producerIdleTimeoutMs);
         break;
       }
       // 実行中でない間は眠らせ、ビジーループにしない。
@@ -1270,26 +1304,48 @@ int RunXrTransfer(const XrTransferOptions& options) {
         const EyePose right = ToEyePose(views[1].pose);
         const EyeFov lf = ToEyeFov(views[0].fov);
         const EyeFov rf = ToEyeFov(views[1].fov);
-        const uint64_t render_id = frame_no;  // 0 を避けるため 1 起点の通番を使う。
-        const RenderRecord& rec =
-            ledger.Issue(render_id, left, right, lf, rf, req_w, req_h, NowUs());
-        TransferMessage req = MakeRenderRequest(rec.renderId, rec.connEpoch, rec.spaceEpoch,
-                                                rec.left, rec.right, rec.leftFov, rec.rightFov,
-                                                req_w, req_h);
-        if (options.injectStaleRecord > 0 &&
-            frame_no == static_cast<uint64_t>(options.injectStaleRecord)) {
-          req.reserved[0] = kStaleMarker;
+        // --pace-records: 未処理の画像がある間は新しいレコードを発行しない
+        // （RenderRequest を送らない）。Offer 処理後の次のフレームで発行する。
+        // 応答が無いまま 500ms 経過したら同じレコードの再送ではなく新しい
+        // レコードを発行して詰まらないようにする（古い分は失効させる）。
+        // off のときは従来どおり毎フレーム発行する。
+        bool issue_record = true;
+        if (options.paceRecords && paceOutstanding) {
+          if (NowUs() - paceIssuedUs > kPaceStallTimeoutUs) {
+            Info("pace: 応答が %llums 無いため新しいレコードを発行する（旧分は失効させる）",
+                 static_cast<unsigned long long>(kPaceStallTimeoutUs / 1000u));
+            paceOutstanding = false;
+          } else {
+            ++stats.pacedWaits;
+            issue_record = false;
+          }
         }
-        try {
-          pipe.Send(req);
-          ++stats.requests;
-        } catch (const std::exception& e) {
-          Error("RenderRequest 送信に失敗: %s", e.what());
-          pipeAlive = false;
-          exitCode = 1;
-          quit = true;
+        if (issue_record) {
+          const uint64_t render_id = frame_no;  // 0 を避けるため 1 起点の通番を使う。
+          const RenderRecord& rec =
+              ledger.Issue(render_id, left, right, lf, rf, req_w, req_h, NowUs());
+          TransferMessage req = MakeRenderRequest(rec.renderId, rec.connEpoch, rec.spaceEpoch,
+                                                  rec.left, rec.right, rec.leftFov, rec.rightFov,
+                                                  req_w, req_h);
+          if (options.injectStaleRecord > 0 &&
+              frame_no == static_cast<uint64_t>(options.injectStaleRecord)) {
+            req.reserved[0] = kStaleMarker;
+          }
+          try {
+            pipe.Send(req);
+            ++stats.requests;
+          } catch (const std::exception& e) {
+            Error("RenderRequest 送信に失敗: %s", e.what());
+            pipeAlive = false;
+            exitCode = 1;
+            quit = true;
+          }
+          rendered = true;
+          if (options.paceRecords) {
+            paceOutstanding = true;
+            paceIssuedUs = NowUs();
+          }
         }
-        rendered = true;
       }
     }
 
@@ -1297,13 +1353,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
     //（SYNCHRONIZED 中でも Offer を受けて ACK できること）。提出だけを
     // shouldRender（rendered）で止める。drain_offers 内の期限切れは返却許可ではなく、
     // ここでの期限は受信のポーリング間隔である。
+    const uint64_t offersBefore = stats.offers;
     drain_offers();
+    if (stats.offers != offersBefore) {
+      // Offer を処理（受理/棄却/中間破棄）し終えたため、次のフレームで
+      // 新しいレコードを発行できる（--pace-records の待ちの解除）。
+      paceOutstanding = false;
+    }
     ledger.SweepExpired(NowUs());
     // harness が Offer を止めたまま読取側を開き続けると（半閉鎖）、切断は返らず
     // 空フレームが続く。一定時間の途絶は producer 終了とみなして統計を出して終了し、
     // kill による統計消失を避ける。切断検知時と同様、現在のフレームは安全に終える。
-    if (pipeAlive && !quit && haveOfferEver && NowUs() - lastOfferUs > kProducerIdleTimeoutUs) {
-      Info("Offer が 5 秒途絶えたため producer 終了とみなして統計を出して終了する");
+    if (pipeAlive && !quit && haveOfferEver && idleTimeoutUs != 0u &&
+        NowUs() - lastOfferUs > idleTimeoutUs) {
+      Info("Offer が %dms 途絶えたため producer 終了とみなして統計を出して終了する",
+           options.producerIdleTimeoutMs);
       pipeAlive = false;
       quit = true;
     }
@@ -1348,7 +1412,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     }
     // 提出は受理画像のレコードの pose/FOV で行う。最新 pose への付け替えはしない。
     // 新規受理が無ければ layerCount=0 で終える（対応不明の画像の再投影頼みは禁止。
-    // DESIGN §7）。受理から 500ms 超のレコードは失効として棄却する。
+    // DESIGN §7）。受理から record-ttl 超のレコードは失効として棄却する。
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1357,7 +1421,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     bool submit_layer = false;
     if (rendered && hasFresh) {
       const uint64_t age = NowUs() - freshRecord.issuedUs;
-      if (age <= kRenderRecordMaxAgeUs) {
+      if (age <= ledger.maxAgeUs()) {
         try {
           const vk::Image own = transfer.OwnImage();
           // 検証用の提出画像ダンプ。N 回目の提出時に blit 後・release 前の両眼を写す。
