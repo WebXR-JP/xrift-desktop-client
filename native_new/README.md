@@ -215,6 +215,7 @@ HMD 脱着/再接続を実装する（DESIGN §10・§11 M4）。
 ```powershell
 build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
   [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]
+  [--inject-space-change=Ms]
 ```
 
 - `--space`（既定 `auto`）… 参照空間の要求。起動時に `xrEnumerateReferenceSpaces` で
@@ -222,10 +223,18 @@ build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
   明示指定が不可なら落とさず後退し、理由をログに出す。選択結果は起動ログに出る。
 - `--inject-session-restart=Ms`（既定 0=無効）… 起動から Ms 後に意図的にセッション束を
   破棄・再生成する（復帰経路の検証用）。成功/失敗は統計に出る。
+- `--inject-space-change=Ms`（既定 0=無効）… 起動から Ms 後に模擬の space 変更を
+  1 回適用する。ランタイムの `REFERENCE_SPACE_CHANGE_PENDING` と同じ適用経路
+  （空間作り直し・`spaceEpoch` 更新・旧レコード失効）を通すが、
+  実イベントではないことをログに明記する
+  （`模擬 space 変更を適用（実イベントではない…）`）。統計の `space変更` に計上する。
 - ハーネス側（`harness/electron/run.ps1 -M2`）:
   `-Space`（exe の `--space` へ渡す）、`-HapticAtMs`（起動から Ms 後に
-  HapticCommand を 1 回送る。既定 0=無効。左手・振幅 0.8・300ms）、
-  `-InjectSessionRestartMs`（exe へ渡す。既定 0=無効）。
+  HapticCommand を送る。既定 `'0'`=無効。カンマ区切りで複数時刻を指定できる。
+  各送信は左手・振幅 0.8・300ms）、`-HapticRepeat`（5 秒間隔で N 回送る。
+  既定 0=無効。左右交互・振幅 1.0・500ms）、
+  `-InjectSessionRestartMs`（exe へ渡す。既定 0=無効）、
+  `-InjectSpaceChangeMs`（exe へ渡す。既定 0=無効）。
 
 入力の取得内容（`src/xr/input.h`）: 左右 grip/aim pose、trigger、squeeze、
 thumbstick＋click、primary/secondary、menu、haptic の適用。trackpad＋click も
@@ -241,13 +250,22 @@ suggest 先は khr/simple、oculus/touch、valve/index、htc/vive、microsoft/mo
 - 起動ログ: アクションセット作成・attach、suggest の profile 別成否、
   参照空間の一覧と選択結果、実際に選ばれた profile（変化時に記録）。
 - 毎フレーム: `xrSyncActions`（FOCUSED 時のみ）とスナップショット取得。
-  main へは毎フレーム InputState（種別 5）を送り、ログは毎秒に抑える
-  （接続状態、profile 名、押下中のボタン、trigger/squeeze 値、thumbstick）。
+  main へは毎フレーム InputState（種別 5。予約先頭 2B に左右の押下ラッチ付き）を送り、
+  ログは毎秒に抑える（接続状態、profile 名、押下中のボタン、trigger/squeeze 値、
+  thumbstick、その 1 秒間に押された `latch=`）。
+- 押下エッジ: 状態が変化したフレームで `[M4エッジ]` を 1 行出す
+  （ボタン bit の press/release、trigger/squeeze の off->on/on->off、
+  stick の idle->touch/touch->idle、pose 有効/無効の変化。変化が無ければ出さない）。
+  1 秒周期のサマリでは短い押下を取りこぼすため、実機の取りこぼし診断は
+  `[M4エッジ]` と `latch=` で行う。実機での再計測手順は
+  `harness/electron/README.md` の「実機での再計測手順」を参照。
 - inactive / 未接続 / 非対応の区別: 値とは別に active/supported の 2 段を持つ。
   supported=0 は非対応、supported=1 かつ active=0 は inactive、active=1 は有効値。
   未接続の手は flags=0 のまま全欄 0 で送る。
 - haptics: main からの HapticCommand（種別 4。hand@40、amplitude@56、duration@48）を受け、
-  `xrApplyHapticFeedback` を呼ぶ。非対応・inactive の失敗は統計に残し、
+  `xrApplyHapticFeedback` を呼ぶ。送信結果は `XrResult` でログに残す
+  （`haptics 送信: …（XrResult=…）`。VkResult ではない）。
+  非対応・inactive の未送信と呼出し失敗は区別して出し、統計に残す。
   例外でループを止めない。
 - `REFERENCE_SPACE_CHANGE_PENDING` を受けたら次フレームで空間を作り直し、
   新しい原点で locate できる確認が取れてから `spaceEpoch` を進め、

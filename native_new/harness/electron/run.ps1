@@ -8,14 +8,21 @@
 #   [-InjectReleaseFail N] [-InjectRendererCrashMs Ms] [-InjectGpuKillMs Ms]
 #   [-Mode vulkan|d3d-open-only|no-gpu] [-MemLog <接頭辞>]
 #   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify]
-#   [-Space auto|local|stage|local-floor] [-HapticAtMs Ms] [-InjectSessionRestartMs Ms]
+#   [-DumpSubmit <dir>] [-DumpFrame N]
+#   [-Space auto|local|stage|local-floor] [-HapticAtMs Ms[,Ms...]] [-HapticRepeat N]
+#   [-InjectSessionRestartMs Ms] [-InjectSpaceChangeMs Ms]
+#   [-Guide] [-NoGuide] [-GuidePlan default|short] [-CaptureAt 'Ms,path[;Ms,path]']
 #   [-SkipBuild]
 #   -Mode は exe の診断モード（既定 vulkan=Vulkan 経路）。借用台帳・ACK・release は同じ。
 #   d3d-open-only は D3D11 Open 経路の診断専用であり、長時間動かすとメモリが増える。
 #   -InjectReleaseFail/-InjectRendererCrashMs/-InjectGpuKillMs は M3 の harness 側注入
 #   （いずれも既定 0=無効。通常経路の挙動は変えない）。詳細は README の M3 節を参照。
 #   -SkipBuild は fault-matrix.ps1 が初回に 1 回だけ建てるための省略用（通常は付けない）。
-#   -Space/-HapticAtMs/-InjectSessionRestartMs は M4 用（-M2 と併用。詳細は README の M4 節を参照）。
+#   -Space/-HapticAtMs/-HapticRepeat/-InjectSessionRestartMs/-InjectSpaceChangeMs は
+#   M4 用（-M2 と併用。詳細は README の M4 節を参照）。
+#   -Guide/-NoGuide は HMD 操作ガイドの HTML オーバーレイ（-M2 時は既定 on、それ以外は off）。
+#   -GuidePlan は手順プラン（既定 default。short は 40 秒用 13 ステップ。-M2 時のみ有効）。
+#   -CaptureAt は検証専用の PNG 保存（例: -CaptureAt '8000,logs\guide.png'。描画経路に入れない）。
 #   -MemLog は計測用 CSV の接頭辞（例: logs\run1 → run1.exe.csv と run1.gpu.csv）。
 #     exe 側の 1 秒周期ログ（Private Bytes/RSS/ハンドル/生存 Vk 資源）と、
 #     GPU プロセスメモリの 1 秒周期ログ（Get-Counter の Local/Dedicated Usage）を出す。
@@ -42,10 +49,21 @@ param(
   [int]$InjectStaleRecord = 0,
   [string]$RenderScale = '0.5',
   [switch]$NoSubmitVerify,
+  [string]$DumpSubmit = '',
+  [int]$DumpFrame = 60,
   [ValidateSet('auto', 'local', 'stage', 'local-floor')]
   [string]$Space = 'auto',
-  [int]$HapticAtMs = 0,
+  # カンマ区切りでも配列でも受け付ける（例: -HapticAtMs 5000,15000 / -HapticAtMs '5000,15000'）。
+  # PowerShell の `5000,15000` は配列になるため、electron へ渡す前に結合する。
+  [string[]]$HapticAtMs = @('0'),
+  [int]$HapticRepeat = 0,
   [int]$InjectSessionRestartMs = 0,
+  [int]$InjectSpaceChangeMs = 0,
+  [switch]$Guide,
+  [switch]$NoGuide,
+  [ValidateSet('default', 'short')]
+  [string]$GuidePlan = 'default',
+  [string]$CaptureAt = '',
   [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -100,10 +118,31 @@ if ($M2) {
   $electronArgs += "--inject-stale-record=$InjectStaleRecord"
   $electronArgs += "--render-scale=$RenderScale"
   $electronArgs += "--space=$Space"
-  if ($HapticAtMs -gt 0) { $electronArgs += "--haptic-at=$HapticAtMs" }
+  # ガイドは -M2 時は既定 on（-NoGuide で off）。-M2 以外は -Guide のときだけ on。
+  if ($NoGuide) { $electronArgs += '--guide=0' }
+  elseif ($Guide -or $M2) { $electronArgs += '--guide=1' }
+  $electronArgs += "--guide-plan=$GuidePlan"
+  if ($CaptureAt -ne '') { $electronArgs += "--capture-at=$CaptureAt" }
+  $hapticAtJoined = ($HapticAtMs -join ',')
+  if ($hapticAtJoined -ne '0' -and $hapticAtJoined -ne '') {
+    $electronArgs += "--haptic-at=$hapticAtJoined"
+  }
+  if ($HapticRepeat -gt 0) { $electronArgs += "--haptic-repeat=$HapticRepeat" }
   if ($InjectSessionRestartMs -gt 0) { $electronArgs += "--inject-session-restart=$InjectSessionRestartMs" }
+  if ($InjectSpaceChangeMs -gt 0) { $electronArgs += "--inject-space-change=$InjectSpaceChangeMs" }
   if ($NoSubmitVerify) { $electronArgs += '--no-submit-verify' }
+  if ($DumpSubmit -ne '') {
+    $dumpDir = [IO.Path]::GetFullPath($DumpSubmit)
+    $electronArgs += "--dump-submit=$dumpDir"
+    $electronArgs += "--dump-frame=$DumpFrame"
+  }
   Write-Host "M2 モード: --m2 --inject-stale-record=$InjectStaleRecord --render-scale=$RenderScale --space=$Space"
+}
+else {
+  # M2 以外は既定 off。明示の -Guide/-CaptureAt だけ通す（既存検証に影響しない）。
+  if ($Guide) { $electronArgs += '--guide=1' }
+  if ($NoGuide) { $electronArgs += '--guide=0' }
+  if ($CaptureAt -ne '') { $electronArgs += "--capture-at=$CaptureAt" }
 }
 # 計測用 CSV（-MemLog <接頭辞>）。exe 側は <接頭辞>.exe.csv（--mem-log 経由）、
 # GPU プロセスメモリは <接頭辞>.gpu.csv（このスクリプトが 1 秒周期で採取）。

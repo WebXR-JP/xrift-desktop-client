@@ -239,13 +239,16 @@ void Session::Destroy() {
   running_ = false;
 }
 
-bool Session::RecreateSpaceForPendingChange() {
+bool Session::RecreateSpaceForPendingChange(XrTime displayTime) {
   if (session_ == XR_NULL_HANDLE) {
     return false;
   }
   // 同種別の空間を作り直し、新しい原点で locate できることを確認してから返す。
   // 呼び出し側は成功時に spaceEpoch を進め、旧世代のレコードを失効させる。
   // 失敗時は旧空間を保ち、世代は進めない。
+  // 時刻 0 はランタイムに解決を委ねるが、受け付けないランタイム
+  // （実測: SteamVR は XR_ERROR_TIME_INVALID を返す）では失敗する。
+  // そのため呼び出し側は xrWaitFrame の予測表示時刻を渡すこと。
   XrReferenceSpaceCreateInfo space_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
   space_info.referenceSpaceType = space_type_;
   space_info.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -257,9 +260,9 @@ bool Session::RecreateSpaceForPendingChange() {
          XrResultToString(created));
     return false;
   }
-  // 新しい原点を取得できることの確認。時刻 0 はランタイムに解決を委ねる。
+  // 新しい原点を取得できることの確認。時刻は呼び出し側の予測表示時刻を使う。
   XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-  const XrResult located = xrLocateSpace(next, next, 0, &location);
+  const XrResult located = xrLocateSpace(next, next, displayTime, &location);
   if (located != XR_SUCCESS) {
     Warn("作り直した参照空間の locate に失敗: %s。旧空間を保つ", XrResultToString(located));
     xrDestroySpace(next);

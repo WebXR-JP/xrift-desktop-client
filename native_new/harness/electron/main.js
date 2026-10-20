@@ -80,9 +80,21 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
     '  M4（--m2 時のみ）:\n' +
     '  --space=<auto|local|stage|local-floor> … exe の参照空間の要求（既定 auto）。\n' +
     '    不可なら落とさず後退し、理由は exe のログに出る\n' +
-    '  --haptic-at=Ms … 起動から Ms 後に HapticCommand を 1 回送る（既定 0=無効。\n' +
-    '    左手・振幅 0.8・300ms。inactive・失敗は exe 側の統計に残る）\n' +
-    '  --inject-session-restart=Ms … exe に渡す意図的セッション再生成フック（既定 0=無効）');
+    '  --haptic-at=Ms[,Ms...] … 起動から Ms 後に HapticCommand を送る（既定 0=無効。\n' +
+    '    カンマ区切りで複数時刻を指定できる。左手・振幅 0.8・300ms。\n' +
+    '    inactive・失敗は exe 側の統計に残る）\n' +
+    '  --haptic-repeat=N … 5 秒間隔で N 回送る（既定 0=無効。左右交互・振幅 1.0・500ms）\n' +
+    '  --inject-space-change=Ms … exe に渡す模擬 space 変更フック（既定 0=無効。\n' +
+    '    実イベントではないことを exe 側のログに明記し、統計の space変更に計上する）\n' +
+    '  --inject-session-restart=Ms … exe に渡す意図的セッション再生成フック（既定 0=無効）\n' +
+    '  --dump-submit=<dir> [--dump-frame=N] … exe に渡す提出画像ダンプ（既定無効。N 既定 60）。\n' +
+    '    N 回目の提出時に両眼 swapchain を PPM 保存する。製品経路の挙動は変えない\n' +
+    '  --guide[=1|0] … HMD 操作ガイドの HTML オーバーレイ（既定 --m2 時 on、それ以外 off）。\n' +
+    '    canvas 描画に触らず Chromium 合成で乗るだけのため検査結果は変わらない\n' +
+    '  --guide-plan=default|short … ガイドの手順プラン（既定 default。short は 40 秒用 13 ステップ）。\n' +
+    '    --m2 時のみ有効。通常経路の挙動は変えない\n' +
+    '  --capture-at=Ms,path … 起動から Ms 後に webContents.capturePage() で PNG を保存する。\n' +
+    '    検証専用（描画経路に入れない）。複数は ; 区切り');
   app.whenReady().then(() => app.exit(0));
   return;
 }
@@ -96,12 +108,62 @@ const M2 = process.argv.includes('--m2');
 const INJECT_STALE_RECORD = Math.max(0, parseInt(arg('inject-stale-record', '0'), 10) || 0);
 const RENDER_SCALE = arg('render-scale', '0.5');
 const NO_SUBMIT_VERIFY = process.argv.includes('--no-submit-verify');
+// 検証用の提出画像ダンプ（exe の --dump-submit/--dump-frame へ渡す。既定 ''=無効）。
+const DUMP_SUBMIT = arg('dump-submit', '');
+const DUMP_FRAME = Math.max(1, parseInt(arg('dump-frame', '60'), 10) || 60);
 // M4: 参照空間の要求（exe の --space へ渡す。既定 auto）。
 const SPACE = arg('space', 'auto');
-// M4: haptics 指令の送信時刻（起動から Ms 後に 1 回送る。既定 0=無効）。
-const HAPTIC_AT_MS = Math.max(0, parseInt(arg('haptic-at', '0'), 10) || 0);
+// M4: haptics 指令の送信時刻（起動から Ms 後に送る。既定 0=無効）。
+// カンマ区切りで複数時刻を指定できる（例: --haptic-at=5000,15000,25000）。
+// 各送信は左手・振幅 0.8・300ms。inactive・失敗は exe 側の統計に残る。
+const HAPTIC_AT_RAW = arg('haptic-at', '0');
+const HAPTIC_AT_LIST = HAPTIC_AT_RAW.split(',')
+  .map((s) => Math.max(0, parseInt(s.trim(), 10) || 0))
+  .filter((v) => v > 0);
+// M4: haptics の繰り返し送信（5 秒間隔で N 回。既定 0=無効）。
+// 左右交互・振幅 1.0・500ms。実機の体感再確認用であり、通常経路の挙動は変えない。
+const HAPTIC_REPEAT = Math.max(0, parseInt(arg('haptic-repeat', '0'), 10) || 0);
+// M4: 模擬の space 変更（exe の --inject-space-change へ渡す。既定 0=無効）。
+const INJECT_SPACE_CHANGE_MS = Math.max(0, parseInt(arg('inject-space-change', '0'), 10) || 0);
 // M4: 意図的セッション再生成の検証フック（exe の --inject-session-restart へ渡す。既定 0=無効）。
 const INJECT_SESSION_RESTART_MS = Math.max(0, parseInt(arg('inject-session-restart', '0'), 10) || 0);
+// HMD 操作ガイド（index-m2.html の HTML/CSS オーバーレイ）。--guide / --guide=1 で
+// 有効、--guide=0 / --no-guide で無効。既定は M2 実機計測で on、他では off であり、
+// 既存の検証（off のまま）に影響しない。canvas 描画には触らない。
+const GUIDE = (() => {
+  const raw = arg('guide', '');
+  if (raw !== '') {
+    const v = raw.trim().toLowerCase();
+    if (['0', 'false', 'off', 'no'].includes(v)) return false;
+    return true;
+  }
+  if (process.argv.includes('--guide')) return true;
+  if (process.argv.includes('--no-guide')) return false;
+  return M2;
+})();
+// HMD 操作ガイドの手順プラン（index-m2.html の ?guidePlan へ渡す。既定 default）。
+// short は 40 秒用の 13 ステップ。--m2 時のみ有効であり、通常経路の挙動は変えない。
+const GUIDE_PLAN = arg('guide-plan', 'default');
+if (!['default', 'short'].includes(GUIDE_PLAN)) {
+  console.error(`unknown --guide-plan=${GUIDE_PLAN}（default / short のいずれか）`);
+  process.exitCode = 1;
+  app.whenReady().then(() => app.exit(1));
+  return;
+}
+// 検証専用の画面 capture（--capture-at=Ms,path。複数は ; 区切り）。
+// 指定時刻に webContents.capturePage() で PNG を保存する。描画経路には入れない。
+const CAPTURE_AT_LIST = (() => {
+  const raw = arg('capture-at', '');
+  if (raw === '') return [];
+  return raw.split(';').map((s) => s.trim()).filter((s) => s !== '').map((s) => {
+    const i = s.indexOf(',');
+    if (i <= 0) return null;
+    const ms = Math.max(0, parseInt(s.slice(0, i).trim(), 10) || 0);
+    const file = s.slice(i + 1).trim();
+    if (!(ms > 0) || file === '') return null;
+    return { ms, file };
+  }).filter((v) => v !== null);
+})();
 if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
   console.error(`unknown --space=${SPACE}（auto / local / stage / local-floor のいずれか）`);
   process.exitCode = 1;
@@ -180,6 +242,7 @@ const stats = {
   inputStates: 0, // M4: exe から受けた InputState の件数。
   lastInput: null, // M4: 最後に受けた InputState の要約（統計用）。
   hapticSent: 0, // M4: exe へ送った HapticCommand の件数（--haptic-at 用）。
+  captures: 0, // 検証専用の --capture-at で保存した PNG の枚数（描画経路に影響しない）。
   releaseAttempts: 0, // M3: release() の試行回数（注入判定の分母）。
   warmupDrops: 0, // M3: パターン描画の合図前の起動過渡 drop 数（転送前 drop。証拠用）。
   rendererCrashed: 0, // M3: renderer 異常を検知したら 1。
@@ -211,7 +274,8 @@ let graceTimer = null;
 // いずれも既定 off であり、通常経路の挙動は変えない。
 let rendererCrashed = false;
 let rendererCrashTimer = null;
-let hapticTimer = null; // M4 の --haptic-at 用（1 回だけ送る）。
+let hapticTimers = []; // M4 の --haptic-at/--haptic-repeat 用（複数回送る）。
+let captureTimers = []; // 検証専用の --capture-at 用（描画経路に入れない）。
 let gpuKillTimer = null;
 let gpuKillObserveTimer = null;
 // M3 の描画準備ゲート。M1 はレンダラの最初のパターン描画の合図
@@ -622,10 +686,20 @@ function forwardM2Record(m) {
 // M4: exe からの InputState を読む。操作の要約であり、pose は含まない
 // （pose の確認は exe 側のログで行う）。「0」と「未対応」の区別は
 // active/supported の 2 段で行う。1 秒に 1 回だけ要約をログに出す。
+// 予約先頭 2B（offset 152,153）は左右の押下ラッチ（その 1 秒間に押された
+// ボタンの集合。buttons と同じ bit 割付け。protocol.h を参照）。
 const PROFILE_NAMES = {
   0: '-', 1: 'simple', 2: 'oculus', 3: 'index', 4: 'vive', 5: 'motion',
   6: 'pico4', 7: 'pico-neo3', 8: 'pico-ultra', 9: 'pico-g3', 255: 'other',
 };
+const LATCH_BUTTON_NAMES = ['stick', 'pad', 'primary', 'secondary', 'menu'];
+function decodeLatch(bits) {
+  const names = [];
+  for (let b = 0; b < 5; b++) {
+    if ((bits & (1 << b)) !== 0) names.push(LATCH_BUTTON_NAMES[b]);
+  }
+  return names.length ? names.join(',') : '-';
+}
 let lastInputLogAt = 0;
 function decodeInputHand(m, base) {
   const flags = m[base];
@@ -661,6 +735,8 @@ function onInputState(m) {
     spaceEpoch: m.readUInt32LE(52),
     left: decodeInputHand(m, 56),
     right: decodeInputHand(m, 72),
+    latchLeft: decodeLatch(m[152]),
+    latchRight: decodeLatch(m[153]),
   };
   stats.inputStates++;
   stats.lastInput = st;
@@ -671,39 +747,81 @@ function onInputState(m) {
       `trig=${h.trigger.toFixed(2)} sq=${h.squeeze.toFixed(2)} ` +
       `stick=(${h.stick[0].toFixed(2)},${h.stick[1].toFixed(2)})${h.stickState} btn=${h.buttons}`;
     log(`[M4入力] L: ${fmt(st.left)} | R: ${fmt(st.right)} ` +
-      `(frame=${st.frame} conn=${st.connEpoch} space=${st.spaceEpoch})`);
+      `(frame=${st.frame} conn=${st.connEpoch} space=${st.spaceEpoch} ` +
+      `latch=L:${st.latchLeft} R:${st.latchRight})`);
   }
 }
 
-// M4: HapticCommand を exe へ 1 回送る（--haptic-at 用。左手・振幅 0.8・300ms）。
-// 配置は protocol.h の MakeHapticCommand と同じ（hand@40、amplitude@56、duration@48）。
-function sendHapticOnce() {
+// M4: HapticCommand を exe へ送る（配置は protocol.h の MakeHapticCommand と同じ）。
+// hand@40、amplitude@56、durationMs@48。送信結果（成功・inactive・失敗）は
+// exe 側のログと統計に残る（XrResult で記録する）。
+function sendHaptic(hand, amplitude, durationMs, why) {
   if (socket === null || socket.destroyed) {
-    log('haptics 未送信: パイプが無い（--haptic-at）');
+    log(`haptics 未送信: パイプが無い（${why}）`);
     return;
   }
   const buf = Buffer.alloc(MSG_LEN);
   buf.writeUInt32LE(MAGIC, 0);
   buf.writeUInt16LE(VERSION, 4);
   buf.writeUInt16LE(TYPE_HAPTIC_COMMAND, 6);
-  buf.writeUInt32LE(0, 40); // hand=0（左）。
-  buf.writeFloatLE(0.8, 56);
-  buf.writeUInt32LE(300, 48);
+  buf.writeUInt32LE(hand, 40);
+  buf.writeFloatLE(amplitude, 56);
+  buf.writeUInt32LE(durationMs, 48);
   try {
     socket.write(buf);
     stats.hapticSent++;
-    log('haptics 指令を送信（左・振幅 0.8・300ms。inactive・失敗は exe 側の統計に残る）');
+    log(`haptics 指令を送信（${hand === 0 ? '左' : '右'}・振幅 ${amplitude}・${durationMs}ms。` +
+      `inactive・失敗は exe 側の統計に残る。${why}）`);
   } catch (e) {
     log(`haptics 送信に失敗: ${e && e.message}`);
   }
 }
-function scheduleHaptic() {
-  if (HAPTIC_AT_MS <= 0) return;
-  log(`検証フック有効: --haptic-at=${HAPTIC_AT_MS}（起動からその ms 後に HapticCommand を 1 回送る）`);
-  hapticTimer = setTimeout(() => {
-    hapticTimer = null;
-    sendHapticOnce();
-  }, HAPTIC_AT_MS);
+// --haptic-at（複数時刻。各送信は左手・振幅 0.8・300ms）と
+// --haptic-repeat（5 秒間隔で N 回。左右交互・振幅 1.0・500ms）の予約。
+// いずれも既定は送らない（通常経路の挙動は変えない）。
+function scheduleHaptics() {
+  for (const at of HAPTIC_AT_LIST) {
+    log(`検証フック有効: --haptic-at=${at}（起動からその ms 後に HapticCommand を送る）`);
+    hapticTimers.push(setTimeout(() => {
+      sendHaptic(0, 0.8, 300, `--haptic-at=${at}`);
+    }, at));
+  }
+  if (HAPTIC_REPEAT > 0) {
+    log(`検証フック有効: --haptic-repeat=${HAPTIC_REPEAT}（5 秒間隔で ${HAPTIC_REPEAT} 回送る。` +
+      `左右交互・振幅 1.0・500ms）`);
+    for (let i = 1; i <= HAPTIC_REPEAT; i++) {
+      const hand = (i % 2 === 1) ? 0 : 1; // 奇数回=左、偶数回=右。
+      hapticTimers.push(setTimeout(() => {
+        sendHaptic(hand, 1.0, 500, `--haptic-repeat（${i}/${HAPTIC_REPEAT}）`);
+      }, i * 5000));
+    }
+  }
+}
+
+// 検証専用の画面 capture（--capture-at=Ms,path）。指定時刻に
+// webContents.capturePage() で PNG を保存する。描画経路（paint/Offer/検査）には
+// 入れず、Chromium 合成後の見た目（ガイド表示の確認用）だけを取る。
+function scheduleCapture(win) {
+  for (const c of CAPTURE_AT_LIST) {
+    log(`検証フック有効: --capture-at=${c.ms},${c.file}（起動からその ms 後に capturePage で PNG 保存）`);
+    captureTimers.push(setTimeout(async () => {
+      try {
+        if (win.isDestroyed()) {
+          log(`capture スキップ（window 破棄済み）: ${c.file}`);
+          return;
+        }
+        const img = await win.webContents.capturePage();
+        const out = path.isAbsolute(c.file) ? c.file : path.join(outDir, c.file);
+        const dir = path.dirname(out);
+        if (dir !== '' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(out, img.toPNG());
+        stats.captures = (stats.captures || 0) + 1;
+        log(`capture 保存: ${out}（${c.ms}ms 時点）`);
+      } catch (e) {
+        log(`capture 失敗 ${c.file}: ${e && e.message}`);
+      }
+    }, c.ms));
+  }
 }
 
 function maybeFinish() {
@@ -726,10 +844,14 @@ function finish(code) {
     clearTimeout(rendererCrashTimer);
     rendererCrashTimer = null;
   }
-  if (hapticTimer) {
-    clearTimeout(hapticTimer);
-    hapticTimer = null;
+  for (const t of hapticTimers) {
+    clearTimeout(t);
   }
+  hapticTimers = [];
+  for (const t of captureTimers) {
+    clearTimeout(t);
+  }
+  captureTimers = [];
   if (gpuKillTimer) {
     clearTimeout(gpuKillTimer);
     gpuKillTimer = null;
@@ -794,6 +916,7 @@ function finish(code) {
   const summary = {
     exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
     mode: MODE, exeMemLog: EXE_MEM_LOG || null,
+    guide: GUIDE, guidePlan: GUIDE_PLAN, captureAt: CAPTURE_AT_LIST,
     injectReleaseFail: INJECT_RELEASE_FAIL,
     injectRendererCrashMs: INJECT_RENDERER_CRASH_MS,
     injectGpuKillMs: INJECT_GPU_KILL_MS,
@@ -913,9 +1036,11 @@ async function createWindow() {
     await win.loadFile(path.join(__dirname, 'index-m2.html'), {
       query: {
         staleRecord: String(INJECT_STALE_RECORD),
+        guide: GUIDE ? '1' : '0',
+        guidePlan: GUIDE_PLAN,
       },
     });
-    log(`index-m2.html loaded (inject staleRecord=${INJECT_STALE_RECORD})`);
+    log(`index-m2.html loaded (inject staleRecord=${INJECT_STALE_RECORD} guide=${GUIDE ? 'on' : 'off'} guidePlan=${GUIDE_PLAN})`);
   } else {
     await win.loadFile(path.join(__dirname, 'index.html'), {
       query: {
@@ -931,6 +1056,7 @@ async function createWindow() {
   }
   gpuPidStart = currentGpuPid();
   log(`GPU プロセス pid=${gpuPidStart}（app.getAppMetrics() から取得）`);
+  scheduleCapture(win);
 
   stopTimer = setTimeout(() => {
     log(`${SECONDS}s 経過。新規 paint の受付を止める`);
@@ -959,6 +1085,7 @@ function start() {
        `--mode=${MODE}`];
   if (M2) {
     log(`exe の M2 XR提出モード: render-scale=${RENDER_SCALE} space=${SPACE}`);
+    log(`HMD 操作ガイド: ${GUIDE ? 'on' : 'off'} plan=${GUIDE_PLAN}（既定 M2=on。canvas 描画に触らない）`);
     if (INJECT_STALE_RECORD > 0) {
       exeArgs.push(`--inject-stale-record=${INJECT_STALE_RECORD}`);
       log(`検証フック有効: exe に --inject-stale-record=${INJECT_STALE_RECORD} を渡す ` +
@@ -969,9 +1096,20 @@ function start() {
       log(`検証フック有効: exe に --inject-session-restart=${INJECT_SESSION_RESTART_MS} を渡す ` +
           `（その ms 後に意図的にセッションを破棄・再生成する）`);
     }
+    if (INJECT_SPACE_CHANGE_MS > 0) {
+      exeArgs.push(`--inject-space-change=${INJECT_SPACE_CHANGE_MS}`);
+      log(`検証フック有効: exe に --inject-space-change=${INJECT_SPACE_CHANGE_MS} を渡す ` +
+          `（その ms 後に模擬の space 変更を 1 回適用する。実イベントではない）`);
+    }
     if (NO_SUBMIT_VERIFY) {
       exeArgs.push('--no-submit-verify');
       log('左右分離検証を無効化 (--no-submit-verify)');
+    }
+    if (DUMP_SUBMIT !== '') {
+      exeArgs.push(`--dump-submit=${DUMP_SUBMIT}`);
+      exeArgs.push(`--dump-frame=${DUMP_FRAME}`);
+      log(`検証フック有効: exe に --dump-submit=${DUMP_SUBMIT} --dump-frame=${DUMP_FRAME} を渡す ` +
+          `（その回目の提出時に両眼を PPM 保存）`);
     }
   } else {
     exeArgs.push(NO_GPU_CHECK ? '--no-gpu-check' : '--gpu-check');
@@ -1008,8 +1146,8 @@ function start() {
   // M3 の renderer クラッシュ・GPU kill の予約は createWindow 後に行う。
   // renderer 側は window が要るため createWindow 側で予約し、GPU 側はここで予約する。
   scheduleGpuKill();
-  // M4 の haptics 指令（--haptic-at。M2 モード以外では送り先が無いため M2 限定）。
-  if (M2) scheduleHaptic();
+  // M4 の haptics 指令（--haptic-at/--haptic-repeat。M2 モード以外では送り先が無いため M2 限定）。
+  if (M2) scheduleHaptics();
   exeProc = spawn(EXE_PATH, exeArgs, {
     stdio: ['ignore', 'inherit', 'inherit'],
   });

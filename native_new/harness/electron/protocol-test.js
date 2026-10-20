@@ -160,5 +160,23 @@ assert.strictEqual(st[64], 0b11100, 'ボタン押下');
 assert.strictEqual(st[68], 0b11100, 'ボタン supported（0 と未対応の区別）');
 assert.ok(st.subarray(88, 152).every((b) => b === 0), 'InputState の未使用域は 0');
 
+// M4計測: InputState の予約先頭 2B は左右の押下ラッチ（buttons と同じ bit 割付け）。
+// 短い押下の取りこぼし診断用。旧復号器は予約域を読まないため配置の追加である。
+const BTN_NAMES = ['stick', 'pad', 'primary', 'secondary', 'menu'];
+function latchNames(bits) {
+  const names = [];
+  for (let b = 0; b < 5; b++) {
+    if ((bits & (1 << b)) !== 0) names.push(BTN_NAMES[b]);
+  }
+  return names.length ? names.join(',') : '-';
+}
+st[152] = 0b11100; st[153] = 0b00001;
+assert.strictEqual(st[152], 0b11100, '左ラッチ（primary/secondary/menu）');
+assert.strictEqual(st[153], 0b00001, '右ラッチ（stick）');
+assert.strictEqual(latchNames(st[152]), 'primary,secondary,menu', '左ラッチの人名');
+assert.strictEqual(latchNames(st[153]), 'stick', '右ラッチの人名');
+assert.strictEqual(latchNames(0), '-', '空ラッチは -');
+assert.ok(st.subarray(154).every((b) => b === 0), 'ラッチ以外の予約域は 0');
+
 console.log('protocol-test: ok（配置 192B・LE・予約 0・RenderRequest 往復を確認）');
 console.log('protocol-test: ok（M4 の HapticCommand・InputState の配置を確認）');

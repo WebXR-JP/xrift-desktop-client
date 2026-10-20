@@ -61,6 +61,9 @@ struct EyeFov {
 // Offer/Done では 40 以降を 0 で送り、受信側は読まない（M1 経路の挙動は変えない）。
 // RenderRequest（exe→main）では borrowId/handle/status を 0 にし、renderId 以降を使う。
 // width/height は RenderRequest では要求アトラス寸法（横並び全体）を入れる。
+// InputState（exe→main）では予約先頭 2B（reserved[0]=左、[1]=右）に押下ラッチ
+// （その 1 秒間に押されたボタンの集合。buttons 欄と同じ bit 割付け）を載せる。
+// 短い押下の取りこぼし診断用であり、旧復号器は予約域を読まないため版は上げない。
 struct TransferMessage {
   uint32_t magic = 0;
   uint16_t version = 0;

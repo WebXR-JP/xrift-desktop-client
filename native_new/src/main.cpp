@@ -31,17 +31,27 @@ void PrintHelp(const char* argv0) {
       "            検証フック（既定 0=無効。Done を送らず終了 2。import 資源は破棄しない）\n"
       "            --delay-ms=N は 1 フレームの処理前に N ミリ秒待つ検証フック（既定 0=無効）\n"
       "  --xr-transfer --pipe=\\\\.\\pipe\\<名前> [--render-scale=<0.25〜1.0>]\n"
-      "            [--seconds=N] [--inject-stale-record=N] [--no-submit-verify]\n"
+      "            [--seconds=N] [--inject-stale-record=N] [--no-submit-verify] [--dump-submit=<dir>] [--dump-frame=N]\n"
       "            M2 の XR 提出モード。XR セッションを開始し、pose/FOV の描画レコードを\n"
       "            発行して RenderRequest を送り、受理画像だけを左右 swapchain へ blit する。\n"
       "            --render-scale は既定 0.5。--inject-stale-record=N は N フレーム目の\n"
       "            RenderRequest に旧 pose 混入の合図を載せる（harness 側フック用）。\n"
       "            --no-submit-verify で blit 後の左右分離 readback を止める\n"
+      "            --dump-submit=<dir> は N 回目の提出時に両眼 swapchain を PPM 保存する\n"
+      "            （検証用。既定は保存しない。--dump-frame=N は既定 60）\n"
       "            [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]\n"
+      "            [--inject-space-change=Ms]\n"
       "            --space は参照空間の要求（既定 auto=local-floor→stage→local の後退。\n"
       "            不可なら落とさず後退し、理由をログに出す）\n"
       "            --inject-session-restart=Ms は起動から Ms 後に意図的にセッションを\n"
       "            破棄・再生成する（復帰経路の検証用。既定 0=無効）\n"
+      "            --inject-space-change=Ms は起動から Ms 後に模擬の space 変更を 1 回\n"
+      "            適用する（spaceEpoch 更新・旧レコード失効の経路検証用。\n"
+      "            実イベントではないことをログに明記し、統計の space変更に計上する。\n"
+      "            既定 0=無効）\n"
+      "            入力は毎秒サマリ（[M4入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
+      "            状態変化のフレームで [M4エッジ] を出す。haptics 受信は XrResult を\n"
+      "            ログに残す\n"
       "  --m2-selftest  M2 の値層（配置・pose タグ・受理/棄却）を HMD 無しに検証する\n"
       "  --help    この表示\n",
       argv0);
@@ -157,6 +167,15 @@ int main(int argc, char** argv) {
         }
       } else if (std::strcmp(argv[i], "--no-submit-verify") == 0) {
         opts.submitVerify = false;
+      } else if (StartsWith(argv[i], "--dump-submit=")) {
+        // 検証用の提出画像ダンプ。既定は空（無効）。通常経路では使わない。
+        opts.dumpSubmitDir = argv[i] + std::strlen("--dump-submit=");
+      } else if (StartsWith(argv[i], "--dump-frame=")) {
+        // 保存する提出回（1 起点。既定 60）。dump-submit が空なら無視する。
+        opts.dumpFrame = std::atoi(argv[i] + std::strlen("--dump-frame="));
+        if (opts.dumpFrame < 1) {
+          opts.dumpFrame = 1;
+        }
       } else if (StartsWith(argv[i], "--space=")) {
         opts.space = argv[i] + std::strlen("--space=");
         if (opts.space != "auto" && opts.space != "local" && opts.space != "stage" &&
@@ -172,6 +191,13 @@ int main(int argc, char** argv) {
             std::atoi(argv[i] + std::strlen("--inject-session-restart="));
         if (opts.injectSessionRestartMs < 0) {
           opts.injectSessionRestartMs = 0;
+        }
+      } else if (StartsWith(argv[i], "--inject-space-change=")) {
+        // 検証用の模擬 space 変更フック。既定 0=無効。通常経路では使わない。
+        opts.injectSpaceChangeMs =
+            std::atoi(argv[i] + std::strlen("--inject-space-change="));
+        if (opts.injectSpaceChangeMs < 0) {
+          opts.injectSpaceChangeMs = 0;
         }
       } else {
         xrift::Error("不明な引数: %s", argv[i]);

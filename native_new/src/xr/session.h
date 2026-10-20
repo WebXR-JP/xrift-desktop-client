@@ -53,8 +53,11 @@ class Session {
   void Destroy();
   // REFERENCE_SPACE_CHANGE_PENDING を受けた後の空間の作り直し。
   // 同種別の空間を作り直し、新しい原点で locate できることを確認する。
+  // displayTime は locate 確認に使う予測表示時刻（xrWaitFrame の値）である。
+  // 0 のときはランタイムに解決を委ねる（受け付けないランタイムでは失敗し、
+  // 旧空間を保つ。呼び出し側はフレーム時刻が取れる running 中に呼ぶこと）。
   // 成功時は true。失敗時は旧空間を保ち false を返す（世代は進めない）。
-  bool RecreateSpaceForPendingChange();
+  bool RecreateSpaceForPendingChange(XrTime displayTime);
 
  private:
   bool CreateSpace(XrReferenceSpaceType type);

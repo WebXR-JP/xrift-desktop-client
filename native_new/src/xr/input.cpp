@@ -1,5 +1,6 @@
 #include "xr/input.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -494,6 +495,8 @@ InputSnapshot InputManager::Snapshot(XrSession session, XrSpace appSpace, XrTime
 bool InputManager::ApplyHaptic(XrSession session, uint32_t hand, float amplitude,
                                uint32_t durationMs, bool focused) {
   if (hand > 1 || session == XR_NULL_HANDLE || haptic_ == XR_NULL_HANDLE || !focused) {
+    // 呼び出し自体を行わない。結果は前回のままにし、未呼出しだけを残す。
+    last_haptic_called_ = false;
     ++stats_.hapticInactive;
     return false;
   }
@@ -505,8 +508,11 @@ bool InputManager::ApplyHaptic(XrSession session, uint32_t hand, float amplitude
   info.action = haptic_;
   info.subactionPath = hand_paths_[hand];
   // 非対応・inactive の失敗は統計に残し、例外でループを止めない。
+  // 呼び出しの有無と XrResult は呼び出し側のログ用に残す。
   const XrResult result =
       xrApplyHapticFeedback(session, &info, reinterpret_cast<XrHapticBaseHeader*>(&vibration));
+  last_haptic_called_ = true;
+  last_haptic_result_ = result;
   if (result == XR_SUCCESS) {
     ++stats_.hapticOk;
     return true;
@@ -562,6 +568,105 @@ std::string InputManager::Summarize(const InputSnapshot& snapshot) {
     }
     out += line;
     out += " btn=" + buttons;
+  }
+  return out;
+}
+
+std::string InputManager::SummarizeWithLatch(const InputSnapshot& snapshot, uint8_t latch0,
+                                             uint8_t latch1) {
+  return Summarize(snapshot) + " latch=L:" + FormatLatch(latch0) + " R:" + FormatLatch(latch1);
+}
+
+uint8_t InputManager::PressedBits(const HandInput& hand) {
+  uint8_t bits = 0;
+  const InputButton* btns[5] = {&hand.thumbstickClick, &hand.trackpadClick, &hand.primary,
+                                &hand.secondary, &hand.menu};
+  for (int b = 0; b < 5; ++b) {
+    if (btns[b]->pressed && btns[b]->state == FieldState::Active) {
+      bits |= static_cast<uint8_t>(1u << b);
+    }
+  }
+  return bits;
+}
+
+std::string InputManager::FormatLatch(uint8_t bits) {
+  static constexpr const char* kNames[5] = {"stick", "pad", "primary", "secondary", "menu"};
+  std::string out;
+  for (int b = 0; b < 5; ++b) {
+    if ((bits & static_cast<uint8_t>(1u << b)) != 0) {
+      if (!out.empty()) {
+        out += ",";
+      }
+      out += kNames[b];
+    }
+  }
+  if (out.empty()) {
+    out = "-";
+  }
+  return out;
+}
+
+std::string InputManager::DescribeEdges(const InputSnapshot& prev, const InputSnapshot& cur) {
+  static constexpr const char* kNames[5] = {"stick", "pad", "primary", "secondary", "menu"};
+  std::string out;
+  auto emit = [&](const std::string& token) {
+    if (!out.empty()) {
+      out += " ";
+    }
+    out += token;
+  };
+  for (int i = 0; i < 2; ++i) {
+    const HandInput& a = prev.hands[i];
+    const HandInput& b = cur.hands[i];
+    const char* hand = (i == 0) ? "L" : "R";
+    const InputButton* prev_btns[5] = {&a.thumbstickClick, &a.trackpadClick, &a.primary,
+                                       &a.secondary, &a.menu};
+    const InputButton* cur_btns[5] = {&b.thumbstickClick, &b.trackpadClick, &b.primary,
+                                      &b.secondary, &b.menu};
+    for (int k = 0; k < 5; ++k) {
+      const bool was = prev_btns[k]->pressed && prev_btns[k]->state == FieldState::Active;
+      const bool now = cur_btns[k]->pressed && cur_btns[k]->state == FieldState::Active;
+      if (was != now) {
+        emit(std::string(hand) + "." + kNames[k] + (now ? " press" : " release"));
+      }
+    }
+    const bool was_trigger = a.trigger > kInputEdgeAnalogEps;
+    const bool now_trigger = b.trigger > kInputEdgeAnalogEps;
+    if (was_trigger != now_trigger) {
+      char token[64];
+      std::snprintf(token, sizeof(token), "%s.trigger %s(%.2f)", hand,
+                    now_trigger ? "off->on" : "on->off", b.trigger);
+      emit(token);
+    }
+    const bool was_squeeze = a.squeeze > kInputEdgeAnalogEps;
+    const bool now_squeeze = b.squeeze > kInputEdgeAnalogEps;
+    if (was_squeeze != now_squeeze) {
+      char token[64];
+      std::snprintf(token, sizeof(token), "%s.squeeze %s(%.2f)", hand,
+                    now_squeeze ? "off->on" : "on->off", b.squeeze);
+      emit(token);
+    }
+    const float was_mag =
+        std::hypot(a.thumbstick[0], a.thumbstick[1]);
+    const float now_mag =
+        std::hypot(b.thumbstick[0], b.thumbstick[1]);
+    const bool was_touch = was_mag > kInputEdgeStickThreshold;
+    const bool now_touch = now_mag > kInputEdgeStickThreshold;
+    if (was_touch != now_touch) {
+      char token[96];
+      std::snprintf(token, sizeof(token), "%s.stick %s(%+.2f,%+.2f)", hand,
+                    now_touch ? "idle->touch" : "touch->idle", b.thumbstick[0], b.thumbstick[1]);
+      emit(token);
+    }
+    if (a.gripValid != b.gripValid) {
+      emit(std::string(hand) + ".grip " + (b.gripValid ? "invalid->valid" : "valid->invalid"));
+    }
+    if (a.aimValid != b.aimValid) {
+      emit(std::string(hand) + ".aim " + (b.aimValid ? "invalid->valid" : "valid->invalid"));
+    }
+    if (a.connected != b.connected) {
+      emit(std::string(hand) + ".connected " + (b.connected ? "no->yes" : "yes->no"));
+    }
   }
   return out;
 }

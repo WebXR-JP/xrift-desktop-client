@@ -63,6 +63,11 @@ struct InputStats {
   uint64_t profileChanges = 0;  // 検出した profile 変化の回数。
 };
 
+// 押下エッジ検出の閾値。短い押下の取りこぼし診断用であり、製品の判定には使わない。
+// trigger/squeeze は 0 と正の出入り、stick は絶対値 0.2 超の出入りを見る。
+constexpr float kInputEdgeAnalogEps = 0.0005f;  // 0 判定の不感帯（取得ノイズの跳ね抑え）。
+constexpr float kInputEdgeStickThreshold = 0.2f;  // stick 有効域の境目（仕様値）。
+
 // 入力アクションの一式。XrInstance に束縛される（action set・action）。
 // grip/aim の空間だけが XrSession に束縛されるため、セッション再生成時は
 // DetachSpaces→AttachSpaces で作り直す（action 自体は作り直さない）。
@@ -96,11 +101,29 @@ class InputManager {
   // haptics の適用。非 FOCUSED・未接続時は送らず inactive に数える。
   // 失敗は統計に残し、例外で呼び出し側のループを止めない。
   // 戻り値は true=送信、false=未送信（inactive・失敗のいずれか）。
+  // 実際に呼び出したか・結果は lastHapticCalled/lastHapticResult で残る
+  // （実機で「送ったが振動不明」の切り分け用。VkResult ではなく XrResult である）。
   bool ApplyHaptic(XrSession session, uint32_t hand, float amplitude, uint32_t durationMs,
                     bool focused);
+  XrResult lastHapticResult() const { return last_haptic_result_; }
+  bool lastHapticCalled() const { return last_haptic_called_; }
 
   // 毎秒ログ用の 1 行要約。押下中のボタンは名前で並べる（無ければ `-`）。
   static std::string Summarize(const InputSnapshot& snapshot);
+  // 毎秒サマリの拡張版。Summarize に「その 1 秒間に押されたボタンの集合
+  // （ラッチ）」を足す。短い押下の取りこぼし診断用であり、呼び出し側が
+  // 1 秒ごとにラッチを 0 へ戻す（戻し忘れると押下済みのまま残る）。
+  static std::string SummarizeWithLatch(const InputSnapshot& snapshot, uint8_t latch0,
+                                        uint8_t latch1);
+  // 前フレームとの差分を 1 行にする。変化が無ければ空を返す（ログを出さない）。
+  // 見るのはボタン bit（押下中かつ Active の変化。InputState の buttons 欄と同じ）、
+  // trigger/squeeze の 0/正の出入り、stick の絶対値 0.2 超の出入り、
+  // pose 有効/無効の変化である。状態のみの遷移（Active→Inactive 等）は見ない。
+  static std::string DescribeEdges(const InputSnapshot& prev, const InputSnapshot& cur);
+  // 現在押下中のボタン bit（InputState の buttons 欄と同じ割付け）。
+  static uint8_t PressedBits(const HandInput& hand);
+  // ラッチ bit の人名（空は `-`）。
+  static std::string FormatLatch(uint8_t bits);
 
  private:
   bool QueryProfile(XrSession session, int hand, std::string* out);
@@ -133,6 +156,8 @@ class InputManager {
   XrSpace aim_spaces_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
   std::string last_profiles_[2];
   InputStats stats_{};
+  XrResult last_haptic_result_ = XR_SUCCESS;  // 最後に呼んだ xrApplyHapticFeedback の結果。
+  bool last_haptic_called_ = false;           // 最後の ApplyHaptic で実際に呼び出したか。
 };
 
 }  // namespace xrift::xr

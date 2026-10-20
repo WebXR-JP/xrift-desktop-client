@@ -2,10 +2,13 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
+#include "transfer/input_state.h"
 #include "transfer/m2_blocks.h"
 #include "transfer/protocol.h"
 #include "transfer/render_record.h"
+#include "xr/input.h"
 
 namespace xrift::transfer {
 namespace {
@@ -169,6 +172,91 @@ int RunM2SelfTest() {
             QuantizeStick(1.0f) == 127,
         "スティック量子化の両端");
   Check(sizeof(TransferMessage) == 192, "M4 追加後もメッセージ 192B");
+
+  // 11. M4計測: 押下エッジの検出と 1 秒ラッチ（HMD 無しで形式を確認する）。
+  // 実機の取りこぼし（短い押下・primary/menu の未記録）の切り分け用である。
+  {
+    // 合成スナップショットの雛形。ボタンは非押下・Inactive、pose は無効から始める。
+    const auto blank = []() {
+      xr::InputSnapshot s{};
+      s.frameNo = 1;
+      return s;
+    };
+    // 左 primary を Active 押下にする。
+    const auto press_primary = [](xr::InputSnapshot s) {
+      s.hands[0].primary.pressed = true;
+      s.hands[0].primary.state = xr::FieldState::Active;
+      return s;
+    };
+    const xr::InputSnapshot s0 = blank();
+    const xr::InputSnapshot s1 = press_primary(s0);
+    Check(xr::InputManager::DescribeEdges(s0, s0).empty(), "変化無しはエッジ無し");
+    const std::string edge = xr::InputManager::DescribeEdges(s0, s1);
+    Check(edge.find("L.primary press") != std::string::npos, "primary 押下のエッジ");
+    const std::string release = xr::InputManager::DescribeEdges(s1, s0);
+    Check(release.find("L.primary release") != std::string::npos, "primary 解放のエッジ");
+    // menu 等の他ボタンも同じ割付けで出る（実機で出なかったボタンの確認用）。
+    xr::InputSnapshot s2 = s0;
+    s2.hands[1].menu.pressed = true;
+    s2.hands[1].menu.state = xr::FieldState::Active;
+    Check(xr::InputManager::DescribeEdges(s0, s2).find("R.menu press") != std::string::npos,
+          "右 menu 押下のエッジ");
+    // Inactive のままの押下は bit が立たないためエッジにしない（InputState と同じ基準）。
+    xr::InputSnapshot s3 = s0;
+    s3.hands[0].primary.pressed = true;
+    s3.hands[0].primary.state = xr::FieldState::Inactive;
+    Check(xr::InputManager::DescribeEdges(s0, s3).empty(), "Inactive の押下はエッジにしない");
+    // trigger の 0/正の出入り。
+    xr::InputSnapshot s4 = s0;
+    s4.hands[0].trigger = 0.45f;
+    s4.hands[0].triggerState = xr::FieldState::Active;
+    Check(xr::InputManager::DescribeEdges(s0, s4).find("L.trigger off->on") != std::string::npos,
+          "trigger 立ち上がりのエッジ");
+    Check(xr::InputManager::DescribeEdges(s4, s0).find("L.trigger on->off") != std::string::npos,
+          "trigger 立ち下がりのエッジ");
+    // stick の絶対値 0.2 超の出入り。
+    xr::InputSnapshot s5 = s0;
+    s5.hands[1].thumbstick[0] = 0.3f;
+    s5.hands[1].thumbstick[1] = -0.1f;
+    s5.hands[1].thumbstickState = xr::FieldState::Active;
+    Check(xr::InputManager::DescribeEdges(s0, s5).find("R.stick idle->touch") !=
+              std::string::npos,
+          "stick 有効域入りのエッジ");
+    // 0.2 以下の倒しはエッジにしない。
+    xr::InputSnapshot s6 = s0;
+    s6.hands[1].thumbstick[0] = 0.1f;
+    Check(xr::InputManager::DescribeEdges(s0, s6).empty(), "stick 微倒しはエッジにしない");
+    // pose 有効/無効の変化。
+    xr::InputSnapshot s7 = s0;
+    s7.hands[0].gripValid = true;
+    s7.hands[0].connected = true;
+    const std::string pose_edge = xr::InputManager::DescribeEdges(s0, s7);
+    Check(pose_edge.find("L.grip invalid->valid") != std::string::npos, "grip 有効化のエッジ");
+    Check(pose_edge.find("L.connected no->yes") != std::string::npos, "接続変化のエッジ");
+  }
+
+  // 12. M4計測: 押下ラッチの bit 割付けと InputState への格納（予約先頭 2B）。
+  {
+    xr::InputSnapshot s{};
+    s.frameNo = 77;
+    s.hands[0].primary.pressed = true;
+    s.hands[0].primary.state = xr::FieldState::Active;
+    s.hands[1].secondary.pressed = true;
+    s.hands[1].secondary.state = xr::FieldState::Active;
+    const uint8_t latch0 = xr::InputManager::PressedBits(s.hands[0]);
+    const uint8_t latch1 = xr::InputManager::PressedBits(s.hands[1]);
+    Check(latch0 == kBtnPrimary && latch1 == kBtnSecondary, "ラッチ bit は buttons 欄と同じ割付け");
+    Check(xr::InputManager::FormatLatch(latch0) == "primary", "ラッチの人名（左）");
+    Check(xr::InputManager::FormatLatch(0) == "-", "空ラッチは -");
+    const TransferMessage with_latch = MakeInputStateMessage(s, 2, 7, latch0, latch1);
+    Check(with_latch.reserved[0] == kBtnPrimary && with_latch.reserved[1] == kBtnSecondary,
+          "ラッチは予約先頭 2B（左・右）");
+    // ラッチ無し（既定 0）の配置は従来どおりであり、buttons 欄は変わらない。
+    const TransferMessage plain = MakeInputStateMessage(s, 2, 7);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(&plain);
+    Check(plain.reserved[0] == 0 && plain.reserved[1] == 0, "既定ラッチは 0");
+    Check(base[kInputHand0 + kInputHandButtons] == kBtnPrimary, "buttons 欄は従来どおり");
+  }
 
   if (g_failures > 0) {
     std::printf("[m2-selftest] FAIL %d 件\n", g_failures);

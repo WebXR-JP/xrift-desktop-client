@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,6 +19,7 @@
 #include "common/log.h"
 #include "common/xr_result.h"
 #include "gfx/swapchains.h"
+#include "transfer/input_state.h"
 #include "transfer/m2_blocks.h"
 #include "transfer/pipe_client.h"
 #include "transfer/protocol.h"
@@ -83,6 +86,51 @@ void InvokeVk(const char* what, F&& f) {
 
 bool IsMagenta(uint8_t b, uint8_t g, uint8_t r) { return r > 200 && b > 200 && g < 80; }
 bool IsCyan(uint8_t b, uint8_t g, uint8_t r) { return g > 200 && b > 200 && r < 80; }
+
+// 検証用の提出画像ダンプ（PPM P6 保存）。blit 後の swapchain 全体を host-visible バッファ
+// から P6（RGB）に変換して保存する。4 バイト画素の並びは swapchain 形式に従う
+// （B8G8R8A8 系は B,G,R,A 順、R8G8B8A8 系は R,G,B,A 順）。提出の正しさには触らない
+// （dump-submit が空なら呼ばない。製品経路の挙動は変えない）。
+bool WriteEyePpm(const std::string& path, const uint8_t* pixels, uint32_t w, uint32_t h,
+                 vk::Format format) {
+  std::error_code ec;
+  const std::filesystem::path out(path);
+  if (out.has_parent_path()) {
+    std::filesystem::create_directories(out.parent_path(), ec);
+  }
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    Warn("dump-submit: %s を開けない", path.c_str());
+    return false;
+  }
+  file << "P6\n" << w << " " << h << "\n255\n";
+  if (!file) {
+    Warn("dump-submit: %s のヘッダ書き込みに失敗", path.c_str());
+    return false;
+  }
+  const bool bgr = (format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb);
+  std::string row;
+  row.resize(static_cast<size_t>(w) * 3);
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* src = pixels + static_cast<size_t>(y) * w * 4;
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint8_t c0 = src[x * 4 + 0];
+      const uint8_t c1 = src[x * 4 + 1];
+      const uint8_t c2 = src[x * 4 + 2];
+      // BGR 系は R=c2、RGB 系は R=c0 である。
+      row[x * 3 + 0] = static_cast<char>(bgr ? c2 : c0);
+      row[x * 3 + 1] = static_cast<char>(c1);
+      row[x * 3 + 2] = static_cast<char>(bgr ? c0 : c2);
+    }
+    file.write(row.data(), static_cast<std::streamsize>(row.size()));
+    if (!file) {
+      Warn("dump-submit: %s の画素書き込みに失敗（行 %u）", path.c_str(), y);
+      return false;
+    }
+  }
+  file.close();
+  return true;
+}
 
 EyePose ToEyePose(const XrPosef& p) {
   EyePose e{};
@@ -253,8 +301,9 @@ class M2BlockReader {
 // 受理画像の提出パス。acquire → blit → マーカー確認 → release を 1 眼単位で行う。
 class BlitPass {
  public:
-  BlitPass(const gfx::VulkanContext& vk, const gfx::Swapchains& swapchains)
-      : device_(&vk.device()), queue_(&vk.queue()) {
+  BlitPass(const gfx::VulkanContext& vk, const gfx::Swapchains& swapchains,
+           const std::string& dumpDir = "")
+      : device_(&vk.device()), queue_(&vk.queue()), dumpDir_(dumpDir) {
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
@@ -285,6 +334,42 @@ class BlitPass {
       eyes_.push_back(std::move(res));
     }
     format_ = swapchains.format();
+    // 検証用の提出画像ダンプ（--dump-submit が空なら確保しない。通常経路の挙動は変えない）。
+    // 各眼の実寸ぶんの host-visible バッファを一時確保し、終了時（デストラクタ）に解放する。
+    if (!dumpDir_.empty()) {
+      dumpStage_.reserve(eyes_.size());
+      dumpMem_.reserve(eyes_.size());
+      dumpSize_.assign(eyes_.size(), 0);
+      for (size_t e = 0; e < eyes_.size(); ++e) {
+        const uint64_t pixels = static_cast<uint64_t>(eyes_[e].extent.width) *
+                                static_cast<uint64_t>(eyes_[e].extent.height);
+        const vk::DeviceSize bytes = static_cast<vk::DeviceSize>(pixels * 4);
+        if (bytes == 0) {
+          continue;
+        }
+        try {
+          vk::raii::Buffer buf{nullptr};
+          vk::raii::DeviceMemory mem{nullptr};
+          AllocateHostBuffer(vk, &buf, &mem, bytes);
+          dumpStage_.push_back(std::move(buf));
+          dumpMem_.push_back(std::move(mem));
+          dumpSize_[e] = bytes;
+        } catch (const std::exception& ex) {
+          Warn("dump-submit: 眼 %u の確保に失敗したためダンプを無効化: %s",
+               static_cast<unsigned>(e), ex.what());
+          dumpDir_.clear();
+          break;
+        }
+      }
+      if (!dumpDir_.empty()) {
+        Info("dump-submit: ダンプ先 %s（各眼の実寸ぶんを一時確保した）", dumpDir_.c_str());
+      }
+    }
+  }
+
+  // ダンプが有効か（確保まで成功したか）。確保失敗時は false になる。
+  bool dumpEnabled() const {
+    return !dumpDir_.empty() && dumpStage_.size() == eyes_.size();
   }
 
   struct Result {
@@ -297,9 +382,11 @@ class BlitPass {
   // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（DESIGN §9 の未決事項。
   // M2 では左右分離と pose 対応を優先し、色の最終確認は M5 まで持ち越す）。
   // blit 後に提出画像からマーカー 1 画素だけを読む（画像全体は読まない）。
+  // dump が真のときは release 前に swapchain 全体を host-visible バッファへ写し、
+  // COLOR_ATTACHMENT_OPTIMAL に戻してから PPM 保存する（提出の正しさを壊さない）。
   // 失敗時は例外にする（呼び出し側は layerCount=0 で終える）。
   Result Blit(uint32_t eye, vk::Image own, uint32_t ownW, uint32_t ownH, uint32_t srcHalf,
-              bool checkMarker) {
+              bool checkMarker, bool dump = false) {
     Result out{};
     const uint64_t t0 = NowUs();
     if (eye >= eyes_.size()) {
@@ -438,6 +525,49 @@ class BlitPass {
                           to_present);
     }
 
+    // 検証用の提出画像ダンプ。blit 後・release 前に swapchain 全体を写し、
+    // 提出前に COLOR_ATTACHMENT_OPTIMAL へ戻す（提出の正しさを壊さない）。
+    // dump-submit が空の通常経路では記録しない。
+    const bool do_dump =
+        dump && dumpEnabled() && eye < dumpStage_.size() && dumpSize_[eye] != 0 &&
+        static_cast<VkBuffer>(*dumpStage_[eye]) != VK_NULL_HANDLE;
+    if (do_dump) {
+      vk::ImageMemoryBarrier to_dump_src{};
+      to_dump_src.sType = vk::StructureType::eImageMemoryBarrier;
+      to_dump_src.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      to_dump_src.oldLayout = vk::ImageLayout::eColorAttachmentOptimal;
+      to_dump_src.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+      to_dump_src.image = dst;
+      to_dump_src.subresourceRange = range;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                          vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_dump_src);
+      vk::BufferImageCopy full{};
+      full.bufferOffset = 0;
+      full.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      full.imageSubresource.layerCount = 1;
+      full.imageOffset = vk::Offset3D{0, 0, 0};
+      full.imageExtent =
+          vk::Extent3D{res.extent.width, res.extent.height, 1};
+      cmd.copyImageToBuffer(dst, vk::ImageLayout::eTransferSrcOptimal, *dumpStage_[eye], full);
+      vk::BufferMemoryBarrier dump_host{};
+      dump_host.sType = vk::StructureType::eBufferMemoryBarrier;
+      dump_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      dump_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      dump_host.buffer = *dumpStage_[eye];
+      dump_host.offset = 0;
+      dump_host.size = dumpSize_[eye];
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                          {}, nullptr, dump_host, nullptr);
+      vk::ImageMemoryBarrier back = to_dump_src;
+      back.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+      back.dstAccessMask = {};
+      back.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+      back.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
+                          back);
+    }
+
     InvokeVk("vkEndCommandBuffer(blit)", [&] { cmd.end(); });
     vk::CommandBuffer raw = *cmd;
     vk::SubmitInfo submit{};
@@ -459,6 +589,31 @@ class BlitPass {
       stageMem_.unmapMemory();
     } else {
       out.markerOk = true;
+    }
+
+    if (do_dump) {
+      // release 前に写した全体を PPM 保存する。失敗しても提出は続ける。
+      void* dmapped = nullptr;
+      bool mapped = false;
+      try {
+        InvokeVk("vkMapMemory(blit-dump)", [&] {
+          dmapped = dumpMem_[eye].mapMemory(0, dumpSize_[eye]);
+        });
+        mapped = true;
+        const std::string name = (eye == 0) ? "eye0.ppm" : "eye1.ppm";
+        const std::string path = (std::filesystem::path(dumpDir_) / name).string();
+        const uint8_t* dpixels = static_cast<const uint8_t*>(dmapped);
+        if (WriteEyePpm(path, dpixels, res.extent.width, res.extent.height, format_)) {
+          Info("dump-submit: 眼 %u を %s に保存（%ux%u）", eye, path.c_str(),
+               static_cast<unsigned>(res.extent.width),
+               static_cast<unsigned>(res.extent.height));
+        }
+      } catch (const std::exception& ex) {
+        Warn("dump-submit: 眼 %u の保存に失敗: %s", eye, ex.what());
+      }
+      if (mapped) {
+        dumpMem_[eye].unmapMemory();
+      }
     }
 
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -487,78 +642,13 @@ class BlitPass {
   vk::raii::DeviceMemory stageMem_{nullptr};
   std::vector<EyeRes> eyes_;
   vk::Format format_ = vk::Format::eUndefined;
+  // 検証用の提出画像ダンプ先と各眼の host-visible バッファ（空なら無効）。
+  // blit と同じ submit 内で写し、release 前に PPM 保存する。終了時に解放する。
+  std::string dumpDir_;
+  std::vector<vk::raii::Buffer> dumpStage_;
+  std::vector<vk::raii::DeviceMemory> dumpMem_;
+  std::vector<vk::DeviceSize> dumpSize_;
 };
-
-// 入力スナップショットを 192B の InputState（exe → main）に畳む。
-// pose は載せない（exe 側のログで確認する。線路上は操作の要約のみ）。
-// 「0」と「未対応」の区別は active/supported の 2 段で行う（protocol.h の欄定義を参照）。
-// 未接続の手は flags=0 のまま全欄 0 で送る（0 埋めと区別のため flags を見る）。
-TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, uint32_t connEpoch,
-                                      uint32_t spaceEpoch) {
-  TransferMessage m{};
-  m.magic = kMagic;
-  m.version = kVersion;
-  m.type = kTypeInputState;
-  m.renderId = snapshot.frameNo;
-  m.connEpoch = connEpoch;
-  m.spaceEpoch = spaceEpoch;
-  uint8_t* base = reinterpret_cast<uint8_t*>(&m);
-  for (int i = 0; i < 2; ++i) {
-    const xr::HandInput& hand = snapshot.hands[i];
-    uint8_t* h = base + kInputHand0 + static_cast<size_t>(i) * kInputHandStride;
-    uint8_t flags = 0;
-    if (hand.connected) {
-      flags |= 1u << 0;
-    }
-    if (hand.gripValid) {
-      flags |= 1u << 1;
-    }
-    if (hand.aimValid) {
-      flags |= 1u << 2;
-    }
-    h[kInputHandFlags] = flags;
-    h[kInputHandProfile] = ProfileIdFromName(hand.profile.c_str());
-    const auto active_value = [](xr::FieldState s) { return s == xr::FieldState::Active ? 1 : 0; };
-    const auto supported_value = [](xr::FieldState s) {
-      return s == xr::FieldState::Unsupported ? 0 : 1;
-    };
-    h[kInputHandTrigger] = QuantizeUnitFloat(hand.trigger);
-    h[kInputHandSqueeze] = QuantizeUnitFloat(hand.squeeze);
-    h[kInputHandStickX] = QuantizeStick(hand.thumbstick[0]);
-    h[kInputHandStickY] = QuantizeStick(hand.thumbstick[1]);
-    h[kInputHandPadX] = QuantizeStick(hand.trackpad[0]);
-    h[kInputHandPadY] = QuantizeStick(hand.trackpad[1]);
-    uint8_t buttons = 0;
-    uint8_t btn_active = 0;
-    uint8_t btn_supported = 0;
-    const xr::InputButton* btns[5] = {&hand.thumbstickClick, &hand.trackpadClick, &hand.primary,
-                                      &hand.secondary, &hand.menu};
-    for (int b = 0; b < 5; ++b) {
-      if (btns[b]->pressed && btns[b]->state == xr::FieldState::Active) {
-        buttons |= static_cast<uint8_t>(1u << b);
-      }
-      if (btns[b]->state == xr::FieldState::Active) {
-        btn_active |= static_cast<uint8_t>(1u << b);
-      }
-      if (btns[b]->state != xr::FieldState::Unsupported) {
-        btn_supported |= static_cast<uint8_t>(1u << b);
-      }
-    }
-    h[kInputHandButtons] = buttons;
-    h[kInputHandBtnActive] = btn_active;
-    h[kInputHandFloatActive] = static_cast<uint8_t>((active_value(hand.triggerState) << 0) |
-                                                    (active_value(hand.squeezeState) << 1));
-    h[kInputHandVecActive] = static_cast<uint8_t>((active_value(hand.thumbstickState) << 0) |
-                                                   (active_value(hand.trackpadState) << 1));
-    h[kInputHandBtnSupported] = btn_supported;
-    h[kInputHandAnalogSupported] =
-        static_cast<uint8_t>((supported_value(hand.triggerState) << 0) |
-                             (supported_value(hand.squeezeState) << 1) |
-                             (supported_value(hand.thumbstickState) << 2) |
-                             (supported_value(hand.trackpadState) << 3));
-  }
-  return m;
-}
 
 struct XrStats {
   uint64_t frames = 0;
@@ -640,6 +730,15 @@ int RunXrTransfer(const XrTransferOptions& options) {
          "破棄・再生成する）",
          options.injectSessionRestartMs);
   }
+  if (options.injectSpaceChangeMs > 0) {
+    Info("検証フック有効: --inject-space-change=%d（起動からその ms 後に模擬の space 変更を"
+         "1 回適用する。実イベントではない）",
+         options.injectSpaceChangeMs);
+  }
+  if (!options.dumpSubmitDir.empty()) {
+    Info("検証フック有効: --dump-submit=%s --dump-frame=%d（その回目の提出時に両眼を PPM 保存）",
+         options.dumpSubmitDir.c_str(), options.dumpFrame);
+  }
 
   // 転送セッションを先に作る。同一 VkDevice を XR セッションと共有し、
   // 自前イメージから swapchain への blit を同一デバイス内で行う。
@@ -657,6 +756,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
   if (options.injectSessionRestartMs < 0) {
     Error("--inject-session-restart は 0 以上であること");
+    return 1;
+  }
+  if (options.injectSpaceChangeMs < 0) {
+    Error("--inject-space-change は 0 以上であること");
     return 1;
   }
 
@@ -701,7 +804,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } else {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
-  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
+  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
   M2BlockReader reader(transfer.Vulkan());
   PipeClient pipe(options.pipeName);
   Info("パイプ接続: main プロセスと接続した");
@@ -723,6 +826,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
   RenderRecord freshRecord{};
   uint32_t freshW = 0;
   uint32_t freshH = 0;
+  // 検証用の提出画像ダンプの状態。N 回目の提出（両眼 blit 成功で 1）に 1 回だけ保存する。
+  // セッション再生成で blit が作り直されても提出回数は保つ（回数は提出基準である）。
+  uint64_t submits = 0;
+  bool dumpDone = false;
 
   bool session_running = false;
   bool quit = false;
@@ -734,11 +841,25 @@ int RunXrTransfer(const XrTransferOptions& options) {
   uint64_t last_rebuild_try_us = 0;
   // REFERENCE_SPACE_CHANGE_PENDING の受付。適用はフレーム側で行う。
   bool pending_space_change = false;
+  // --inject-space-change の発火済み合図（1 回だけ送る）と模擬の区別。
+  // 模擬もランタイム由来と同じ適用経路（空間作り直し・spaceEpoch 更新・旧レコード失効）を
+  // 通すが、実イベントではないことをログに明記し、統計の space変更には計上する。
+  bool space_change_injected = false;
+  bool pending_space_injected = false;
+  // locate 確認に使う予測表示時刻（直近の xrWaitFrame の値）。
+  // 時刻 0 を渡すと受け付けないランタイムがある（実測: SteamVR は
+  // XR_ERROR_TIME_INVALID）ため、running 中のフレーム時刻を使う。
+  XrTime last_display_time = 0;
   // --inject-session-restart の発火済み合図（1 回だけ送る）。
   bool restart_injected = false;
   const uint64_t start_us = NowUs();
   // M4 の毎秒入力ログの前回出力時刻。0 は未出力である。
   uint64_t last_input_log_us = 0;
+  // M4計測: 押下エッジ用の前フレームと 1 秒ラッチ（左右のボタン bit）。
+  // ラッチは 1 秒サマリで 0 へ戻す。製品経路の buttons 欄は変えない。
+  xr::InputSnapshot prev_snapshot{};
+  bool have_prev_snapshot = false;
+  uint8_t input_latch[2] = {0, 0};
   // パイプの生死と終了コード。切断（hard close）は新規受付の停止と統計付き終了の合図
   // であり（DESIGN §6③）、未完了の借用へ Done は送らない。プロトコルに終了合図が無い
   // ため、少なくともハングせず統計を残すことを優先し、正常な切断は 0、異常は非ゼロで返す。
@@ -788,7 +909,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
                                                      session->handle(), session->views(),
                                                      gfx::M2PreferredSwapchainFormats());
-      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
+      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
     } catch (const std::exception& e) {
       Warn("再生成後の swapchain 生成に失敗（%s）: %s", why, e.what());
       session.reset();
@@ -803,19 +924,27 @@ int RunXrTransfer(const XrTransferOptions& options) {
 
   // REFERENCE_SPACE_CHANGE_PENDING の適用。新しい原点で locate できることを確認してから
   // spaceEpoch を進め、旧世代のレコードを失効させる（DESIGN §10）。
+  // --inject-space-change の模擬もこの経路を通す（別経路は作らない）。
   auto apply_pending_space = [&]() {
     if (!pending_space_change || !session) {
       return;
     }
-    if (session->RecreateSpaceForPendingChange()) {
+    if (session->RecreateSpaceForPendingChange(last_display_time)) {
       ledger.AdvanceSpaceEpoch(ledger.spaceEpoch() + 1);
       hasFresh = false;
       ++stats.spaceChanges;
-      Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
+      if (pending_space_injected) {
+        Info("模擬 space 変更を適用（実イベントではない。--inject-space-change。"
+             "spaceEpoch=%u。旧レコードを失効）",
+             ledger.spaceEpoch());
+      } else {
+        Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
+      }
     } else {
       Warn("reference space 変更の適用に失敗したため旧空間・旧世代を保つ");
     }
     pending_space_change = false;
+    pending_space_injected = false;
   };
 
   auto poll_events = [&]() {
@@ -949,8 +1078,18 @@ int RunXrTransfer(const XrTransferOptions& options) {
         } else {
           input.ApplyHaptic(XR_NULL_HANDLE, hand, amp, dur, false);
         }
-        Info("haptics %s: %s 振幅=%.2f 持続=%ums（inactive・失敗は統計に残る）",
-             sent ? "送信" : "未送信", hand == 0 ? "左" : "右", amp, dur);
+        // 送信結果は XrResult で残す（VkResult ではない。実機で「成功だが振動不明」の
+        // 切り分け用）。inactive（未呼出し）と呼出し失敗は区別して出す。
+        if (sent) {
+          Info("haptics 送信: %s 振幅=%.2f 持続=%ums（XrResult=%s）", hand == 0 ? "左" : "右",
+               amp, dur, XrResultToString(input.lastHapticResult()));
+        } else if (input.lastHapticCalled()) {
+          Info("haptics 未送信: %s 振幅=%.2f 持続=%ums（呼出し失敗 XrResult=%s。統計に残る）",
+               hand == 0 ? "左" : "右", amp, dur, XrResultToString(input.lastHapticResult()));
+        } else {
+          Info("haptics 未送信: %s 振幅=%.2f 持続=%ums（inactive のため送らず。統計に残る）",
+               hand == 0 ? "左" : "右", amp, dur);
+        }
         continue;
       }
       // 何らかの受信があれば producer は生存している（有効・無効を問わない）。
@@ -1039,6 +1178,16 @@ int RunXrTransfer(const XrTransferOptions& options) {
         last_rebuild_try_us = NowUs();
       }
     }
+    // M4計測: --inject-space-change の発火（1 回だけ。適用は apply_pending_space の
+    // 実イベントと同じ経路を通す。実イベントではないことは受付・適用の両方で明記する）。
+    if (!space_change_injected && options.injectSpaceChangeMs > 0 && session &&
+        NowUs() - start_us >= static_cast<uint64_t>(options.injectSpaceChangeMs) * 1000u) {
+      space_change_injected = true;
+      pending_space_change = true;
+      pending_space_injected = true;
+      Info("検証フック --inject-space-change: 模擬の space 変更要求（実イベントではない。"
+           "次フレームで適用を試みる）");
+    }
     // M4: loss 後の再生成の再試行（1 秒周期）。上限を超えたらランタイム未復帰として
     // 安全に終了する（統計出力。非ゼロにはしない。こちらの破損ではないため）。
     if (needs_rebuild && !session && rebuild_attempts_left > 0 &&
@@ -1052,8 +1201,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
         break;
       }
     }
-    // M4: 参照空間変更の適用（新しい原点で locate できる確認が取れてから世代を進める）。
-    apply_pending_space();
+    // M4: 参照空間変更の適用は running 中のフレーム時刻が要るため、
+    // xrWaitFrame の後（running 側）で行う。実行中でない間は受付だけ保ち、
+    // 適用は開始後の最初のフレームまで待つ。
     if (!session_running || !session) {
       // 実行中でない間も Offer の受付・ACK と切断検知は進める。受信した Offer は
       // drain_offers が Done を返すため、消費して返せなくなることはない。
@@ -1082,6 +1232,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     CheckXr(xrWaitFrame(session->handle(), &wait_info, &frame_state), "xrWaitFrame");
+    last_display_time = frame_state.predictedDisplayTime;
+    // M4: 参照空間変更の適用（新しい原点で locate できる確認が取れてから世代を進める）。
+    // 当フレームの予測表示時刻を使う（時刻 0 を渡すと受け付けないランタイムがある）。
+    apply_pending_space();
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
     CheckXr(xrBeginFrame(session->handle(), &begin_info), "xrBeginFrame");
 
@@ -1161,8 +1315,22 @@ int RunXrTransfer(const XrTransferOptions& options) {
       input.Sync(session->handle(), focused);
       const xr::InputSnapshot snapshot = input.Snapshot(
           session->handle(), session->space(), frame_state.predictedDisplayTime, focused, frame_no);
+      // M4計測: 押下エッジの記録。1 秒周期のスナップショットでは短い押下を
+      // 取りこぼすため、状態が変化したフレームで 1 行出す（変化が無ければ出さない）。
+      if (have_prev_snapshot) {
+        const std::string edge = xr::InputManager::DescribeEdges(prev_snapshot, snapshot);
+        if (!edge.empty()) {
+          Info("[M4エッジ] frame=%llu %s", static_cast<unsigned long long>(frame_no),
+               edge.c_str());
+        }
+      }
+      prev_snapshot = snapshot;
+      have_prev_snapshot = true;
+      input_latch[0] |= xr::InputManager::PressedBits(snapshot.hands[0]);
+      input_latch[1] |= xr::InputManager::PressedBits(snapshot.hands[1]);
       try {
-        pipe.Send(MakeInputStateMessage(snapshot, conn_epoch, ledger.spaceEpoch()));
+        pipe.Send(MakeInputStateMessage(snapshot, conn_epoch, ledger.spaceEpoch(), input_latch[0],
+                                        input_latch[1]));
         ++stats.inputSent;
       } catch (const std::exception& e) {
         Error("InputState 送信に失敗: %s", e.what());
@@ -1172,7 +1340,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
       }
       if (NowUs() - last_input_log_us >= 1000000u) {
         last_input_log_us = NowUs();
-        Info("[M4入力] %s", xr::InputManager::Summarize(snapshot).c_str());
+        Info("[M4入力] %s",
+             xr::InputManager::SummarizeWithLatch(snapshot, input_latch[0], input_latch[1])
+                 .c_str());
+        input_latch[0] = input_latch[1] = 0;
       }
     }
     // 提出は受理画像のレコードの pose/FOV で行う。最新 pose への付け替えはしない。
@@ -1189,8 +1360,19 @@ int RunXrTransfer(const XrTransferOptions& options) {
       if (age <= kRenderRecordMaxAgeUs) {
         try {
           const vk::Image own = transfer.OwnImage();
-          const BlitPass::Result r0 = blit->Blit(0, own, freshW, freshH, 0, options.submitVerify);
-          const BlitPass::Result r1 = blit->Blit(1, own, freshW, freshH, 1, options.submitVerify);
+          // 検証用の提出画像ダンプ。N 回目の提出時に blit 後・release 前の両眼を写す。
+          // 1 回だけ。提出の正しさは変えない（ダンプ後に COLOR_ATTACHMENT に戻す）。
+          const bool do_dump = !options.dumpSubmitDir.empty() && !dumpDone && blit &&
+                               blit->dumpEnabled() &&
+                               submits + 1 == static_cast<uint64_t>(options.dumpFrame);
+          const BlitPass::Result r0 =
+              blit->Blit(0, own, freshW, freshH, 0, options.submitVerify, do_dump);
+          const BlitPass::Result r1 =
+              blit->Blit(1, own, freshW, freshH, 1, options.submitVerify, do_dump);
+          if (do_dump) {
+            dumpDone = true;
+            Info("dump-submit: %llu 回目の提出を保存した", static_cast<unsigned long long>(submits + 1));
+          }
           const uint64_t blit_us = r0.blitUs + r1.blitUs;
           ++stats.blits;
           stats.blitUsTotal += blit_us;
@@ -1230,6 +1412,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
                static_cast<unsigned long long>(freshRecord.renderId),
                static_cast<unsigned long long>(age));
           submit_layer = true;
+          ++submits;
           hasFresh = false;
         } catch (const std::exception& e) {
           Warn("blit に失敗したため空フレームで終える: %s", e.what());
@@ -1255,6 +1438,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
        static_cast<unsigned long long>(droppedIntermediate));
   if (stats.submitLayers == 0) {
     Warn("提出層 0 のまま終了した（受理画像が無い。harness 側の描画を確認すること）");
+  }
+  if (!options.dumpSubmitDir.empty() && !dumpDone) {
+    Warn("dump-submit: %d 回目の提出に届かず保存しなかった（提出 %llu 回）",
+         options.dumpFrame, static_cast<unsigned long long>(submits));
   }
   if (!pipeAlive) {
     Info("パイプ終了に伴う終了（exit=%d）", exitCode);

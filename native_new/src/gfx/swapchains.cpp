@@ -100,8 +100,10 @@ Swapchains::Swapchains(XrInstance instance, XrSession session,
     const uint32_t height =
         std::min(views[i].recommendedImageRectHeight, views[i].maxImageRectHeight);
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    info.usageFlags =
-        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    // TRANSFER_SRC は検証用の提出画像ダンプ（--dump-submit）の readback に使う。
+    // 通常の提出（blit 書き込み→コンポジタ渡し）の挙動は変えない。
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
     info.format = static_cast<int64_t>(format_);
     info.sampleCount = 1;
     info.width = width;

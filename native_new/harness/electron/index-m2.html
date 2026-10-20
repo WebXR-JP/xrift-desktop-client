@@ -7,10 +7,41 @@
   /* M2 検証パターン専用。スクロールバー等が出ないようにする。 */
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
   canvas { position: absolute; left: 0; top: 0; display: block; }
+  /* HMD 操作ガイド（検証用オーバーレイ）。Chromium 合成で OSR 共有テクスチャに乗る。
+     予約領域（上部の ID/タグブロック y=64〜96・マーカー y=8〜40）を避けて
+     ページ高さの 40% から表示する（縦方向の中央。左右眼で読めるよう半分ごとに
+     同じ内容を中央配置する。シーンのクアッドに重なるのは許容（ガイド優先））。 */
+  #guide { position: absolute; left: 0; right: 0; top: 40%; bottom: auto; display: none;
+    align-items: flex-start; pointer-events: none; z-index: 10; font-family: sans-serif; }
+  #guide.on { display: flex; }
+  .guide-eye { width: 50%; display: flex; justify-content: center; align-items: flex-start; }
+  /* カード幅は各半分の 84% 程度。4098x2049 基準でメイン 96px 以上・サブ 54px 以上を
+     保ち、行間・余白を広めに取る。背景は不透明寄りで HMD 内の視認性を優先する。 */
+  .guide-card { width: 84%; max-width: 84%; background: rgba(0,0,0,0.78); color: #fff;
+    border: 4px solid #fff; border-radius: 18px; padding: 28px 36px; text-align: center; }
+  .guide-main { font-size: 96px; font-weight: bold; line-height: 1.25;
+    overflow-wrap: break-word; word-break: break-word; }
+  .guide-sub { margin-top: 16px; font-size: 54px; line-height: 1.35; color: #ffe27a;
+    overflow-wrap: break-word; word-break: break-word; }
+  .guide-dots { margin-top: 14px; font-size: 32px; letter-spacing: 6px; color: #888; }
+  .guide-dots .done { color: #8f8; }
+  .guide-dots .active { color: #ff0; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="guide" aria-hidden="true">
+  <div class="guide-eye"><div class="guide-card">
+    <div class="guide-main" id="guideMainL"></div>
+    <div class="guide-sub" id="guideSubL"></div>
+    <div class="guide-dots" id="guideDotsL"></div>
+  </div></div>
+  <div class="guide-eye"><div class="guide-card">
+    <div class="guide-main" id="guideMainR"></div>
+    <div class="guide-sub" id="guideSubR"></div>
+    <div class="guide-dots" id="guideDotsR"></div>
+  </div></div>
+</div>
 <script src="m2-codec.js"></script>
 <script>
 // M2 検証パターン（exe 側 src/transfer/xr_transfer_app.cpp と一致させること）。
@@ -33,6 +64,108 @@ const STALE_AT = (() => {
   const v = parseInt(QUERY.get('staleRecord') || '0', 10);
   return (Number.isFinite(v) && v > 0) ? v : 0;
 })();
+// HMD 操作ガイド（HTML/CSS オーバーレイ）。WebGPU/canvas 描画には触らず、
+// Chromium 合成で OSR 共有テクスチャに乗るだけであるため、パターン画素・
+// 検査結果は変わらない。?guide=1 で有効、?guide=0 か無指定で無効
+// （既定 off。main 側が M2 実機計測では on を渡す）。
+const GUIDE_ON = QUERY.get('guide') === '1';
+// 実機計測の操作手順。?guidePlan=default（現行 17 ステップ・約 80 秒）と
+// ?guidePlan=short（短縮 13 ステップ・約 40 秒）を切り替える。既定は default。
+// default は 4 秒刻みを基本に、haptics（20/30/40 秒）・脱着（55/60 秒）・
+// 模擬 space 変更（70 秒）を置く。short は trigger/squeeze/stick・X/A・Y/B・
+// menu・振動 2 回だけに絞った 40 秒用である。
+// 文言を変えても配置には影響しない（上部 40% からのみ。予約領域と重ならない）。
+// 各ラベルは 20 文字以内に収める（メイン行の「番号: ラベル」全体で 26 文字以内になる）。
+const GUIDE_PLAN = QUERY.get('guidePlan') === 'short' ? 'short' : 'default';
+const GUIDE_STEPS_DEFAULT = [
+  { t: 0, label: '装着を確認：この文字が見えればOK' },
+  { t: 4, label: '1/8: 左 trigger を 1 秒押す' },
+  { t: 8, label: '2/8: 右 trigger を 1 秒押す' },
+  { t: 12, label: '3/8: 左 squeeze を 1 秒押す' },
+  { t: 16, label: '4/8: 右 squeeze を 1 秒押す' },
+  { t: 20, label: '振動 1/3：感じたら覚えておく' },
+  { t: 24, label: '5/8: 左 stick を倒す' },
+  { t: 28, label: '6/8: 右 stick を倒す' },
+  { t: 30, label: '振動 2/3：感じたら覚えておく' },
+  { t: 34, label: '7/8: A/X・Y/B を 1 秒押す' },
+  { t: 38, label: '8/8: menu を 1 秒押す' },
+  { t: 40, label: '振動 3/3：感じたら覚えておく' },
+  { t: 44, label: '休み：そのまま装着' },
+  { t: 55, label: 'ヘッドセットを外す' },
+  { t: 60, label: '戻して装着' },
+  { t: 70, label: 'space 変更（模擬）：動かず待つ' },
+  { t: 76, label: '終了までそのまま' },
+];
+// 40 秒用の短縮プラン（13 ステップ。3 秒刻みを基本にする）。
+const GUIDE_STEPS_SHORT = [
+  { t: 0, label: '装着を確認：この文字が見えればOK' },
+  { t: 4, label: '左 trigger を 1 秒押す' },
+  { t: 7, label: '右 trigger を 1 秒押す' },
+  { t: 10, label: '左 squeeze を 1 秒押す' },
+  { t: 13, label: '右 squeeze を 1 秒押す' },
+  { t: 16, label: '振動（感じたら覚えておく）' },
+  { t: 19, label: '左 stick を倒す' },
+  { t: 22, label: '右 stick を倒す' },
+  { t: 25, label: '左 X → 右 A を 1 秒ずつ' },
+  { t: 28, label: '左 Y → 右 B を 1 秒ずつ' },
+  { t: 31, label: 'menu を 1 秒押す' },
+  { t: 34, label: '振動（2 回目）' },
+  { t: 37, label: '終了までそのまま' },
+];
+// 選択中のプランの手順を使う。不正値は default に寄せる（GUIDE_PLAN で正規化済み）。
+const GUIDE_STEPS = GUIDE_PLAN === 'short' ? GUIDE_STEPS_SHORT : GUIDE_STEPS_DEFAULT;
+const guideT0 = Date.now();
+window.__guideInfo = { enabled: GUIDE_ON, plan: GUIDE_PLAN, steps: GUIDE_STEPS.length, idx: 0, elapsed: 0 };
+function guideTick() {
+  if (!GUIDE_ON) return;
+  const elapsed = (Date.now() - guideT0) / 1000;
+  let idx = 0;
+  for (let i = 0; i < GUIDE_STEPS.length; i++) {
+    if (elapsed >= GUIDE_STEPS[i].t) idx = i;
+  }
+  const cur = GUIDE_STEPS[idx];
+  const next = idx + 1 < GUIDE_STEPS.length ? GUIDE_STEPS[idx + 1] : null;
+  const remain = next ? Math.max(0, next.t - elapsed) : 0;
+  const main = `${idx + 1}/${GUIDE_STEPS.length}: ${cur.label}`;
+  // サブ行は 1 行 26 文字以内に収めるため「あとX秒 → 次: ラベル」だけにする。
+  // 経過秒は __guideInfo.elapsed に残し、表示では落とす（残り秒と次の手順は維持する）。
+  const sub = next
+    ? `あと${remain.toFixed(0)}秒→次: ${next.label}`
+    : `このまま終了まで`;
+  for (const sfx of ['L', 'R']) {
+    document.getElementById('guideMain' + sfx).textContent = main;
+    document.getElementById('guideSub' + sfx).textContent = sub;
+  }
+  window.__guideInfo.idx = idx;
+  window.__guideInfo.elapsed = elapsed;
+}
+if (GUIDE_ON) {
+  document.getElementById('guide').classList.add('on');
+  // 進捗ドットは手順数だけ作り、現在をハイライトする（タイムライン表示）。
+  for (const sfx of ['L', 'R']) {
+    const dots = document.getElementById('guideDots' + sfx);
+    for (let i = 0; i < GUIDE_STEPS.length; i++) {
+      const s = document.createElement('span');
+      s.textContent = '●';
+      dots.appendChild(s);
+    }
+  }
+  const dotsTick = () => {
+    if (!GUIDE_ON) return;
+    for (const sfx of ['L', 'R']) {
+      const dots = document.getElementById('guideDots' + sfx).children;
+      for (let i = 0; i < dots.length; i++) {
+        dots[i].className = i < window.__guideInfo.idx ? 'done'
+          : (i === window.__guideInfo.idx ? 'active' : '');
+      }
+    }
+  };
+  const guideLoop = () => { guideTick(); dotsTick(); setTimeout(guideLoop, 200); };
+  guideLoop();
+  console.log('[m2] guide=on plan=' + GUIDE_PLAN + ' steps=' + GUIDE_STEPS.length);
+} else {
+  console.log('[m2] guide=off');
+}
 
 // ---- C++ 側との共有定義は m2-codec.js が持つ（render_record.h と一致） ----
 const { quantizePos, quantizeOri, poseTag } = window.__m2codec;

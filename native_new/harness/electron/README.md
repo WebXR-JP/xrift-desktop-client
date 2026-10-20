@@ -236,29 +236,134 @@ M4（DESIGN §10・§11）の検証ハーネス。`-M2` に足して使う。HMD
 # M4 の煙試験（10 秒・2048x1024。HMD 非装着で可）。
 .\run.ps1 -Seconds 10 -Width 2048 -Height 1024 -M2 -Space stage `
   -HapticAtMs 5000 -InjectSessionRestartMs 8000
+# haptics の複数送信（カンマ区切りの複数時刻。左手・振幅 0.8・300ms）。
+.\run.ps1 -Seconds 30 -Width 2048 -Height 1024 -M2 -HapticAtMs 5000,15000,25000
+# haptics の繰り返し送信（5 秒間隔で 3 回。左右交互・振幅 1.0・500ms）。
+.\run.ps1 -Seconds 25 -Width 2048 -Height 1024 -M2 -HapticRepeat 3
+# 模擬の space 変更（起動 8 秒後に 1 回適用。実イベントではない）。
+.\run.ps1 -Seconds 15 -Width 2048 -Height 1024 -M2 -InjectSpaceChangeMs 8000
 ```
 
 - `-Space <auto|local|stage|local-floor>`（既定 `auto`）… exe の `--space` へ渡す。
   起動ログの「参照空間の一覧」と「参照空間: …（要求=…）」で選択を確認する。
-- `-HapticAtMs <Ms>`（既定 0=無効）… 起動から Ms 後に HapticCommand を 1 回送る
-  （左手・振幅 0.8・300ms）。exe は `xrApplyHapticFeedback` を呼び、
-  非対応・inactive のときは失敗を統計に残す（例外でループを止めない）。
+- `-HapticAtMs <Ms[,Ms...]>`（既定 `'0'`=無効）… 起動から Ms 後に HapticCommand を送る
+  （各送信は左手・振幅 0.8・300ms）。カンマ区切りで複数時刻を指定できる。
+  exe は `xrApplyHapticFeedback` を呼び、結果を `XrResult` でログに残す
+  （`haptics 送信: …（XrResult=…）`。非対応・inactive のときは未送信として
+  統計に残す。例外でループを止めない）。
   非装着時は inactive として記録される（体感の確認は実機装着時に行う）。
+- `-HapticRepeat <N>`（既定 `0`=無効）… 5 秒間隔で N 回送る
+  （左右交互・振幅 1.0・500ms）。実機の体感再確認用。
 - `-InjectSessionRestartMs <Ms>`（既定 0=無効）… exe の `--inject-session-restart` へ渡す。
   指定時刻に意図的にセッション束を破棄・再生成する。`connEpoch` が進み、
   再生成の成功/試行が exe の `M4統計` に残る。harness 側の `[M4入力]` ログの
   `conn=` も切り替わる。
-- 入力スナップショットの表示: exe 側の `[M4入力]`（毎秒）と harness 側の `[M4入力]`
-  （毎秒。`harness-run.log` に残る）。`harness-stats.json` の `inputStates` と
-  `lastInput` に受信件数と最終要約が残る。
+- `-InjectSpaceChangeMs <Ms>`（既定 0=無効）… exe の `--inject-space-change` へ渡す。
+  指定時刻に模擬の space 変更を 1 回適用する。ランタイムの
+  `REFERENCE_SPACE_CHANGE_PENDING` と同じ適用経路
+  （空間作り直し・`spaceEpoch` 更新・旧レコード失効）を通すが、
+  実イベントではないことを exe 側のログに明記する
+  （`模擬 space 変更を適用（実イベントではない…）`）。
+  統計の `space変更` に計上する。
+- 入力スナップショットの表示: exe 側の `[M4入力]`（毎秒。その 1 秒間に押された
+  ボタンの集合 `latch=` 付き）と harness 側の `[M4入力]`
+  （毎秒。`harness-run.log` に残る。`latch=` 付き）。短い押下は 1 秒サマリの
+  `latch=` と線路上の InputState 予約域（左右各 1B、buttons と同じ bit 割付け）で
+  取りこぼさない。状態が変化したフレームでは exe 側に `[M4エッジ]` が 1 行出る
+  （ボタン bit の press/release、trigger/squeeze の off->on/on->off、
+  stick の idle->touch/touch->idle、pose 有効/無効の変化）。
+  `harness-stats.json` の `inputStates` と `lastInput` に受信件数と最終要約が残る。
 
 M4 の既知の制約:
 
 - 実機のコントローラ操作・haptics の体感・追従は未検証。
   実機装着時の確認項目は `native_new/README.md` のチェックリストを参照。
+  再計測の手順は下の「実機での再計測手順」を参照。
 - PICO 系（bytedance）の suggest は SteamVR が `XR_ERROR_PATH_UNSUPPORTED` で拒否する。
   仕様には存在するため suggest 表に含め、失敗は記録して他を続行する。
   実機装着時に選ばれる profile は別途記録する。
 - すべての参照空間（local-floor/stage/local）が利用可の環境では、
   明示指定の後退経路は通らない（後退の確認は利用不可の環境で行う）。
 - producer 同期の未解決（DESIGN §8）、色（DESIGN §9）は触らない。
+
+### 実機での再計測手順（M4 の取りこぼし・haptics 判定不能の再確認用）
+
+前回の実機計測では primary（A/X）と menu がログに出ず（1 秒周期スナップショットの
+取りこぼし・システム消費・バインディング誤りのいずれか未確定）、haptics は
+`xrApplyHapticFeedback` 成功でも体感が判定不能だった。
+以下の手順で 1 項目ずつ切り分ける。HMD は使わない検証（`--m2-selftest`・
+`protocol-test`・`fault-matrix`）を先に通してから行う。
+
+```powershell
+# 60 秒の計測枠。haptics は 5・25・45 秒の 3 回、模擬 space 変更は使わない（実操作で確認）。
+.\run.ps1 -Seconds 60 -Width 2048 -Height 1024 -M2 -HapticAtMs 5000,25000,45000
+```
+
+1. ボタンは 1 つずつ 1 秒押して 2 秒空ける（左右 trigger・squeeze・stick・
+   stick click・primary（A/X）・secondary（Y/B）・menu の順）。
+   1 秒周期の `[M4入力]` では `latch=` に載ること、押下の瞬間には `[M4エッジ]` に
+   `L.primary press` のような行が出ることを `run-out.txt` で確認する。
+   `latch=` にも `[M4エッジ]` にも出ないボタンはバインディング誤り
+   （suggest 表・`SupportMask` を疑う）。出るがサマリに無いものは短押しの
+   取りこぼしであり、押し方（1 秒保持）で再現するかを見る。
+   menu はシステムに消費される場合があり、出なくても直ちに誤りとしない。
+   その場合は「menu はシステム消費の疑い」として記録する。
+2. haptics は上記の 3 回送信で左右の振動の有無を答える（左・左・左のため、
+   右の確認は別途 `-HapticRepeat 4` で左右交互に送る）。
+   exe 側の `haptics 送信: …（XrResult=…）` と体感の組で記録する。
+   成功（`XrResult=XR_SUCCESS`）でも振動不明なら振幅・持続・周波数の問題であり、
+   バインディングの問題ではない。
+3. 脱着→再装着は `[M4エッジ]` の `L.connected yes->no` / `no->yes` と
+   `[M4入力]` の `未接続` / `接続` の往復で確認する。exe が終了せず、
+   `STOPPING` のまま束を保つこと（再生成が走らないこと）。
+4. リセンタリングの代替手段: SteamVR メニューが出せない場合は
+   `-InjectSpaceChangeMs`（模擬。実イベントではない）で適用経路だけを確かめ、
+   実イベントの確認はダッシュボード等でリセンターできる環境に持ち越す。
+   模擬では `模擬 space 変更を適用（実イベントではない…）` と `spaceEpoch` の
+   進行・旧レコードの失効（`M2 棄却: space世代不一致` が出ないこと＝新世代で
+   照合すること）を確認する。
+5. 終了統計（`M4統計`）の `space変更`・`haptic受信`・`InputState送信` を記録し、
+   `harness-stats.json` の `hapticSent`・`inputStates`・`lastInput` と突き合わせる。
+
+### HMD 操作ガイド（実機計測用。検証器具）
+
+HMD 装着中は PC 画面が見えないため、`index-m2.html` の WebGPU キャンバスの上に
+HTML/CSS のオーバーレイで操作手順を出す。Chromium 合成で OSR 共有テクスチャに
+乗るだけであり、canvas 描画・パターン画素・検査結果は変わらない。
+
+```powershell
+# 実機計測（ガイドは -M2 時に既定 on。付け外しは -NoGuide/-Guide で明示）。
+.\run.ps1 -Seconds 80 -Width 2048 -Height 1024 -M2 -HapticAtMs 20000,30000,40000
+# ガイド表示の事前確認（8 秒時点の見た目を PNG に保存。検証専用で描画経路に入れない）。
+.\run.ps1 -Seconds 20 -Width 2048 -Height 1024 -M2 -CaptureAt '8000,logs\guide-cap.png'
+```
+
+- `-Guide` / `-NoGuide`（`-M2` 時は既定 on、それ以外は既定 off）…
+  electron の `--guide[=1|0]` へ渡す。off のままの既存検証（`protocol-test`・
+  `m2-render-test`・`fault-matrix`・M1 経路）に挙動の影響は無い。
+- ガイドは左右眼の中央（下部。予約の ID/タグブロック・マーカーと重ならない）に
+  同じ内容を出す。大きく高コントラスト（半透明の黒帯・白文字）で、現在の操作・
+  残り時間・次の操作・進捗ドットを示す。手順は 4 秒刻みを基本に、
+  20/30/40 秒の振動・55 秒の脱着・60 秒の再装着・70 秒の模擬 space 変更を含む。
+- `-CaptureAt 'Ms,path[;Ms,path]'`（既定 `''`=無効）… electron の
+  `--capture-at=Ms,path` へ渡す。起動から Ms 後に `webContents.capturePage()` で
+  PNG を保存する。検証専用であり、paint/Offer/検査の経路には入れない。
+
+### 2026-10-20 の実機確認結果
+
+PICO 4S（PICO Connect ストリーミング）→ SteamVR/OpenXR 2.17.10、RTX 3090 での実測。
+既存の M4 チェックリストは置き換えない。事実のみを残す。
+
+| 項目 | 結果 |
+|---|---|
+| interaction profile | `oculus/touch_controller`。bytedance 系 4 profile は `XR_ERROR_PATH_UNSUPPORTED` で未対応 |
+| 入力（エッジ記録） | 左右 trigger（0.07〜1.00）、左右 squeeze（0.19〜1.00）、左右 thumbstick（±1.0 まで）、stick click、primary（A/X）・secondary（B/Y）の押下・解放を検出 |
+| menu | ユーザーは押したがアプリに届かず。システム予約と判断 |
+| haptics | 2 回送信・2 回成功、ユーザーが両方とも体感 |
+| 参照空間 | `auto` → `local-floor`。`--space=stage` / `local` も選択可 |
+| リセンター | SteamVR メニューに到達できず実イベント未取得。`--inject-space-change` の模擬で `spaceEpoch 1→2` と旧レコード失効を確認 |
+| 脱着 | 外してもセッションは FOCUSED のまま（PICO ストリーミングでは検出されないと判断）。ストリーム終了時は `STOPPING → IDLE → EXITING` でアプリ終了 |
+| 提出 | blit 3,098〜4,886 回/ラン、左右分離検証 ng=0、XR fps 87〜89、`xrEndFrame` 層あり |
+| 緑一色の事象 | SteamVR コンポジタの不調（null ドライバ実験後に発生）。SteamVR 再起動で復旧。`--dump-submit` で両眼 swapchain をダンプし、正しいシーン・ガイド・マーカー入りを確認済み |
+| null ドライバ | SteamVR 2.17 では `xrGetVulkanGraphicsDeviceKHR` が `XR_ERROR_RUNTIME_FAILURE`（`GetOutputDevice: failed to find VkPhysicalDevice matching adapter UUID`）となり、Vulkan 経路の検証には使えない。今後は実機前提 |
+| 未確認 | 実リセンター、実セッション loss/再接続（`--inject-session-restart` の模擬のみ）、menu の代替経路 |
