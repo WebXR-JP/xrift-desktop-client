@@ -24,6 +24,8 @@ add_executable(xrift_new
   src/transfer/mem_log.cpp
   src/transfer/gpu_check.cpp
   src/transfer/transfer_app.cpp
+  src/transfer/m2_selftest.cpp
+  src/transfer/xr_transfer_app.cpp
 )
 
 # M1b 全画面 GPU 検査の compute シェーダ（shaders/check.comp）。

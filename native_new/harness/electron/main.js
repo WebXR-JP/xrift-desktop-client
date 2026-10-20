@@ -52,12 +52,24 @@ if (!['vulkan', 'd3d-open-only', 'no-gpu'].includes(MODE)) {
   return;
 }
 
-// プロトコル（native_new/src/transfer/protocol.h と同じ配置。64 バイト LE）。
-const MSG_LEN = 64;
+// M2 XR 提出モード（検証用フック）。--m2 で index-m2.html を描き、exe を
+// --xr-transfer で起動する。exe→main の RenderRequest を受けてレンダラへ渡す。
+// --inject-stale-record=N は N フレーム目の RenderRequest に旧 pose 混入の合図を
+// 載せるよう exe へ渡し、合図付き要求の pose を 1 つ前のもので描かせる
+// （不一致として棄却される想定。既定 0=無効）。
+const M2 = process.argv.includes('--m2');
+const INJECT_STALE_RECORD = Math.max(0, parseInt(arg('inject-stale-record', '0'), 10) || 0);
+const RENDER_SCALE = arg('render-scale', '0.5');
+const NO_SUBMIT_VERIFY = process.argv.includes('--no-submit-verify');
+
+// プロトコル（native_new/src/transfer/protocol.h と同じ配置。192 バイト LE）。
+// M2 で 64B→192B 化した。先頭 64B の配置は M1 と同じである。
+const MSG_LEN = 192;
 const MAGIC = 0x54465258;
-const VERSION = 1;
+const VERSION = 2;
 const TYPE_OFFER = 1;
 const TYPE_DONE = 2;
+const TYPE_RENDER_REQUEST = 3;
 const FORMAT_BGRA = 0;
 const STATUS_OK = 0;
 
@@ -115,6 +127,7 @@ const stats = {
   statusOk: 0, statusCopyFailed: 0, statusVerifyFailed: 0,
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
   distinctHandles: 0, firstCodedSize: null,
+  renderRequests: 0, // M2: exe から受けた RenderRequest の件数。
 };
 const handleCounts = new Map();
 // ソースハンドルの初出時刻（複製前の生値 hex -> 初出時刻 ms）。
@@ -125,6 +138,7 @@ const paintTimes = [];
 let exeProc = null;
 let socket = null;
 let doneSeq = 0; // 受信した Done の通番（--drop-done-at 用。既定 0=無効）。
+let winRef = null; // M2 のレコード転送先（createWindow が設定する）。
 // GPU プロセスの pid（app.getAppMetrics() から取る。GPU メモリ計測との突き合わせ用）。
 let gpuPidStart = null;
 let stopTimer = null;
@@ -367,10 +381,38 @@ function onDone(borrowId, status) {
   }
 }
 
+// M2: exe からの RenderRequest をレンダラへ渡す。pose/FOV は描画要求であり、
+// main プロセスは値を推測・付与しない（DESIGN §7。使用証拠は画素内の ID のみ）。
+// 予約先頭バイト 0x5A は --inject-stale-record の合図であり、次フレームの描画に
+// 旧 pose を混ぜさせる（harness 側フック。不一致として棄却される想定）。
+function forwardM2Record(m) {
+  const floats = (off, n) => Array.from({ length: n }, (_, i) => m.readFloatLE(off + i * 4));
+  const rec = {
+    renderId: m.readBigUInt64LE(40).toString(),
+    connEpoch: m.readUInt32LE(48),
+    spaceEpoch: m.readUInt32LE(52),
+    leftPos: floats(56, 3),
+    leftOri: floats(68, 4),
+    rightPos: floats(84, 3),
+    rightOri: floats(96, 4),
+    leftFov: floats(112, 4),
+    rightFov: floats(128, 4),
+    reqWidth: m.readUInt32LE(144),
+    reqHeight: m.readUInt32LE(148),
+    staleHint: m[152] === 0x5A,
+  };
+  stats.renderRequests++;
+  if (rec.staleHint) {
+    log(`M2 検証フック: renderId=${rec.renderId} に旧 pose 混入の合図（次フレームで混ぜる）`);
+  }
+  if (winRef !== null && !winRef.isDestroyed()) {
+    winRef.webContents.executeJavaScript(`window.__m2push(${JSON.stringify(rec)})`).catch(() => {});
+  }
+}
+
 function maybeFinish() {
   if (!stopping || finished) return;
-  if (inFlight !== null) return;
-  // 未 offer の保留は転送前 drop と同じ扱いで finish 側が release するため、
+  if (inFlight !== null) return;  // 未 offer の保留は転送前 drop と同じ扱いで finish 側が release するため、
   // inFlight の ACK 揃いだけでソケットを閉じてよい。低速 consumer（--delay-ms）では
   // 停止時に保留が残るが、pump 停止後は offer されないため待っても解消しない。
   // 高速な通常経路では停止時に保留は空であり、従来どおりの条件になる。
@@ -512,6 +554,8 @@ async function createWindow() {
   win.setContentSize(WIN_W, WIN_H);
   win.webContents.setFrameRate(90);
   log(`window created: ${WIN_W}x${WIN_H} offscreen.useSharedTexture=true frameRate=90 target=${SECONDS}s`);
+  // M2 のレコード転送先。RenderRequest の到着より先に設定する。
+  winRef = win;
 
   win.webContents.on('console-message', (_e, _level, message) => {
     log('renderer-console: ' + message);
@@ -526,17 +570,26 @@ async function createWindow() {
     }
   });
 
-  await win.loadFile(path.join(__dirname, 'index.html'), {
-    query: {
-      badTile: String(INJECT_BAD_TILE),
-      staleTile: String(INJECT_STALE_TILE),
-      badCorner: String(INJECT_BAD_CORNER),
-      badBit: String(INJECT_BAD_BIT),
-    },
-  });
-  log('index.html loaded ' +
-      `(inject badTile=${INJECT_BAD_TILE} staleTile=${INJECT_STALE_TILE} ` +
-      `badCorner=${INJECT_BAD_CORNER} badBit=${INJECT_BAD_BIT})`);
+  if (M2) {
+    await win.loadFile(path.join(__dirname, 'index-m2.html'), {
+      query: {
+        staleRecord: String(INJECT_STALE_RECORD),
+      },
+    });
+    log(`index-m2.html loaded (inject staleRecord=${INJECT_STALE_RECORD})`);
+  } else {
+    await win.loadFile(path.join(__dirname, 'index.html'), {
+      query: {
+        badTile: String(INJECT_BAD_TILE),
+        staleTile: String(INJECT_STALE_TILE),
+        badCorner: String(INJECT_BAD_CORNER),
+        badBit: String(INJECT_BAD_BIT),
+      },
+    });
+    log('index.html loaded ' +
+        `(inject badTile=${INJECT_BAD_TILE} staleTile=${INJECT_STALE_TILE} ` +
+        `badCorner=${INJECT_BAD_CORNER} badBit=${INJECT_BAD_BIT})`);
+  }
   gpuPidStart = currentGpuPid();
   log(`GPU プロセス pid=${gpuPidStart}（app.getAppMetrics() から取得）`);
 
@@ -559,11 +612,28 @@ function start() {
   // Node の spawn ではできない（引数確定より pid 取得が後になる）ため、
   // 一意性という目的を electron pid で満たす。詳細は README の既知の制約を参照。
   const pipePath = `\\\\.\\pipe\\xrift_m1_${process.pid}`;
-  const exeArgs = ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`,
-    `--mode=${MODE}`];
-  exeArgs.push(NO_GPU_CHECK ? '--no-gpu-check' : '--gpu-check');
-  log(`exe の診断モード: ${MODE}`);
-  log(`exe の GPU検査: ${NO_GPU_CHECK ? 'off (--no-gpu-check)' : 'on'}`);
+  // M2 モードは XR 提出ループを起動する。M1 の --transfer 経路は変えない。
+  const exeArgs = M2
+    ? ['--xr-transfer', `--pipe=${pipePath}`, `--render-scale=${RENDER_SCALE}`,
+       `--seconds=${SECONDS + 30}`]
+    : ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`,
+       `--mode=${MODE}`];
+  if (M2) {
+    log(`exe の M2 XR提出モード: render-scale=${RENDER_SCALE}`);
+    if (INJECT_STALE_RECORD > 0) {
+      exeArgs.push(`--inject-stale-record=${INJECT_STALE_RECORD}`);
+      log(`検証フック有効: exe に --inject-stale-record=${INJECT_STALE_RECORD} を渡す ` +
+          `（その要求に旧 pose 混入の合図。不一致で棄却される想定）`);
+    }
+    if (NO_SUBMIT_VERIFY) {
+      exeArgs.push('--no-submit-verify');
+      log('左右分離検証を無効化 (--no-submit-verify)');
+    }
+  } else {
+    exeArgs.push(NO_GPU_CHECK ? '--no-gpu-check' : '--gpu-check');
+    log(`exe の診断モード: ${MODE}`);
+    log(`exe の GPU検査: ${NO_GPU_CHECK ? 'off (--no-gpu-check)' : 'on'}`);
+  }
   if (EXE_MEM_LOG !== '') {
     exeArgs.push(`--mem-log=${EXE_MEM_LOG}`);
     log(`exe のメモリログ: ${EXE_MEM_LOG}（1 秒周期 CSV）`);
@@ -624,9 +694,18 @@ function start() {
       while (acc.length >= MSG_LEN) {
         const m = acc.subarray(0, MSG_LEN);
         acc = acc.subarray(MSG_LEN);
-        if (m.readUInt32LE(0) !== MAGIC || m.readUInt16LE(4) !== VERSION ||
-            m.readUInt16LE(6) !== TYPE_DONE) {
-          log('不正な Done を破棄');
+        if (m.readUInt32LE(0) !== MAGIC || m.readUInt16LE(4) !== VERSION) {
+          log('不正なメッセージを破棄（magic/version の不一致）');
+          continue;
+        }
+        const msgType = m.readUInt16LE(6);
+        // M2: exe→main の描画要求。借用台帳には触れずレンダラへ渡す。
+        if (msgType === TYPE_RENDER_REQUEST) {
+          forwardM2Record(m);
+          continue;
+        }
+        if (msgType !== TYPE_DONE) {
+          log(`未知のメッセージ種別を破棄 type=${msgType}`);
           continue;
         }
         const borrowId = Number(m.readBigUInt64LE(8));

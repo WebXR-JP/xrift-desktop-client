@@ -13,6 +13,11 @@ namespace xrift::gfx {
 
 // 優先順に並べた swapchain フォーマット候補。
 std::vector<vk::Format> PreferredSwapchainFormats();
+// M2 の XR 提出モード用の候補。受理画像の自前イメージ（B8G8R8A8_UNORM）と一致する
+// 形式を優先する。blit は同一形式間の複写・拡大であり、色空間の変換は行わない。
+// sRGB 形式しか無いランタイムでは二重符号化の疑いが残るため、確定時はログに残す
+// （DESIGN §9・§13 の未決事項。色の最終確認は M5 まで持ち越す）。
+std::vector<vk::Format> M2PreferredSwapchainFormats();
 // フォーマット値の表示名。未知の値は "不明なフォーマット" を返す。
 // vk::to_string(Format) は存在するが "R8G8B8A8Srgb" 式の表記になるため、
 // --probe の出力内容を変えないよう従来の "VK_FORMAT_..." 表記を保つ。
@@ -21,7 +26,8 @@ const char* SwapchainFormatName(vk::Format format);
 class Swapchains {
  public:
   Swapchains(XrInstance instance, XrSession session,
-             const std::vector<XrViewConfigurationView>& views);
+             const std::vector<XrViewConfigurationView>& views,
+             const std::vector<vk::Format>& preference = {});
   ~Swapchains();
 
   Swapchains(const Swapchains&) = delete;

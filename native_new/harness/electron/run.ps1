@@ -6,6 +6,7 @@
 #   [-InjectBadTile N] [-InjectStaleTile N] [-InjectBadCorner N] [-InjectBadBit N] [-NoGpuCheck]
 #   [-FailAfter N] [-InjectUnconfirmed N] [-DelayMs N] [-DropDoneAt N]
 #   [-Mode vulkan|d3d-open-only|no-gpu] [-MemLog <接頭辞>]
+#   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify]
 #   -Mode は exe の診断モード（既定 vulkan=Vulkan 経路）。借用台帳・ACK・release は同じ。
 #   d3d-open-only は D3D11 Open 経路の診断専用であり、長時間動かすとメモリが増える。
 #   -MemLog は計測用 CSV の接頭辞（例: logs\run1 → run1.exe.csv と run1.gpu.csv）。
@@ -26,7 +27,11 @@ param(
   [ValidateSet('vulkan', 'd3d-open-only', 'no-gpu')]
   [string]$Mode = 'vulkan',
   [string]$MemLog = '',
-  [switch]$NoGpuCheck
+  [switch]$NoGpuCheck,
+  [switch]$M2,
+  [int]$InjectStaleRecord = 0,
+  [string]$RenderScale = '0.5',
+  [switch]$NoSubmitVerify
 )
 $ErrorActionPreference = 'Stop'
 $harness = $PSScriptRoot                    # native_new/harness/electron
@@ -47,6 +52,13 @@ if ($buildCode -ne 0) { throw "exe のビルドに失敗" }
 Write-Host "== 3/4 プロトコル配置試験 =="
 node (Join-Path $harness 'protocol-test.js')
 if ($LASTEXITCODE -ne 0) { throw "protocol-test に失敗" }
+node (Join-Path $harness 'm2-codec-test.js')
+if ($LASTEXITCODE -ne 0) { throw "m2-codec-test に失敗" }
+if ($M2) {
+  Write-Host "== 3b/4 M2 レンダラの画素試験 =="
+  & $electron (Join-Path $harness 'm2-render-test.js')
+  if ($LASTEXITCODE -ne 0) { throw "m2-render-test に失敗" }
+}
 
 Write-Host "== 4/4 electron ハーネスの実行（${Seconds} 秒・mode=${Mode}） =="
 $exe = Join-Path $root 'build\windows\Release\xrift_new.exe'
@@ -57,6 +69,13 @@ $electronArgs = @('.', "--exe=$exe", "--seconds=$Seconds", "--width=$Width", "--
   "--fail-after=$FailAfter", "--inject-unconfirmed=$InjectUnconfirmed",
   "--delay-ms=$DelayMs", "--drop-done-at=$DropDoneAt")
 if ($NoGpuCheck) { $electronArgs += '--no-gpu-check' }
+if ($M2) {
+  $electronArgs += '--m2'
+  $electronArgs += "--inject-stale-record=$InjectStaleRecord"
+  $electronArgs += "--render-scale=$RenderScale"
+  if ($NoSubmitVerify) { $electronArgs += '--no-submit-verify' }
+  Write-Host "M2 モード: --m2 --inject-stale-record=$InjectStaleRecord --render-scale=$RenderScale"
+}
 # 計測用 CSV（-MemLog <接頭辞>）。exe 側は <接頭辞>.exe.csv（--mem-log 経由）、
 # GPU プロセスメモリは <接頭辞>.gpu.csv（このスクリプトが 1 秒周期で採取）。
 $sampler = $null

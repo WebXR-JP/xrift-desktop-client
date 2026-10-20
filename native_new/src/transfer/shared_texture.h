@@ -78,6 +78,21 @@ class TransferSession {
 
   const std::string& gpuName() const { return vulkan_.gpuName(); }
 
+  // M2 の XR 提出モード用の読み口。自前イメージ（横並びアトラスの最新コピー）と
+  // 寸法・Vulkan 資源を借用する。所有権は移らない。破棄してはならない。
+  // 自前イメージは GENERAL 駐めが不変条件であり、借用側は読み後に GENERAL へ戻すこと。
+  vk::Image OwnImage() const {
+    const vk::Image img = *ownImage_;
+    return (static_cast<VkImage>(img) != VK_NULL_HANDLE) ? img : vk::Image{};
+  }
+  uint32_t OwnWidth() const { return ownWidth_; }
+  uint32_t OwnHeight() const { return ownHeight_; }
+  const gfx::VulkanContext& Vulkan() const { return vulkan_; }
+  // XR セッション共有用の XR インスタンス。M2 の XR 提出モードは転送と XR で
+  // 同一 VkDevice を使うため、TransferSession が作った instance を借用する。
+  // 所有権は移らない。TransferSession より長生きさせてはならない。
+  const xr::Instance& XrInstance() const { return instance_; }
+
  private:
   // 自前イメージを extent に合わせる。変化時のみ作り直す。
   void EnsureOwnImage(uint32_t width, uint32_t height);

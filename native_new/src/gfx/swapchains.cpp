@@ -17,6 +17,15 @@ std::vector<vk::Format> PreferredSwapchainFormats() {
   };
 }
 
+std::vector<vk::Format> M2PreferredSwapchainFormats() {
+  return {
+      vk::Format::eB8G8R8A8Unorm,
+      vk::Format::eR8G8B8A8Unorm,
+      vk::Format::eB8G8R8A8Srgb,
+      vk::Format::eR8G8B8A8Srgb,
+  };
+}
+
 const char* SwapchainFormatName(vk::Format format) {
   switch (format) {
     case vk::Format::eR8G8B8A8Srgb:
@@ -48,8 +57,12 @@ const char* SwapchainFormatName(vk::Format format) {
 }
 
 Swapchains::Swapchains(XrInstance instance, XrSession session,
-                       const std::vector<XrViewConfigurationView>& views)
+                       const std::vector<XrViewConfigurationView>& views,
+                       const std::vector<vk::Format>& preference)
     : instance_(instance) {
+  // 空の指定は既存の既定候補と同じである（通常起動の挙動は変えない）。
+  const std::vector<vk::Format> wanted =
+      preference.empty() ? PreferredSwapchainFormats() : preference;
   // コンストラクタが例外で抜けるとデストラクタは呼ばれないため、生成済み swapchain は
   // ここで破棄する。Destroy() は冪等であり、部分構築状態でも安全に呼べる。
   try {
@@ -65,9 +78,9 @@ Swapchains::Swapchains(XrInstance instance, XrSession session,
   for (int64_t available : formats) {
     Info("  swapchain format 対応: %s", SwapchainFormatName(static_cast<vk::Format>(available)));
   }
-  for (vk::Format wanted : PreferredSwapchainFormats()) {
-    if (std::find(formats.begin(), formats.end(), static_cast<int64_t>(wanted)) != formats.end()) {
-      format_ = wanted;
+  for (vk::Format want : wanted) {
+    if (std::find(formats.begin(), formats.end(), static_cast<int64_t>(want)) != formats.end()) {
+      format_ = want;
       break;
     }
   }
