@@ -48,6 +48,12 @@ constexpr uint8_t kStaleMarker = 0x5Au;
 // なお deadlineUs=0 は無期限待ちの意味であるため、ノンブロッキングのつもりで
 // 現在時刻や 0 をそのまま期限に渡さないこと。
 constexpr uint64_t kOfferPollWaitUs = 1000u;
+// Offer が途絶えた場合に producer 終了とみなす無受信の上限（5 秒は意図的な値）。
+// harness は計測終了で Offer を止めてから読取側を開いたままにし（socket.end の半閉鎖）、
+// 8 秒の猶予後に kill する。exe が受信待ちを続けると統計を出す前に殺されるため、
+// 通常時（約 90Hz で Offer が来る）では起きない 5 秒の途絶で新規受付を止めて終了する。
+// 初回 Offer 前は適用しない（起動直後の誤終了を避ける）。
+constexpr uint64_t kProducerIdleTimeoutUs = 5000000u;
 
 uint64_t NowUs() {
   return static_cast<uint64_t>(
@@ -577,6 +583,15 @@ int RunXrTransfer(const XrTransferOptions& options) {
 
   bool session_running = false;
   bool quit = false;
+  // パイプの生死と終了コード。切断（hard close）は新規受付の停止と統計付き終了の合図
+  // であり（DESIGN §6③）、未完了の借用へ Done は送らない。プロトコルに終了合図が無い
+  // ため、少なくともハングせず統計を残すことを優先し、正常な切断は 0、異常は非ゼロで返す。
+  bool pipeAlive = true;
+  int exitCode = 0;
+  // 最後に Offer（有効・無効を問わず何らかの受信）があった時刻。初回受信前は idle 判定を
+  // 行わない（起動直後の誤終了を避ける）。
+  bool haveOfferEver = false;
+  uint64_t lastOfferUs = NowUs();
   uint64_t frame_no = 0;
   uint64_t droppedIntermediate = 0;
   const uint64_t deadlineUs =
@@ -655,18 +670,26 @@ int RunXrTransfer(const XrTransferOptions& options) {
         received = pipe.ReceiveWithDeadline(&msg, poll_deadline, &timed_out);
       } catch (const std::exception& e) {
         Error("パイプ受信に失敗: %s", e.what());
+        pipeAlive = false;
+        exitCode = 1;
         quit = true;
         return;
       }
       if (!received) {
         // 空振り（期限切れ）は正常であり、borrow 資源の返却許可にはならない。
-        // 切断時は速やかに終了する。
+        // 切断時は新規受付を止め、現在の処理を安全に終わらせて統計を出して終了する。
+        // 未完了の借用へ Done は送らない（隔離。DESIGN §6③）。
         if (!timed_out) {
+          Info("パイプ切断を検知したため新規受付を止めて終了する");
+          pipeAlive = false;
           quit = true;
           return;
         }
         break;
       }
+      // 何らかの受信があれば producer は生存している（有効・無効を問わない）。
+      haveOfferEver = true;
+      lastOfferUs = NowUs();
       if (!IsValidOffer(msg)) {
         Warn("不正な Offer を破棄（magic/version/type/format の不一致）");
         continue;
@@ -677,6 +700,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
           transfer.ProcessOffer(msg.handle, msg.width, msg.height, &timings, nullptr);
       if (status == kStatusNoAck) {
         Error("GPU 完了未確認のため受付を停止して終了する（borrow への ACK なし）");
+        pipeAlive = false;
+        exitCode = 2;
         quit = true;
         return;
       }
@@ -688,6 +713,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
         pipe.Send(done);
       } catch (const std::exception& e) {
         Error("ACK 送信に失敗: %s", e.what());
+        pipeAlive = false;
+        exitCode = 1;
         quit = true;
         return;
       }
@@ -733,9 +760,20 @@ int RunXrTransfer(const XrTransferOptions& options) {
     }
     poll_events();
     if (!session_running) {
+      // 実行中でない間も Offer の受付・ACK と切断検知は進める。受信した Offer は
+      // drain_offers が Done を返すため、消費して返せなくなることはない。
+      // 以前はここで切断を見ず --seconds か kill 待ちでぶら下がったため、
+      // harness 先死で統計を出さずに殺されていた（DESIGN §6③の違反）。
+      drain_offers();
+      ledger.SweepExpired(NowUs());
+      if (quit) {
+        break;
+      }
+      if (haveOfferEver && NowUs() - lastOfferUs > kProducerIdleTimeoutUs) {
+        Info("Offer が 5 秒途絶えたため producer 終了とみなして統計を出して終了する");
+        break;
+      }
       // 実行中でない間は眠らせ、ビジーループにしない。
-      // pipe の切断検知は行わない（受信すると Offer を消費して Done を返せなくなるため。
-      // 終了は --seconds か XR イベントで行い、harness が exe を kill する）。
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
@@ -798,6 +836,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
           ++stats.requests;
         } catch (const std::exception& e) {
           Error("RenderRequest 送信に失敗: %s", e.what());
+          pipeAlive = false;
+          exitCode = 1;
           quit = true;
         }
         rendered = true;
@@ -810,6 +850,14 @@ int RunXrTransfer(const XrTransferOptions& options) {
     // ここでの期限は受信のポーリング間隔である。
     drain_offers();
     ledger.SweepExpired(NowUs());
+    // harness が Offer を止めたまま読取側を開き続けると（半閉鎖）、切断は返らず
+    // 空フレームが続く。一定時間の途絶は producer 終了とみなして統計を出して終了し、
+    // kill による統計消失を避ける。切断検知時と同様、現在のフレームは安全に終える。
+    if (pipeAlive && !quit && haveOfferEver && NowUs() - lastOfferUs > kProducerIdleTimeoutUs) {
+      Info("Offer が 5 秒途絶えたため producer 終了とみなして統計を出して終了する");
+      pipeAlive = false;
+      quit = true;
+    }
     // 提出は受理画像のレコードの pose/FOV で行う。最新 pose への付け替えはしない。
     // 新規受理が無ければ layerCount=0 で終える（対応不明の画像の再投影頼みは禁止。
     // DESIGN §7）。受理から 500ms 超のレコードは失効として棄却する。
@@ -891,7 +939,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
   if (stats.submitLayers == 0) {
     Warn("提出層 0 のまま終了した（受理画像が無い。harness 側の描画を確認すること）");
   }
-  return 0;
+  if (!pipeAlive) {
+    Info("パイプ終了に伴う終了（exit=%d）", exitCode);
+  }
+  return exitCode;
 }
 
 }  // namespace xrift::transfer

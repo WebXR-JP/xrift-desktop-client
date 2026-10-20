@@ -426,6 +426,14 @@ function finish(code) {
   finished = true;
   // 終了確定。以後の新規 paint・pump・submit を止める。
   stopping = true;
+  // M2 の XR ループは Offer 待ちで空フレームを回し続けるため、読取側を開いたままの
+  // 半閉鎖（socket.end のみ）では切断を検知できず kill による統計消失が起きる。
+  // 終了待ちの前に破棄して切断（BROKEN_PIPE）として知らせ、exe に統計を出させる。
+  // 未 ACK の借用は下で隔離し release しない（DESIGN §6②③）。
+  try {
+    if (socket !== null && !socket.destroyed) socket.destroy();
+  } catch { /* 無視 */ }
+  socket = null;
   if (stopTimer) clearTimeout(stopTimer);
   if (graceTimer) clearTimeout(graceTimer);
   if (exeWaitTimer) clearTimeout(exeWaitTimer);
@@ -728,6 +736,7 @@ function start() {
       log('パイプ切断を検知');
       socket = null;
       pipeClosed = true;
+      if (finished) return;
       if (exeCode !== null) {
         // exe は既に終了している。exe のコードで確定する。
         finish(exeBaseCode());

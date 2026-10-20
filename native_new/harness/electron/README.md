@@ -135,3 +135,37 @@ blit 後に各眼の提出画像から 1 画素だけ読み、左眼=マゼン�
 - `--render-scale` の既定は 0.5（VRAM 圧迫の回避）。要求寸法と実寸が食い違ったら
   実寸を正とする（DESIGN §9）。
 - 中間 Offer は最新優先で Done だけ返し、照合は最新 1 件に行う（破棄数は統計に出る）。
+- 終了の合図は無い。harness が Offer を止めても読取側を開いたままにするため、
+  exe は 5 秒の途絶で producer 終了とみなして統計を出して終了する（DESIGN §6③）。
+  切断（BROKEN_PIPE）時は新規受付を止め、現在のフレームを安全に終えて終了する。
+  未完了の借用へ Done は送らない。
+
+### null ドライバでの検証手順（HMD 無しで両眼提出まで回す。将来の自動検証用）
+
+- 目的: HMD 無しで XR セッションを VISIBLE/FOCUSED まで進め、提出レート・blit・
+  左右分離検証を測る。実機（PICO 等）の置き換えではなく、提出経路の回帰用である。
+- SteamVR 設定の変更は必ず復元すること。手順はバックアップ→変更→再起動→測定→
+  復元→再起動→ハッシュ一致確認までを 1 セットにする。
+- 設定ファイルは `%LOCALAPPDATA%\openvr\steamvr.vrsettings`（SteamVR の
+  `steamvr.vrsettings`。パスが無い場合は SteamVR の設定画面から開く）。
+  変更前に全文を別名で保存し、ハッシュ（`Get-FileHash` の SHA256）を記録する。
+- 追加する 3 点（JSON の対応する節に足す。既存の値は消さない）。
+  - `"driver_null": {"enable": true}`
+  - `"steamvr": {"forcedDriver": "null"}`（既存の `steamvr` 節があれば中に足す）
+  - `"power": {"pauseCompositorOnStandby": false}`（既存の `power` 節があれば中に足す）
+- 変更後に SteamVR を再起動する（SteamVR のメニューから再起動するか、
+  `vrserver.exe`/`vrmonitor.exe` の終了と SteamVR の起動で代用する）。
+  再起動せずに測ると旧ドライバのままになり、FOCUSED に届かない。
+- 測定（例: 60 秒・4096x2048 相当。`Width`/`Height` は OSR 側であり要求寸法ではない）。
+  - `.\run.ps1 -Seconds 60 -M2 -RenderScale 0.5`
+  - `--render-scale 1.0` は VRAM・負荷が大きい。失敗したら 0.5 のみでよいが、
+    数値と理由（VRAM 不足・タイムアウト等）を報告すること。勝手に縮小して黙らない。
+- 測定後は設定ファイルをバックアップから復元し、SteamVR を再起動して PICO 等の
+  実機に戻ることを確認する。復元後にハッシュがバックアップと一致することを確かめる。
+- 注意点。
+  - null ドライバでは pose が静止しがちで、視差シーンの動きは小さい。
+    左右分離（マゼンタ/シアン）と pose 対応の有無は見られるが、追従遅延の評価にはならない。
+  - 色の最終確認は未決のまま（sRGB のみの場合あり）。左右分離と pose 対応を優先する。
+  - 終了時に harness が先に終わっても exe は統計を出して終了するはずである。
+    `finish(3)` で kill されて exe 統計（XR fps・blit 平均/最大・検証 ok/ng）が欠けたら
+    切断検知の退行として扱う。
