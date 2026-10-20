@@ -12,14 +12,35 @@
 <body>
 <canvas id="c"></canvas>
 <script>
-// M1 検証パターン（exe 側 shared_texture.cpp の定数と一致させること）。
+// M1b 検証パターン（exe 側 shaders/check.comp と一致させること）。
 // バッキングサイズはウィンドウに合わせる（devicePixelRatio は使わない）。
 // 既定の起動（4096x2048）では 4096x2048 になる。
-// 背景はフレーム番号に応じた単調変化のグレー、4 隅に 64x64 の固定色、
-// (64,64) から 32x32 の領域に 16bit フレーム番号を 4x4 セルで描く
-//（bit b: x=64+(b%8)*4, y=64+floor(b/8)*4。1=白/0=黒）。
+// 16x16 タイルごとのハッシュ色を全面に描き、予約領域だけ上書きする:
+//   c = (f * 2654435761) ^ (tx * 40503) ^ (ty * 2246822519)  // 32bit ラップ
+//   R = c & 0xFF, G = (c >> 8) & 0xFF, B = (c >> 16) & 0xFF, A = 255
+// 予約領域: 4 隅の 64x64 固定色（左上=赤、右上=緑、左下=青、右下=白）、
+// (64,64) から 32x32 のフレーム番号ブロック（bit b: x=64+(b%8)*4, y=64+floor(b/8)*4 の
+// 4x4 セル。1=白/0=黒。セル内は単色。使わない行は黒で埋める）。
+// 注入フック（検査自体の妥当性確認用。既定は全て off=0）:
+//   ?badTile=N   N フレーム目だけタイル (20,20) を別色（マゼンタ）にする
+//   ?staleTile=N N フレーム目だけタイル (30,30) を f-1 の色で描く（世代混在の模擬）
+//   ?badCorner=N N フレーム目だけ左上隅を赤ではなく緑にする
+//   ?badBit=N    N フレーム目だけ番号セル b=3 の右半分を反転して非単色にする
 window.__m1Info = { backend: 'none', error: null, frames: 0 };
 const W = window.innerWidth, H = window.innerHeight;
+const QUERY = new URLSearchParams(location.search);
+function injectOf(name) {
+  const v = parseInt(QUERY.get(name) || '0', 10);
+  return (Number.isFinite(v) && v > 0) ? (v & 0xFFFF) : 0;
+}
+const INJECT = {
+  badTile: injectOf('badTile'),
+  staleTile: injectOf('staleTile'),
+  badCorner: injectOf('badCorner'),
+  badBit: injectOf('badBit'),
+};
+// 0 は off を表す。シェーダ側の比較対象には到達しない番兵を渡す。
+const OFF = 0xFFFFFFFF;
 
 async function boot() {
   const canvas = document.getElementById('c');
@@ -47,7 +68,16 @@ async function runWebGPU(canvas) {
   ctx.configure({ device, format, alphaMode: 'opaque' });
 
   const code = `
-struct U { frame : u32 };
+struct U {
+  frame : u32,
+  badTile : u32,
+  staleTile : u32,
+  badCorner : u32,
+  badBit : u32,
+  width : u32,
+  height : u32,
+  pad : u32,
+};
 @group(0) @binding(0) var<uniform> u : U;
 struct VSOut { @builtin(position) pos : vec4f };
 @vertex fn vs(@builtin(vertex_index) i : u32) -> VSOut {
@@ -56,26 +86,43 @@ struct VSOut { @builtin(position) pos : vec4f };
   o.pos = vec4f(p[i], 0.0, 1.0);
   return o;
 }
+// M1b タイルパターン。u32 演算は 32bit で回るため GLSL 側と一致する。
+// 除算は整数除算であり、丸め誤差は出ない。
+fn tileColor(f : u32, tx : u32, ty : u32) -> vec4f {
+  let c = (f * 2654435761u) ^ (tx * 40503u) ^ (ty * 2246822519u);
+  return vec4f(f32(c & 255u) / 255.0, f32((c >> 8u) & 255u) / 255.0,
+               f32((c >> 16u) & 255u) / 255.0, 1.0);
+}
 @fragment fn fs(in : VSOut) -> @location(0) vec4f {
   let px = vec2u(in.pos.xy);
   let frame = u.frame;
   // 4 隅の 64x64 固定色（左上=赤、右上=緑、左下=青、右下=白）。
-  if (px.x < 64u && px.y < 64u) { return vec4f(1.0, 0.0, 0.0, 1.0); }
-  if (px.x >= (${W}u - 64u) && px.y < 64u) { return vec4f(0.0, 1.0, 0.0, 1.0); }
-  if (px.x < 64u && px.y >= (${H}u - 64u)) { return vec4f(0.0, 0.0, 1.0, 1.0); }
-  if (px.x >= (${W}u - 64u) && px.y >= (${H}u - 64u)) { return vec4f(1.0, 1.0, 1.0, 1.0); }
+  if (px.x < 64u && px.y < 64u) {
+    if (frame == u.badCorner) { return vec4f(0.0, 1.0, 0.0, 1.0); }
+    return vec4f(1.0, 0.0, 0.0, 1.0);
+  }
+  if (px.x >= (u.width - 64u) && px.y < 64u) { return vec4f(0.0, 1.0, 0.0, 1.0); }
+  if (px.x < 64u && px.y >= (u.height - 64u)) { return vec4f(0.0, 0.0, 1.0, 1.0); }
+  if (px.x >= (u.width - 64u) && px.y >= (u.height - 64u)) { return vec4f(1.0, 1.0, 1.0, 1.0); }
   // フレーム番号ブロック（64,64）起点の 32x32。8 列 x 2 行の 4x4 セル。
-  if (px.x >= 64u && px.x < 96u && px.y >= 64u && px.y < 72u) {
+  // 使わない行は黒で埋め、予約領域全体をタイルパターンで上書きする。
+  if (px.x >= 64u && px.x < 96u && px.y >= 64u && px.y < 96u) {
     let col = (px.x - 64u) / 4u;
     let row = (px.y - 64u) / 4u;
+    if (row >= 2u) { return vec4f(0.0, 0.0, 0.0, 1.0); }
     let b = row * 8u + col;
-    let bit = (frame >> b) & 1u;
+    var bit = (frame >> b) & 1u;
+    if (frame == u.badBit && b == 3u && (px.x - 64u - col * 4u) >= 2u) { bit = 1u - bit; }
     if (bit == 1u) { return vec4f(1.0, 1.0, 1.0, 1.0); }
     return vec4f(0.0, 0.0, 0.0, 1.0);
   }
-  // 背景はフレーム番号に応じた単調変化（256 階調のグレー）。
-  let v = f32(frame & 255u) / 255.0;
-  return vec4f(v, v, v, 1.0);
+  // タイルパターン。
+  let tx = px.x / 16u;
+  let ty = px.y / 16u;
+  if (frame == u.badTile && tx == 20u && ty == 20u) { return vec4f(1.0, 0.0, 1.0, 1.0); }
+  var f = frame;
+  if (frame == u.staleTile && tx == 30u && ty == 30u) { f = (frame - 1u) & 0xFFFFu; }
+  return tileColor(f, tx, ty);
 }`;
   const module = device.createShaderModule({ code });
   const pipeline = device.createRenderPipeline({
@@ -84,15 +131,22 @@ struct VSOut { @builtin(position) pos : vec4f };
     fragment: { module, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'triangle-list' },
   });
-  const ubuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const ubuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: ubuf } }],
   });
-  const uarr = new Uint32Array(4);
+  const uarr = new Uint32Array(8);
+  uarr[1] = INJECT.badTile || OFF;
+  uarr[2] = INJECT.staleTile || OFF;
+  uarr[3] = INJECT.badCorner || OFF;
+  uarr[4] = INJECT.badBit || OFF;
+  uarr[5] = W;
+  uarr[6] = H;
   let frame = 0;
-  window.__m1Info = { backend: 'webgpu', error: null, frames: 0, format };
-  console.log('[m1] renderer backend=webgpu format=' + format + ' size=' + W + 'x' + H);
+  window.__m1Info = { backend: 'webgpu', error: null, frames: 0, format, inject: INJECT };
+  console.log('[m1] renderer backend=webgpu format=' + format + ' size=' + W + 'x' + H +
+              ' inject=' + JSON.stringify(INJECT));
 
   function draw() {
     frame = (frame + 1) & 0xFFFF;
@@ -117,21 +171,52 @@ struct VSOut { @builtin(position) pos : vec4f };
 function runCanvas2D(canvas) {
   const ctx = canvas.getContext('2d');
   let frame = 0;
-  window.__m1Info = { backend: 'canvas2d', error: null, frames: 0 };
-  console.log('[m1] renderer backend=canvas2d size=' + W + 'x' + H);
+  window.__m1Info = { backend: 'canvas2d', error: null, frames: 0, inject: INJECT };
+  console.log('[m1] renderer backend=canvas2d size=' + W + 'x' + H +
+              ' inject=' + JSON.stringify(INJECT));
+  // Math.imul で 32bit ラップさせ、WGSL/GLSL と同じ値にする。
+  function tileRGB(f, tx, ty) {
+    const c = (Math.imul(f, 2654435761) ^ Math.imul(tx, 40503) ^ Math.imul(ty, 2246822519)) >>> 0;
+    return [(c & 255), ((c >>> 8) & 255), ((c >>> 16) & 255)];
+  }
   function draw() {
     frame = (frame + 1) & 0xFFFF;
-    const v = frame & 255;
-    ctx.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 64, 64);
+    const tilesX = Math.ceil(W / 16), tilesY = Math.ceil(H / 16);
+    for (let ty = 0; ty < tilesY; ty++) {
+      for (let tx = 0; tx < tilesX; tx++) {
+        let rgb;
+        // 0 は off を表す。frame 0（周回）との衝突を避けるため 0 除外で比べる。
+        if (INJECT.badTile !== 0 && frame === INJECT.badTile && tx === 20 && ty === 20) {
+          rgb = [255, 0, 255];
+        } else {
+          let f = frame;
+          if (INJECT.staleTile !== 0 && frame === INJECT.staleTile && tx === 30 && ty === 30) {
+            f = (frame - 1) & 0xFFFF;
+          }
+          rgb = tileRGB(f, tx, ty);
+        }
+        ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+        ctx.fillRect(tx * 16, ty * 16, 16, 16);
+      }
+    }
+    ctx.fillStyle = (INJECT.badCorner !== 0 && frame === INJECT.badCorner) ? '#00ff00' : '#ff0000';
+    ctx.fillRect(0, 0, 64, 64);
     ctx.fillStyle = '#00ff00'; ctx.fillRect(W - 64, 0, 64, 64);
     ctx.fillStyle = '#0000ff'; ctx.fillRect(0, H - 64, 64, 64);
     ctx.fillStyle = '#ffffff'; ctx.fillRect(W - 64, H - 64, 64, 64);
+    ctx.fillStyle = '#000000'; ctx.fillRect(64, 64, 32, 32);
     for (let b = 0; b < 16; b++) {
-      const on = ((frame >> b) & 1) === 1;
-      ctx.fillStyle = on ? '#ffffff' : '#000000';
-      ctx.fillRect(64 + (b % 8) * 4, 64 + Math.floor(b / 8) * 4, 4, 4);
+      let on = ((frame >> b) & 1) === 1;
+      const x0 = 64 + (b % 8) * 4, y0 = 64 + Math.floor(b / 8) * 4;
+      if (INJECT.badBit !== 0 && frame === INJECT.badBit && b === 3) {
+        ctx.fillStyle = on ? '#ffffff' : '#000000';
+        ctx.fillRect(x0, y0, 2, 4);
+        ctx.fillStyle = on ? '#000000' : '#ffffff';
+        ctx.fillRect(x0 + 2, y0, 2, 4);
+      } else {
+        ctx.fillStyle = on ? '#ffffff' : '#000000';
+        ctx.fillRect(x0, y0, 4, 4);
+      }
     }
     window.__m1Info.frames = frame;
     requestAnimationFrame(draw);

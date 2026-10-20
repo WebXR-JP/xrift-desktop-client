@@ -14,10 +14,20 @@ void PrintHelp(const char* argv0) {
       "使い方: %s [--probe] [--transfer --pipe=<名前>] [--help]\n"
       "  引数なし  HMD に両眼クリア色を表示する\n"
       "  --probe   インスタンスと Vulkan 初期化だけ行い環境情報を出す（セッションは作らない）\n"
-      "  --transfer --pipe=\\\\.\\pipe\\<名前> [--verify|--no-verify] [--seconds=N]\n"
+      "  --transfer --pipe=\\\\.\\pipe\\<名前> [--verify|--no-verify] [--gpu-check|--no-gpu-check]\n"
+      "            [--seconds=N] [--mode=<vulkan|d3d-open-only|no-gpu>] [--mem-log=<path>]\n"
       "            Electron の OSR 共有テクスチャを受けて GPU 内コピーする（セッションは作らない）\n"
       "            --verify は既定 on。--seconds が正ならその秒数で受信を打ち切る\n"
+      "            --gpu-check は既定 on。全画面を GPU 上で検査し、画像は CPU に戻さない\n"
+      "            --mode は診断用（既定 vulkan=Vulkan 経路。D3D11 デバイスを作らない）。\n"
+      "            d3d-open-only は D3D11 Open 経路の診断専用（Vulkan は使わない。\n"
+      "            長時間動かすとメモリが増えるため切り分け以外の用途では使わない）。\n"
+      "            no-gpu は GPU API を使わず即 Done（借用の返却だけ。いずれも ACK 経路は同じ）\n"
+      "            --mem-log=<path> は 1 秒周期のメモリ CSV（計測用。既定は出さない）\n"
       "            --fail-after=N は検証用の人為的非ゼロ終了フック（既定 0=無効）\n"
+      "            --inject-unconfirmed=N は N 件目の Offer を完了未確認として扱う\n"
+      "            検証フック（既定 0=無効。Done を送らず終了 2。import 資源は破棄しない）\n"
+      "            --delay-ms=N は 1 フレームの処理前に N ミリ秒待つ検証フック（既定 0=無効）\n"
       "  --help    この表示\n",
       argv0);
 }
@@ -29,8 +39,13 @@ bool StartsWith(const char* s, const char* prefix) {
 int RunTransferArgs(int argc, char** argv) {
   std::string pipe;
   bool verify = true;
+  bool gpu_check = true;
   int seconds = 0;
   int fail_after = 0;
+  int inject_unconfirmed = 0;
+  int delay_ms = 0;
+  std::string mode = "vulkan";
+  std::string mem_log;
   for (int i = 2; i < argc; ++i) {
     if (StartsWith(argv[i], "--pipe=")) {
       pipe = argv[i] + std::strlen("--pipe=");
@@ -38,6 +53,10 @@ int RunTransferArgs(int argc, char** argv) {
       verify = true;
     } else if (std::strcmp(argv[i], "--no-verify") == 0) {
       verify = false;
+    } else if (std::strcmp(argv[i], "--gpu-check") == 0) {
+      gpu_check = true;
+    } else if (std::strcmp(argv[i], "--no-gpu-check") == 0) {
+      gpu_check = false;
     } else if (StartsWith(argv[i], "--seconds=")) {
       seconds = std::atoi(argv[i] + std::strlen("--seconds="));
       if (seconds < 0) {
@@ -49,6 +68,30 @@ int RunTransferArgs(int argc, char** argv) {
       if (fail_after < 0) {
         fail_after = 0;
       }
+    } else if (StartsWith(argv[i], "--inject-unconfirmed=")) {
+      // 検証用の完了未確認フック。既定 0=無効。通常経路では使わない。
+      inject_unconfirmed = std::atoi(argv[i] + std::strlen("--inject-unconfirmed="));
+      if (inject_unconfirmed < 0) {
+        inject_unconfirmed = 0;
+      }
+    } else if (StartsWith(argv[i], "--delay-ms=")) {
+      // 検証用の consumer 遅延フック。既定 0=無効。通常経路では使わない。
+      delay_ms = std::atoi(argv[i] + std::strlen("--delay-ms="));
+      if (delay_ms < 0) {
+        delay_ms = 0;
+      }
+    } else if (StartsWith(argv[i], "--mode=")) {
+      // 診断モード（既定 vulkan=Vulkan 経路）。不正値は受付時に落とす。
+      mode = argv[i] + std::strlen("--mode=");
+      if (mode != "vulkan" && mode != "d3d-open-only" && mode != "no-gpu") {
+        xrift::Error("不明な --mode=%s（vulkan / d3d-open-only / no-gpu のいずれか）",
+                     mode.c_str());
+        PrintHelp(argv[0]);
+        return 1;
+      }
+    } else if (StartsWith(argv[i], "--mem-log=")) {
+      // 1 秒周期のメモリ CSV（計測用。既定は出さない）。
+      mem_log = argv[i] + std::strlen("--mem-log=");
     } else {
       xrift::Error("不明な引数: %s", argv[i]);
       PrintHelp(argv[0]);
@@ -60,7 +103,8 @@ int RunTransferArgs(int argc, char** argv) {
     PrintHelp(argv[0]);
     return 1;
   }
-  return xrift::transfer::RunTransfer(pipe, verify, seconds, fail_after);
+  return xrift::transfer::RunTransfer(pipe, verify, seconds, fail_after, gpu_check,
+                                        inject_unconfirmed, delay_ms, mode, mem_log);
 }
 
 }  // namespace

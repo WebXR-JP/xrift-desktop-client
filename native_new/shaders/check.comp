@@ -1,0 +1,168 @@
+#version 450
+
+// M1b 全画面 GPU 検査の compute シェーダ。
+// import した共有テクスチャをサンプルし、1 スレッド = 1 タイル (16x16) で検査する。
+// 画像全体は CPU に戻さない。結果 (176 バイト) だけを readback する。
+//
+// 検査パターン（harness/electron/index.html と厳密に一致させること）:
+//   c = (f * 2654435761u) ^ (tx * 40503u) ^ (ty * 2246822519u)  // uint32 ラップ
+//   R = c & 0xFF, G = (c >> 8) & 0xFF, B = (c >> 16) & 0xFF, A = 255
+//   タイル内は全画素同色。tx = x / 16, ty = y / 16 は整数除算であり丸め誤差は無い。
+// 予約領域（タイルパターンを上書きする。検査では期待値を切り替える）:
+//   フレーム番号ブロック: (64,64) から 32x32。bit b (0..15) は
+//     x = 64 + (b % 8) * 4 + [0..3], y = 64 + (b / 8) * 4 + [0..3] の 4x4 セル。
+//     1 = 白、0 = 黒。セル内は単色であること。
+//   4 隅の 64x64: 左上 = 赤、右上 = 緑、左下 = 青、右下 = 白。
+//
+// 不一致は atomicAdd で数え、最初の 8 件だけ詳細を記録する。
+// 種別: 0 = タイル不一致、1 = フレーム番号セルの非単色、2 = 隅ブロックの不一致。
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// 自前イメージへの結合サンプラ。texelFetch で読むためフィルタは無視される。
+layout(set = 0, binding = 0) uniform sampler2D u_image;
+
+struct CheckRecord {
+  uint x;
+  uint y;
+  uint expected;
+  uint actual;
+  uint kind;
+};
+
+// std430。ホスト側 (gpu_check.h の Report) と配置を一致させること。
+// 先頭 3 ワードの直後に記録配列が来る（どちらも 4 バイト整列のため詰め物は要らない）。
+layout(set = 0, binding = 1, std430) buffer CheckResult {
+  uint mismatch_count;
+  uint decoded_frame;
+  uint checked_tiles;
+  CheckRecord records[8];
+} u_result;
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+} u_pc;
+
+const uint kTile = 16u;
+const uint kCorner = 64u;
+const uint kFrameX = 64u;
+const uint kFrameY = 64u;
+const uint kFrameBlock = 32u;
+const uint kMaxRecords = 8u;
+
+// タイルハッシュ。uint 演算は 32bit でラップすることが GLSL で保証される。
+// WebGPU (WGSL) 側も u32 演算であり、同じ入力には同じ結果になる。
+uint TileHash(uint f, uint tx, uint ty) {
+  return (f * 2654435761u) ^ (tx * 40503u) ^ (ty * 2246822519u);
+}
+
+// 白 (1,1,1) を 1、黒 (0,0,0) を 0 と読む。中間値は出ない想定であり、
+// 境界 0.5 で二値化する。
+uint BitOf(vec4 c) {
+  float v = (c.r + c.g + c.b) / 3.0;
+  return v > 0.5 ? 1u : 0u;
+}
+
+uvec4 ToU8(vec4 c) {
+  return uvec4(uint(c.r * 255.0 + 0.5), uint(c.g * 255.0 + 0.5),
+               uint(c.b * 255.0 + 0.5), uint(c.a * 255.0 + 0.5));
+}
+
+// R を下位バイトに詰める。ホスト側の PackColor と同じ並びであること。
+uint PackColor(uvec3 rgb, uint a) {
+  return rgb.r | (rgb.g << 8u) | (rgb.b << 16u) | (a << 24u);
+}
+
+void ReportMismatch(uint x, uint y, uint expected, uint actual, uint kind) {
+  uint idx = atomicAdd(u_result.mismatch_count, 1u);
+  if (idx < kMaxRecords) {
+    u_result.records[idx].x = x;
+    u_result.records[idx].y = y;
+    u_result.records[idx].expected = expected;
+    u_result.records[idx].actual = actual;
+    u_result.records[idx].kind = kind;
+  }
+}
+
+bool InFrameBlock(uint x, uint y) {
+  return x >= kFrameX && x < kFrameX + kFrameBlock && y >= kFrameY &&
+         y < kFrameY + kFrameBlock;
+}
+
+void main() {
+  uint w = u_pc.width;
+  uint h = u_pc.height;
+  uint tilesX = (w + kTile - 1u) / kTile;
+  uint tilesY = (h + kTile - 1u) / kTile;
+  uint tx = gl_GlobalInvocationID.x;
+  uint ty = gl_GlobalInvocationID.y;
+  if (tx >= tilesX || ty >= tilesY) {
+    return;
+  }
+  atomicAdd(u_result.checked_tiles, 1u);
+
+  // フレーム番号の復号。各スレッドが独立に復号するため共有メモリもバリアも要らない。
+  // 各セルは 4 隅を読んで単色であることを確認する（ティアリング・破損の検出）。
+  uint f = 0u;
+  bool cellBroken = false;
+  for (uint b = 0u; b < 16u; ++b) {
+    uint bx = kFrameX + (b % 8u) * 4u;
+    uint by = kFrameY + (b / 8u) * 4u;
+    uint b0 = BitOf(texelFetch(u_image, ivec2(int(bx), int(by)), 0));
+    uint b1 = BitOf(texelFetch(u_image, ivec2(int(bx + 3u), int(by)), 0));
+    uint b2 = BitOf(texelFetch(u_image, ivec2(int(bx), int(by + 3u)), 0));
+    uint b3 = BitOf(texelFetch(u_image, ivec2(int(bx + 3u), int(by + 3u)), 0));
+    if (b1 != b0 || b2 != b0 || b3 != b0) {
+      cellBroken = true;
+    }
+    f |= (b0 << b);
+  }
+  // 復号結果の書き込みは (0,0) の 1 スレッドだけが行う。
+  if (tx == 0u && ty == 0u) {
+    u_result.decoded_frame = f;
+    if (cellBroken) {
+      ReportMismatch(kFrameX, kFrameY, 0u, 0u, 1u);
+    }
+  }
+
+  // タイル中心の 1 画素を期待値と比較する。端の欠けタイルは画像内に寄せる。
+  // 期待色は中心画素の位置で決める（予約領域との重なりを画素単位で判定する）。
+  uint cx = tx * kTile + 8u;
+  uint cy = ty * kTile + 8u;
+  if (cx >= w) {
+    cx = w - 1u;
+  }
+  if (cy >= h) {
+    cy = h - 1u;
+  }
+  if (InFrameBlock(cx, cy)) {
+    return;
+  }
+
+  uint kind = 0u;
+  uvec3 expRgb;
+  if (cx < kCorner && cy < kCorner) {
+    expRgb = uvec3(255u, 0u, 0u);
+    kind = 2u;
+  } else if (cx >= w - kCorner && cy < kCorner) {
+    expRgb = uvec3(0u, 255u, 0u);
+    kind = 2u;
+  } else if (cx < kCorner && cy >= h - kCorner) {
+    expRgb = uvec3(0u, 0u, 255u);
+    kind = 2u;
+  } else if (cx >= w - kCorner && cy >= h - kCorner) {
+    expRgb = uvec3(255u, 255u, 255u);
+    kind = 2u;
+  } else {
+    uint qx = cx / kTile;
+    uint qy = cy / kTile;
+    uint c = TileHash(f, qx, qy);
+    expRgb = uvec3(c & 255u, (c >> 8u) & 255u, (c >> 16u) & 255u);
+    kind = 0u;
+  }
+  uvec4 act = ToU8(texelFetch(u_image, ivec2(int(cx), int(cy)), 0));
+  if (expRgb.r != act.r || expRgb.g != act.g || expRgb.b != act.b || act.a != 255u) {
+    ReportMismatch(cx, cy, PackColor(expRgb, 255u), PackColor(act.rgb, act.a), kind);
+  }
+}

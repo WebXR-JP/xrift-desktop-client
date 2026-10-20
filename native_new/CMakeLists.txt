@@ -21,10 +21,58 @@ add_executable(xrift_new
   src/gfx/clear_pass.cpp
   src/transfer/pipe_client.cpp
   src/transfer/shared_texture.cpp
+  src/transfer/mem_log.cpp
+  src/transfer/gpu_check.cpp
   src/transfer/transfer_app.cpp
 )
 
-target_include_directories(xrift_new PRIVATE src)
+# M1b 全画面 GPU 検査の compute シェーダ（shaders/check.comp）。
+# glslc があればビルド時に SPIR-V を生成し、無ければコミット済みの .spv を使う。
+# どちらも Vulkan SDK へのリンクは生まない（glslc は任意の外部ツール扱い）。
+# 再現ビルド用に強制する場合は -DXRIFT_USE_COMMITTED_SPV=ON を付ける。
+option(XRIFT_USE_COMMITTED_SPV "コミット済みの check.comp.spv を使い glslc を使わない" OFF)
+set(XRIFT_CHECK_COMP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/check.comp")
+set(XRIFT_CHECK_SPV_COMMITTED "${CMAKE_CURRENT_SOURCE_DIR}/shaders/check.comp.spv")
+set(XRIFT_CHECK_SPV_H "${CMAKE_CURRENT_BINARY_DIR}/check_comp_spv.h")
+if(NOT XRIFT_USE_COMMITTED_SPV)
+  find_program(XRIFT_GLSLC glslc)
+endif()
+if(XRIFT_GLSLC)
+  # 生成と埋め込みは 1 つのカスタムコマンドに直列化する。
+  # 分割すると並列ビルドで埋め込みが先走ることがある。
+  # --target-env=vulkan1.0 を付ける。転送のデバイスはランタイム要件の最小版
+  # （実測 1.0）で作るため、1.1 以降の SPIR-V 版は vkCreateComputePipelines で弾かれる。
+  # 検査に使う機能は 1.0 の core だけである。
+  set(XRIFT_CHECK_SPV "${CMAKE_CURRENT_BINARY_DIR}/check.comp.spv")
+  add_custom_command(
+    OUTPUT "${XRIFT_CHECK_SPV_H}"
+    COMMAND "${XRIFT_GLSLC}" --target-env=vulkan1.0 -O "${XRIFT_CHECK_COMP_SRC}" -o "${XRIFT_CHECK_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -DSPV_IN=${XRIFT_CHECK_SPV} -DHEADER_OUT=${XRIFT_CHECK_SPV_H}
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpvToHeader.cmake"
+    DEPENDS "${XRIFT_CHECK_COMP_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpvToHeader.cmake"
+    COMMENT "glslc で M1b 検査シェーダを生成・埋め込み"
+    VERBATIM)
+else()
+  if(NOT EXISTS "${XRIFT_CHECK_SPV_COMMITTED}")
+    message(FATAL_ERROR
+      "glslc が無く、コミット済みの shaders/check.comp.spv も無い。"
+      "Vulkan SDK の glslc で shaders/check.comp から生成してコミットすること"
+      "（README の「シェーダの再生成」を参照）。")
+  endif()
+  add_custom_command(
+    OUTPUT "${XRIFT_CHECK_SPV_H}"
+    COMMAND "${CMAKE_COMMAND}" -DSPV_IN=${XRIFT_CHECK_SPV_COMMITTED}
+      -DHEADER_OUT=${XRIFT_CHECK_SPV_H}
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpvToHeader.cmake"
+    DEPENDS "${XRIFT_CHECK_SPV_COMMITTED}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpvToHeader.cmake"
+    COMMENT "コミット済み SPIR-V から M1b 検査シェーダを埋め込み"
+    VERBATIM)
+endif()
+# SPIR-V を C 配列ヘッダへ変換して埋め込む。実行時に .spv ファイルを探さない。
+add_custom_target(xrift_check_spv DEPENDS "${XRIFT_CHECK_SPV_H}")
+add_dependencies(xrift_new xrift_check_spv)
+
+target_include_directories(xrift_new PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
 
 target_compile_definitions(xrift_new PRIVATE
   VK_NO_PROTOTYPES
@@ -35,7 +83,8 @@ target_compile_definitions(xrift_new PRIVATE
 if(WIN32)
   target_compile_definitions(xrift_new PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX VK_USE_PLATFORM_WIN32_KHR)
   # 転送の D3D11 照合（OpenSharedResource1）に使う。Vulkan 本体は動的読み込みのまま。
-  target_link_libraries(xrift_new PRIVATE d3d11 dxgi dxguid)
+  # psapi はメモリログの GetProcessMemoryInfo に使う。
+  target_link_libraries(xrift_new PRIVATE d3d11 dxgi dxguid psapi)
 endif()
 
 if(MSVC)

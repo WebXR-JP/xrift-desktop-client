@@ -189,6 +189,9 @@ VulkanContext::VulkanContext(const xr::Instance& xr,
     device_exts.push_back(name.c_str());
   }
   Info("VkDevice 拡張: %u 件", static_cast<unsigned>(device_ext_names.size()));
+  for (const std::string& name : device_ext_names) {
+    Info("  %s", name.c_str());
+  }
 
   // 7. グラフィックス対応の queue family を選び、空の feature で VkDevice を作る。
   const std::vector<vk::QueueFamilyProperties> families =

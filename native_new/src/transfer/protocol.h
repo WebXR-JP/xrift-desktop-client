@@ -19,9 +19,11 @@ constexpr uint16_t kTypeDone = 2;   // exe → main。GPU コピー完了（ま�
 
 constexpr uint32_t kFormatBgra8Unorm = 0;  // OSR pixelFormat "bgra" に対応。
 
-constexpr uint32_t kStatusOk = 0;           // コピー成功（検証付きの場合は検証も成功）。
+constexpr uint32_t kStatusOk = 0;           // コピー成功（検査付きの場合は検査も成功）。
 constexpr uint32_t kStatusCopyFailed = 1;   // import またはコピーに失敗した。
-constexpr uint32_t kStatusVerifyFailed = 2;  // コピーは成功したが画素検証に失敗した。
+// コピーは成功したが画素検査に失敗した。--verify の部分検証と --gpu-check の
+// 全画面 GPU 検査のどちらかの不一致である（内訳は exe 側の統計に出る）。
+constexpr uint32_t kStatusVerifyFailed = 2;
 
 // GPU 完了を確認できない失敗（フェンス待ち失敗・device lost・waitIdle 失敗）の
 // 内部合図。線路上には出さない。timeout は返却許可ではないため、Done を送らず

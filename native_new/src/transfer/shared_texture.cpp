@@ -21,9 +21,36 @@
 
 #include "common/log.h"
 #include "common/xr_result.h"
+#include "transfer/mem_log.h"
 #include "transfer/protocol.h"
 
 namespace xrift::transfer {
+
+TransferMode ParseTransferMode(const std::string& mode) {
+  if (mode == "vulkan") {
+    return TransferMode::Vulkan;
+  }
+  if (mode == "d3d-open-only") {
+    return TransferMode::D3dOpenOnly;
+  }
+  if (mode == "no-gpu") {
+    return TransferMode::NoGpu;
+  }
+  throw std::runtime_error("不明な --mode=" + mode +
+                           "（vulkan / d3d-open-only / no-gpu のいずれか）");
+}
+
+const char* TransferModeName(TransferMode mode) {
+  switch (mode) {
+    case TransferMode::Vulkan:
+      return "vulkan";
+    case TransferMode::D3dOpenOnly:
+      return "d3d-open-only";
+    case TransferMode::NoGpu:
+      return "no-gpu";
+  }
+  return "不明";
+}
 namespace {
 
 // 転送に必須のデバイス拡張。存在しなければ明確なエラーで停止する。
@@ -222,12 +249,18 @@ TransferSession::TransferSession(const Options& options) : options_(options), vu
   // 必須のデバイス拡張の有無は VulkanContext が vkCreateDevice の前に名指しで確認する。
   // ここでは物理デバイスの API 版だけを確認する。
 
-  // D3D11 照合用デバイスを作る。Vulkan 物理デバイスの deviceLUID に一致する
-  // DXGI アダプタを選ぶ。WARP への退避や既定アダプタでの生成はしない。
+  // D3D11 照合用デバイスは d3d-open-only の診断時にだけ作る。既定の Vulkan 経路では
+  // D3D11CreateDevice すら呼ばない（毎フレームの OpenSharedResource1 が実測で
+  // 持続不能なため。約 +16MB/分。詳細は shared_texture.h の TransferMode を参照）。
   // 別 GPU で開けてしまうと同一 GPU の検証にならないため、失敗はそのまま返す。
+  // no-gpu モードでは GPU API を一切使わないため作らない（帰属切り分けの起点）。
+  // Vulkan 経路では D3D11 を一切使わない。Offer の寸法・形式を信じて Vulkan 側だけで
+  // import する。
   ID3D11Device1* dev1 = nullptr;
   ID3D11DeviceContext* ctx = nullptr;
-  CreateD3D11DeviceOnVulkanAdapter(physical, &dev1, &ctx);
+  if (options_.mode == TransferMode::D3dOpenOnly) {
+    CreateD3D11DeviceOnVulkanAdapter(physical, &dev1, &ctx);
+  }
   d3dDevice_ = dev1;
   d3dContext_ = ctx;
 
@@ -252,6 +285,26 @@ TransferSession::TransferSession(const Options& options) : options_(options), vu
   fence_info.sType = vk::StructureType::eFenceCreateInfo;
   InvokeVk("vkCreateFence", [&] { fence_ = vk::raii::Fence(device, fence_info); });
 
+  // M1b 全画面 GPU 検査は起動時に確定する。--no-gpu-check では作らず、
+  // 無効経路に compute 由来の負荷も失敗要因も残さない。
+  // 診断モード（d3d-open-only / no-gpu）では Vulkan を使わないため作らない。
+  if (options_.verify) {
+    Info("部分検証 (--verify) は有効。デバッグ用の範囲に隔離した読み戻しである");
+  }
+  if (options_.gpuCheck && options_.mode == TransferMode::Vulkan) {
+    checker_ = std::make_unique<GpuChecker>(vulkan_);
+  }
+  if (options_.mode == TransferMode::D3dOpenOnly) {
+    Warn("--mode=d3d-open-only は D3D11 Open 経路の診断専用。長時間動かすとメモリが増える"
+         "（実測約 +16MB/分）ため、切り分け以外の用途では使わないこと");
+  }
+  if (options_.mode == TransferMode::NoGpu) {
+    Info("診断モード --mode=no-gpu（Vulkan import/コピー/検査は行わない）");
+  }
+  if (options_.mode == TransferMode::Vulkan) {
+    Info("--mode=vulkan（既定。D3D11 を使わず Offer 寸法で Vulkan import/コピー/検査を行う）");
+  }
+
   Info("転送セッション開始: GPU=%s", vulkan_.gpuName().c_str());
 }
 
@@ -270,6 +323,21 @@ TransferSession::~TransferSession() {
   if (!idle_ok && (unconfirmedImage_ || unconfirmedMemory_)) {
     unconfirmedImage_.release();
     unconfirmedMemory_.release();
+    // 意図的リークのため生存計数は残す（破棄していないことを正直に表す）。
+    // プロセス終了時の OS/ドライバ回収に委ねる。
+  }
+  if (idle_ok) {
+    // GPU が触っていないことが確定したため、残っていれば通常破棄する。
+    ReleaseUnconfirmedCounted();
+  }
+  // 自前イメージの破棄に合わせて生存計数を落とす（以降は raii の逆順破棄）。
+  if (ownImageBytes_ > 0) {
+    TrackVkImageDestroy(ownImageBytes_);
+    ownImageBytes_ = 0;
+  }
+  if (ownMemoryBytes_ > 0) {
+    TrackVkMemoryFree(ownMemoryBytes_);
+    ownMemoryBytes_ = 0;
   }
   if (d3dContext_ != nullptr) {
     static_cast<ID3D11DeviceContext*>(d3dContext_)->Release();
@@ -309,11 +377,37 @@ void TransferSession::ValidateHandle(uint64_t remoteHandle, uint32_t width, uint
   }
 }
 
+void TransferSession::ReleaseUnconfirmedCounted() {
+  const bool held = (unconfirmedImage_ != nullptr) || (unconfirmedMemory_ != nullptr);
+  if (unconfirmedMemory_) {
+    TrackVkMemoryFree(unconfirmedMemoryBytes_);
+    unconfirmedMemory_.reset();
+    unconfirmedMemoryBytes_ = 0;
+  }
+  if (unconfirmedImage_) {
+    TrackVkImageDestroy(unconfirmedImageBytes_);
+    unconfirmedImage_.reset();
+    unconfirmedImageBytes_ = 0;
+  }
+  if (held) {
+    TrackImportFree();
+  }
+}
+
 void TransferSession::EnsureOwnImage(uint32_t width, uint32_t height) {
   if (ownDefined_ && ownWidth_ == width && ownHeight_ == height) {
     return;
   }
   const vk::raii::Device& device = vulkan_.device();
+  // 作り直し前に生存計数を落とす（バイト数は引き当て分と一致させる）。
+  if (ownImageBytes_ > 0) {
+    TrackVkImageDestroy(ownImageBytes_);
+    ownImageBytes_ = 0;
+  }
+  if (ownMemoryBytes_ > 0) {
+    TrackVkMemoryFree(ownMemoryBytes_);
+    ownMemoryBytes_ = 0;
+  }
   ownMemory_.clear();
   ownImage_.clear();
   ownDefined_ = false;
@@ -336,6 +430,8 @@ void TransferSession::EnsureOwnImage(uint32_t width, uint32_t height) {
   // 所要量の問い合わせは 1.0 系の vkGetImageMemoryRequirements を使う。
   // DeviceImageMemoryRequirements 経由（1.3 / maintenance4 相当）は使わない。
   const vk::MemoryRequirements req = ownImage_.getMemoryRequirements();
+  ownImageBytes_ = req.size;
+  TrackVkImageCreate(req.size);
   const vk::PhysicalDeviceMemoryProperties mem_props =
       vulkan_.physicalDevice().getMemoryProperties();
   int32_t index = -1;
@@ -363,15 +459,21 @@ void TransferSession::EnsureOwnImage(uint32_t width, uint32_t height) {
   alloc.allocationSize = req.size;
   alloc.memoryTypeIndex = static_cast<uint32_t>(index);
   InvokeVk("vkAllocateMemory(自前)", [&] { ownMemory_ = vk::raii::DeviceMemory(device, alloc); });
+  ownMemoryBytes_ = alloc.allocationSize;
+  TrackVkMemoryAlloc(alloc.allocationSize);
   InvokeVk("vkBindImageMemory(自前)",
            [&] { ownImage_.bindMemory(*ownMemory_, 0); });
   ownWidth_ = width;
   ownHeight_ = height;
   ownDefined_ = false;
+  // GPU 検査の結び付けは作り直し時だけ行う。同寸法の再利用では結び付けが残る。
+  if (checker_) {
+    checker_->BindImage(*ownImage_, width, height);
+  }
 }
 
 uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, uint32_t height,
-                                      Timings* timings) {
+                                      Timings* timings, GpuChecker::Report* gpuReport) {
   Timings local{};
   const uint64_t t0 = NowUs();
   const vk::raii::Device& device = vulkan_.device();
@@ -381,6 +483,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     // 受領した複製ハンドルは受領直後から単一の所有ガードで保持し、全経路で閉じる。
     // import 前の失敗（照合・生成の失敗）でも漏らさない。
     DuplicatedHandle owned(remoteHandle);
+    ++offerCount_;
 
     // 前回の完了未確認資源が残っている場合の新規受付は誤りである。
     // 古い保留を上書き破棄するより保持を優先し、ACK せず受付停止に回す。
@@ -388,8 +491,30 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
       throw UnconfirmedCompletion("前回の完了未確認 import 資源が残っているため新規受付を停止");
     }
 
-    // 1. D3D11 照合。別プロセス複製が有効であることの証拠になる（M1 段階 1）。
-    ValidateHandle(remoteHandle, width, height);
+    // 診断モードの分岐。借用台帳・ACK・release は呼び出し側で同一経路を通すため、
+    // ここでは Done の内容（kStatusOk）だけを返し、受領ハンドルは所有ガードが閉じる。
+    if (options_.mode == TransferMode::NoGpu) {
+      if (timings != nullptr) {
+        *timings = local;
+      }
+      return kStatusOk;
+    }
+    if (options_.mode == TransferMode::D3dOpenOnly) {
+      ValidateHandle(remoteHandle, width, height);
+      local.importUs = NowUs() - t0;
+      if (timings != nullptr) {
+        *timings = local;
+      }
+      return kStatusOk;
+    }
+
+    // 1. D3D11 照合は行わない。Vulkan 経路では Offer の width/height/format を信じて
+    // import し、妥当性は Vulkan 側の import・コピーと全画面 GPU 検査で担保する。
+    // 不正な寸法・形式は失敗側（kStatusCopyFailed / kStatusVerifyFailed）に回り、
+    // 黙って成功にはならない。毎フレームの OpenSharedResource1 を避けるのは、
+    // 実測で持続不能（4096x2048・90Hz で約 +16MB/分）のに対し Vulkan 経路は
+    // 10 分で平坦（Private Bytes 96.2→97.2MB、imports=frees）なためである。
+    // 詳細は shared_texture.h の TransferMode を参照。
 
     // 2. import 用イメージの生成。実 Desc（Offer の codedSize）に合わせ、決め打ちしない。
     vk::ExternalMemoryImageCreateInfo external{};
@@ -480,6 +605,12 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
              [&] { import_memory = vk::raii::DeviceMemory(device, alloc); });
     InvokeVk("vkBindImageMemory(import)",
              [&] { import_image.bindMemory(*import_memory, 0); });
+    // bind 完了で import 1 件の確保対が成立した。生存計数と累計を更新する。
+    unconfirmedImageBytes_ = req.size;
+    unconfirmedMemoryBytes_ = alloc.allocationSize;
+    TrackVkImageCreate(req.size);
+    TrackVkMemoryAlloc(alloc.allocationSize);
+    TrackImport();
     local.importUs = NowUs() - t0;
 
     // import 資源は submit 以降の失敗（完了未確認）に備えて保留メンバへ移す。
@@ -490,6 +621,19 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     unconfirmedImage_ = std::make_unique<vk::raii::Image>(std::move(import_image));
     unconfirmedMemory_ = std::make_unique<vk::raii::DeviceMemory>(std::move(import_memory));
     const vk::Image import_view = **unconfirmedImage_;
+
+    // 検証用の障害注入フック（--inject-unconfirmed=N）。N 件目の Offer で完了未確認を
+    // 強制する。実際のフェンス失敗と同じ UnconfirmedCompletion 例外で同じ catch 経路
+    // （kStatusNoAck→Done なし→受付停止→終了 2）を通すため、別経路は作らない。
+    // 注入点を import 資源の保留直後に置くのは、実際の失敗と同じく資源を破棄せず保持する
+    // 扱いにするためである（成功後の Done 直前で偽装すると資源は既に解放済みになり、
+    // 実経路と状態が一致しなくなる）。既定 0 は未到達である。
+    if (options_.injectUnconfirmed > 0 &&
+        offerCount_ == static_cast<uint64_t>(options_.injectUnconfirmed)) {
+      throw UnconfirmedCompletion("検証フック --inject-unconfirmed=" +
+                                  std::to_string(options_.injectUnconfirmed) +
+                                  " に到達したため完了未確認として扱う");
+    }
 
     // 5. 自前イメージの用意とコピー。完了はフェンスで待ち、完了後に ACK する。
     EnsureOwnImage(width, height);
@@ -619,23 +763,53 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
         throw UnconfirmedCompletion(std::string("GPU コピーの待避 waitIdle に失敗: ") + e.what());
       }
       // waitIdle 成功時は GPU が触っていないことが確定したため、保留資源を破棄してよい。
-      unconfirmedImage_.reset();
-      unconfirmedMemory_.reset();
+      ReleaseUnconfirmedCounted();
       throw UnconfirmedCompletion("GPU コピーの完了待ちが 2 秒でタイムアウト");
     }
     ownDefined_ = true;
     local.copyUs = NowUs() - t1;
     // コピー完了を確認できたため、保留していた import 資源を即座に破棄する（従来どおり）。
-    unconfirmedImage_.reset();
-    unconfirmedMemory_.reset();
+    ReleaseUnconfirmedCounted();
 
-    // 6. 検証（--verify の範囲に隔離）。画像全体は読まない。
-    // 本番経路に readback を入れないこと。M2 以降のサンプリングは GPU 内で行う。
+    // 6. 全画面 GPU 検査（--gpu-check の範囲に隔離）。画像全体は読まず、
+    // 176 バイトの結果バッファだけを読む。M2 以降の本番経路にも readback を入れない。
+    // 不一致は画素検証の失敗として Done に載せる（kStatusVerifyFailed）。
+    GpuChecker::Report check_report{};
+    if (checker_) {
+      const uint64_t t15 = NowUs();
+      try {
+        check_report = checker_->Check(width, height);
+        local.checkRan = true;
+      } catch (const UnconfirmedCheck& e) {
+        // 検証 submit 後の失敗は完了未確認として上位へ伝える。
+        // timeout は返却許可ではない。
+        throw UnconfirmedCompletion(std::string("GPU検査の完了が未確認: ") + e.what());
+      }
+      local.checkUs = NowUs() - t15;
+    }
+    if (gpuReport != nullptr) {
+      *gpuReport = check_report;
+    }
     uint32_t status = kStatusOk;
+    if (checker_ && check_report.mismatchCount > 0) {
+      const GpuChecker::Record& first = check_report.records[0];
+      Warn("GPU検査: 不一致 %u 件（復号=%u タイル=%u）。先頭: x=%u y=%u 期待=%08x 実際=%08x 種別=%s",
+           static_cast<unsigned>(check_report.mismatchCount),
+           static_cast<unsigned>(check_report.decodedFrame),
+           static_cast<unsigned>(check_report.checkedTiles), first.x, first.y, first.expected,
+           first.actual, MismatchKindName(first.kind));
+      status = kStatusVerifyFailed;
+    }
+
+    // 7. 部分検証（--verify の範囲に隔離）。画像全体は読まない。
+    // 本番経路に readback を入れないこと。M2 以降のサンプリングは GPU 内で行う。
     if (options_.verify) {
       const uint64_t t2 = NowUs();
-      status = VerifyLocked(width, height);
+      const uint32_t verify_status = VerifyLocked(width, height);
       local.verifyUs = NowUs() - t2;
+      if (verify_status != kStatusOk) {
+        status = verify_status;
+      }
     }
     if (timings != nullptr) {
       *timings = local;
@@ -656,8 +830,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     return kStatusNoAck;
   } catch (const std::exception& e) {
     // submit 前の失敗（GPU は触っていない）のため、保留資源があれば破棄してよい。
-    unconfirmedImage_.reset();
-    unconfirmedMemory_.reset();
+    ReleaseUnconfirmedCounted();
     Warn("Offer 処理に失敗: %s", e.what());
     if (timings != nullptr) {
       *timings = local;
@@ -905,14 +1078,41 @@ uint32_t TransferSession::VerifyLocked(uint32_t width, uint32_t height) {
 
 namespace xrift::transfer {
 
+TransferMode ParseTransferMode(const std::string& mode) {
+  if (mode == "vulkan") {
+    return TransferMode::Vulkan;
+  }
+  if (mode == "d3d-open-only") {
+    return TransferMode::D3dOpenOnly;
+  }
+  if (mode == "no-gpu") {
+    return TransferMode::NoGpu;
+  }
+  throw std::runtime_error("不明な --mode=" + mode);
+}
+
+const char* TransferModeName(TransferMode mode) {
+  switch (mode) {
+    case TransferMode::Vulkan:
+      return "vulkan";
+    case TransferMode::D3dOpenOnly:
+      return "d3d-open-only";
+    case TransferMode::NoGpu:
+      return "no-gpu";
+  }
+  return "不明";
+}
+
 TransferSession::TransferSession(const Options&) : instance_(), vulkan_(instance_) {
   throw std::runtime_error("共有テクスチャ転送は Windows のみ（Linux は将来対応）");
 }
 TransferSession::~TransferSession() = default;
-uint32_t TransferSession::ProcessOffer(uint64_t, uint32_t, uint32_t, Timings*) {
+uint32_t TransferSession::ProcessOffer(uint64_t, uint32_t, uint32_t, Timings*,
+                                         GpuChecker::Report*) {
   throw std::runtime_error("共有テクスチャ転送は Windows のみ（Linux は将来対応）");
 }
 void TransferSession::EnsureOwnImage(uint32_t, uint32_t) {}
+void TransferSession::ReleaseUnconfirmedCounted() {}
 void TransferSession::ValidateHandle(uint64_t, uint32_t, uint32_t) {}
 uint32_t TransferSession::VerifyLocked(uint32_t, uint32_t) { return 0; }
 

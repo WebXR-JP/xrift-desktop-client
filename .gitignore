@@ -22,3 +22,4 @@ native_new/transfer-addon/build/
 native_new/harness/electron/run-out.txt
 native_new/harness/electron/run-err.txt
 native_new/harness/electron/harness-stats.json
+native_new/harness/electron/logs/

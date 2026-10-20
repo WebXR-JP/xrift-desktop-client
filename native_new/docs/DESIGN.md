@@ -201,6 +201,7 @@ stateDiagram-v2
 - 色の最終確認: 二重符号化の有無は要判断
 - 追加 controller profile の保証範囲、Linux の輸送実装は後決めでよい
 - 同期保証、旧世代の隔離、別 exe / XR 指定 GPU の import は未検証として残せるが、完成条件から除外しない
+- 輸送の hot path に Windows の D3D11 `OpenSharedResource1` を置かない（実測で約 +16MB/分の増加が止まらないため。既定は Vulkan 経路）
 
 ## 実機で確定した事実
 

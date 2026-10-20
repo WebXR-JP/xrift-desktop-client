@@ -25,6 +25,32 @@ const WIN_W = parseInt(arg('width', '4096'), 10) || 4096;
 const WIN_H = parseInt(arg('height', '2048'), 10) || 2048;
 // 検証 5 用: exe へ --fail-after=N を渡し、人為的に非ゼロ終了させる（既定 0=無効）。
 const FAIL_AFTER = Math.max(0, parseInt(arg('fail-after', '0'), 10) || 0);
+// M1b 障害注入フック（既定は全て 0=off）。
+// exe 側: --inject-unconfirmed=N（N 件目を完了未確認として扱う）、--delay-ms=N（consumer 遅延）。
+// harness 側: --drop-done-at=N（N 個目の Done を捨て、ACK 消失を模擬する）。
+const INJECT_UNCONFIRMED = Math.max(0, parseInt(arg('inject-unconfirmed', '0'), 10) || 0);
+const DELAY_MS = Math.max(0, parseInt(arg('delay-ms', '0'), 10) || 0);
+const DROP_DONE_AT = Math.max(0, parseInt(arg('drop-done-at', '0'), 10) || 0);
+// M1b 検査妥当性用: レンダラへ注入フックを渡す（既定は全て 0=off）。
+// N フレーム目だけ描画を壊し、exe 側の GPU 検査が不一致を数えることを確かめる。
+const INJECT_BAD_TILE = Math.max(0, parseInt(arg('inject-bad-tile', '0'), 10) || 0);
+const INJECT_STALE_TILE = Math.max(0, parseInt(arg('inject-stale-tile', '0'), 10) || 0);
+const INJECT_BAD_CORNER = Math.max(0, parseInt(arg('inject-bad-corner', '0'), 10) || 0);
+const INJECT_BAD_BIT = Math.max(0, parseInt(arg('inject-bad-bit', '0'), 10) || 0);
+// exe 側の全画面 GPU 検査。--no-gpu-check で無効化できる（既定 on）。
+const NO_GPU_CHECK = process.argv.includes('--no-gpu-check');
+// 診断モード（既定 vulkan=Vulkan 経路。D3D11 デバイスを作らない）。exe へ --mode として渡す。
+// d3d-open-only は D3D11 Open 経路の診断専用であり、長時間動かすとメモリが増える。
+// 借用台帳・ACK・release はどのモードでも同じ経路を通す。
+const MODE = arg('mode', 'vulkan');
+// exe 側の 1 秒周期メモリ CSV（既定 ''=出さない）。--mem-log=<path> として渡す。
+const EXE_MEM_LOG = arg('mem-log', '');
+if (!['vulkan', 'd3d-open-only', 'no-gpu'].includes(MODE)) {
+  console.error(`unknown --mode=${MODE}（vulkan / d3d-open-only / no-gpu のいずれか）`);
+  process.exitCode = 1;
+  app.whenReady().then(() => app.exit(1));
+  return;
+}
 
 // プロトコル（native_new/src/transfer/protocol.h と同じ配置。64 バイト LE）。
 const MSG_LEN = 64;
@@ -84,16 +110,23 @@ const MAX_HELD = 2;     // 同時保持の上限（処理中 1 + 保留 1）
 let stopping = false;   // 計測終了後。新規 paint は即 release する
 let finished = false;
 const stats = {
-  offers: 0, dones: 0, drops: 0, offerFailures: 0, staleDones: 0,
+  offers: 0, dones: 0, drops: 0, offerFailures: 0, staleDones: 0, droppedDone: 0,
   quarantined: 0, releasedPending: 0, maxHeld: 0,
   statusOk: 0, statusCopyFailed: 0, statusVerifyFailed: 0,
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
   distinctHandles: 0, firstCodedSize: null,
 };
 const handleCounts = new Map();
+// ソースハンドルの初出時刻（複製前の生値 hex -> 初出時刻 ms）。
+// paint の textureInfo.handle.ntHandle の生値（main が見ている値。exe へ送る
+// 複製後の値ではない）を集計し、再利用か毎回新規かの判定材料にする。
+const handleFirstSeen = new Map();
 const paintTimes = [];
 let exeProc = null;
 let socket = null;
+let doneSeq = 0; // 受信した Done の通番（--drop-done-at 用。既定 0=無効）。
+// GPU プロセスの pid（app.getAppMetrics() から取る。GPU メモリ計測との突き合わせ用）。
+let gpuPidStart = null;
 let stopTimer = null;
 let graceTimer = null;
 // 終了コード確定の状態。パイプ close で finish(0) を確定し、後の exe 非ゼロを
@@ -155,6 +188,23 @@ function noteHeld() {
   if (held.size > stats.maxHeld) stats.maxHeld = held.size;
 }
 
+// GPU プロセスの pid を app.getAppMetrics() から取る。取れなければ null。
+// 1 秒周期の GPU メモリ計測（Get-Counter 側）のインスタンス名（pid_XXXX 形式）と
+// 突き合わせるための鍵である。
+function currentGpuPid() {
+  try {
+    const metrics = app.getAppMetrics();
+    const gpu = metrics.find((m) => String(m && m.type).toLowerCase() === 'gpu');
+    if (gpu && typeof gpu.pid === 'number') return gpu.pid;
+    const types = metrics.map((m) => `${m && m.type}:${m && m.pid}`).join(' ');
+    log(`GPU プロセスが見つからない (types=${types})`);
+    return null;
+  } catch (e) {
+    log(`getAppMetrics 失敗: ${e && e.message}`);
+    return null;
+  }
+}
+
 function makeOffer(borrowId, width, height, ntHandle) {
   // 複製して送る。失敗したらその借用だけ release して失敗扱いにする。
   let dup;
@@ -212,6 +262,11 @@ function pumpQueue(meta) {
 
 function onPaint(details) {
   paintTimes.push(Date.now());
+  // GPU プロセスは起動直後にいないことがあるため、初 paint で再取得する。
+  if (gpuPidStart === null) {
+    gpuPidStart = currentGpuPid();
+    if (gpuPidStart !== null) log(`GPU プロセス pid=${gpuPidStart}（初 paint 時に取得）`);
+  }
   const texture = details && details.texture;
   if (!texture) {
     stats.noTexture++;
@@ -246,6 +301,8 @@ function onPaint(details) {
     log(`first codedSize=${coded.width}x${coded.height} pixelFormat=${ti.pixelFormat}`);
   }
   const hex = nt.toString('hex');
+  // 生値（複製前）の集計。重複排除の鍵は main が見ている値そのものである。
+  if (!handleCounts.has(hex)) handleFirstSeen.set(hex, Date.now());
   handleCounts.set(hex, (handleCounts.get(hex) || 0) + 1);
 
   // 新規借用を登録する前に古い保留の release を済ませ、maxHeld が上限を超えない
@@ -312,10 +369,14 @@ function onDone(borrowId, status) {
 
 function maybeFinish() {
   if (!stopping || finished) return;
-  if (inFlight === null && pending === null) {
-    log('全借用の ACK が揃ったためソケットを閉じる');
-    try { socket.end(); } catch { /* 無視 */ }
-  }
+  if (inFlight !== null) return;
+  // 未 offer の保留は転送前 drop と同じ扱いで finish 側が release するため、
+  // inFlight の ACK 揃いだけでソケットを閉じてよい。低速 consumer（--delay-ms）では
+  // 停止時に保留が残るが、pump 停止後は offer されないため待っても解消しない。
+  // 高速な通常経路では停止時に保留は空であり、従来どおりの条件になる。
+  if (socket === null || socket.destroyed) return;
+  log('全借用の ACK が揃ったためソケットを閉じる（未 offer の保留は終了時に返却）');
+  try { socket.end(); } catch { /* 無視 */ }
 }
 
 function finish(code) {
@@ -347,12 +408,35 @@ function finish(code) {
   const q = (p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : 0;
   const total = paintTimes.length > 1 ? paintTimes[paintTimes.length - 1] - paintTimes[0] : 0;
   stats.distinctHandles = handleCounts.size;
+  // ソースハンドル（複製前の生値）の性質。毎フレーム新規か少数再利用かの判定用。
+  // distinctSourceHandles は生値の種類数、sourceNewLast60s は終了時刻の直近 60 秒に
+  // 初出た種類数、sourceNewPer30s は開始起点の 30 秒区切りごとの新規種類数である。
+  const finishNow = Date.now();
+  let sourceNewLast60s = 0;
+  for (const t of handleFirstSeen.values()) {
+    if (finishNow - t <= 60000) sourceNewLast60s++;
+  }
+  const startMs = paintTimes.length > 0 ? paintTimes[0] : finishNow;
+  const nBuckets = Math.max(1, Math.ceil((finishNow - startMs) / 30000));
+  const sourceNewPer30s = new Array(nBuckets).fill(0);
+  for (const t of handleFirstSeen.values()) {
+    const b = Math.min(nBuckets - 1, Math.max(0, Math.floor((t - startMs) / 30000)));
+    sourceNewPer30s[b]++;
+  }
+  stats.distinctSourceHandles = handleCounts.size;
+  stats.sourceNewLast60s = sourceNewLast60s;
+  stats.sourceNewPer30s = sourceNewPer30s;
   const summary = {
     exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
+    mode: MODE, exeMemLog: EXE_MEM_LOG || null,
+    gpuPidStart, gpuPid: currentGpuPid(),
     paints: paintTimes.length,
     fps: total > 0 ? (intervals.length / (total / 1000)) : 0,
     paintIntervalMs: { min: q(0), p50: q(0.5), p95: q(0.95), max: q(1) },
     distinctHandles: handleCounts.size,
+    distinctSourceHandles: handleCounts.size,
+    sourceNewLast60s,
+    sourceNewPer30s,
     ...stats,
   };
   try {
@@ -383,6 +467,7 @@ function finish(code) {
   }
   flushLog();
   log(`harness 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
+      `droppedDone=${stats.droppedDone} ` +
       `ok=${stats.statusOk} copyFail=${stats.statusCopyFailed} verifyFail=${stats.statusVerifyFailed} ` +
       `maxHeld=${stats.maxHeld} quarantine=${stats.quarantined}`);
   flushLog();
@@ -441,8 +526,19 @@ async function createWindow() {
     }
   });
 
-  await win.loadFile(path.join(__dirname, 'index.html'));
-  log('index.html loaded');
+  await win.loadFile(path.join(__dirname, 'index.html'), {
+    query: {
+      badTile: String(INJECT_BAD_TILE),
+      staleTile: String(INJECT_STALE_TILE),
+      badCorner: String(INJECT_BAD_CORNER),
+      badBit: String(INJECT_BAD_BIT),
+    },
+  });
+  log('index.html loaded ' +
+      `(inject badTile=${INJECT_BAD_TILE} staleTile=${INJECT_STALE_TILE} ` +
+      `badCorner=${INJECT_BAD_CORNER} badBit=${INJECT_BAD_BIT})`);
+  gpuPidStart = currentGpuPid();
+  log(`GPU プロセス pid=${gpuPidStart}（app.getAppMetrics() から取得）`);
 
   stopTimer = setTimeout(() => {
     log(`${SECONDS}s 経過。新規 paint の受付を止める`);
@@ -451,7 +547,9 @@ async function createWindow() {
     // inFlight が残れば猶予後に隔離して終了する（timeout を返却許可にしない）。
     graceTimer = setTimeout(() => {
       log('grace 期限切れ。未 ACK を隔離して終了する');
-      finish(3);
+      // 未 ACK が残る猶予切れは隔離（失敗）扱いのため終了 2 にする。ACK 消失の模擬
+      // （--drop-done-at）の期待値である。残債が無ければ従来どおり 3。
+      finish(inFlight !== null ? 2 : 3);
     }, 8000);
   }, SECONDS * 1000);
 }
@@ -461,10 +559,34 @@ function start() {
   // Node の spawn ではできない（引数確定より pid 取得が後になる）ため、
   // 一意性という目的を electron pid で満たす。詳細は README の既知の制約を参照。
   const pipePath = `\\\\.\\pipe\\xrift_m1_${process.pid}`;
-  const exeArgs = ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`];
+  const exeArgs = ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`,
+    `--mode=${MODE}`];
+  exeArgs.push(NO_GPU_CHECK ? '--no-gpu-check' : '--gpu-check');
+  log(`exe の診断モード: ${MODE}`);
+  log(`exe の GPU検査: ${NO_GPU_CHECK ? 'off (--no-gpu-check)' : 'on'}`);
+  if (EXE_MEM_LOG !== '') {
+    exeArgs.push(`--mem-log=${EXE_MEM_LOG}`);
+    log(`exe のメモリログ: ${EXE_MEM_LOG}（1 秒周期 CSV）`);
+  }
+  if (INJECT_BAD_TILE > 0 || INJECT_STALE_TILE > 0 || INJECT_BAD_CORNER > 0 || INJECT_BAD_BIT > 0) {
+    log(`注入フック有効: badTile=${INJECT_BAD_TILE} staleTile=${INJECT_STALE_TILE} ` +
+        `badCorner=${INJECT_BAD_CORNER} badBit=${INJECT_BAD_BIT}（不一致が出る想定）`);
+  }
   if (FAIL_AFTER > 0) {
     exeArgs.push(`--fail-after=${FAIL_AFTER}`);
     log(`検証フック有効: exe に --fail-after=${FAIL_AFTER} を渡す`);
+  }
+  if (INJECT_UNCONFIRMED > 0) {
+    exeArgs.push(`--inject-unconfirmed=${INJECT_UNCONFIRMED}`);
+    log(`検証フック有効: exe に --inject-unconfirmed=${INJECT_UNCONFIRMED} を渡す ` +
+        `（その件目は Done を送らず終了 2 の想定）`);
+  }
+  if (DELAY_MS > 0) {
+    exeArgs.push(`--delay-ms=${DELAY_MS}`);
+    log(`検証フック有効: exe に --delay-ms=${DELAY_MS} を渡す（consumer 遅延の模擬）`);
+  }
+  if (DROP_DONE_AT > 0) {
+    log(`検証フック有効: --drop-done-at=${DROP_DONE_AT}（その個目の Done を捨てる。ACK 消失の模擬）`);
   }
   exeProc = spawn(EXE_PATH, exeArgs, {
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -509,6 +631,17 @@ function start() {
         }
         const borrowId = Number(m.readBigUInt64LE(8));
         const status = m.readUInt32LE(36);
+        doneSeq++;
+        // 検証用の ACK 消失フック（--drop-done-at=N）。N 個目の Done を捨てる。
+        // 捨てた借用は未 ACK のまま残り、以降のフレームは処理中 1 + 保留 1 の範囲で
+        // drop される。終了時に未 ACK は quarantined に入り release されない。
+        // 既定 0 は捨てない。
+        if (DROP_DONE_AT > 0 && doneSeq === DROP_DONE_AT) {
+          stats.droppedDone++;
+          log(`検証フック --drop-done-at=${DROP_DONE_AT}: Done#${doneSeq} を捨てる ` +
+              `(borrow=${borrowId} status=${status}。未 ACK のまま残す)`);
+          continue;
+        }
         onDone(borrowId, status);
       }
     });
