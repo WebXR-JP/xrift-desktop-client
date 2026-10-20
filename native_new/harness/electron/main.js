@@ -7,7 +7,7 @@
 //    GPU 完了の証拠が無いため release せず隔離し（DESIGN §6②）、Electron 終了で回収する
 'use strict';
 const { app, BrowserWindow } = require('electron');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const net = require('node:net');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -31,6 +31,16 @@ const FAIL_AFTER = Math.max(0, parseInt(arg('fail-after', '0'), 10) || 0);
 const INJECT_UNCONFIRMED = Math.max(0, parseInt(arg('inject-unconfirmed', '0'), 10) || 0);
 const DELAY_MS = Math.max(0, parseInt(arg('delay-ms', '0'), 10) || 0);
 const DROP_DONE_AT = Math.max(0, parseInt(arg('drop-done-at', '0'), 10) || 0);
+// M3 障害注入フック（既定は全て 0=off。通常経路の挙動は変えない）。
+// harness 側: --inject-release-fail=N（N 回目の texture.release() を例外にする。
+// 実際に release せず投げ、Electron 側の解放失敗を模擬する）、
+// --inject-renderer-crash=Ms（起動から Ms 後に renderer を強制クラッシュさせる）、
+// --inject-gpu-kill=Ms（起動から Ms 後に GPU プロセスを kill する）。
+// いずれもテスト専用であり、通常経路のコードを分岐で汚さないよう注入点は
+// doReleaseTexture・クラッシュ/ kill スケジューラの各 1 箇所にまとめる。
+const INJECT_RELEASE_FAIL = Math.max(0, parseInt(arg('inject-release-fail', '0'), 10) || 0);
+const INJECT_RENDERER_CRASH_MS = Math.max(0, parseInt(arg('inject-renderer-crash', '0'), 10) || 0);
+const INJECT_GPU_KILL_MS = Math.max(0, parseInt(arg('inject-gpu-kill', '0'), 10) || 0);
 // M1b 検査妥当性用: レンダラへ注入フックを渡す（既定は全て 0=off）。
 // N フレーム目だけ描画を壊し、exe 側の GPU 検査が不一致を数えることを確かめる。
 const INJECT_BAD_TILE = Math.max(0, parseInt(arg('inject-bad-tile', '0'), 10) || 0);
@@ -49,6 +59,25 @@ if (!['vulkan', 'd3d-open-only', 'no-gpu'].includes(MODE)) {
   console.error(`unknown --mode=${MODE}（vulkan / d3d-open-only / no-gpu のいずれか）`);
   process.exitCode = 1;
   app.whenReady().then(() => app.exit(1));
+  return;
+}
+
+// harness の使い方（--help で表示。注入は既定 off。通常経路の挙動は変えない）。
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(
+    '使い方: electron . --exe=<path> --seconds=N --width=W --height=H [--mode=vulkan|d3d-open-only|no-gpu]\n' +
+    '  障害注入（いずれも既定 0=無効。--help / README に明記する範囲だけ）:\n' +
+    '  --fail-after=N … exe へ渡す人為的非ゼロ終了フック\n' +
+    '  --inject-unconfirmed=N … exe へ渡す完了未確認フック（その件目は Done なし）\n' +
+    '  --delay-ms=N … exe へ渡す consumer 遅延フック\n' +
+    '  --drop-done-at=N … N 個目の Done を harness 側で捨てる（ACK 消失の模擬）\n' +
+    '  --inject-release-fail=N … N 回目の texture.release() を例外にする（解放失敗の模擬）。\n' +
+    '    参照を隔離に保持し、以降の新規 Offer を止め、非ゼロ終了する。二重 release はしない\n' +
+    '  --inject-renderer-crash=Ms … 起動から Ms 後に renderer を強制クラッシュさせる。\n' +
+    '    ハングせず停止し、未 ACK を隔離し、非ゼロ終了する。exe は切断で終了する\n' +
+    '  --inject-gpu-kill=Ms … 起動から Ms 後に GPU プロセスを kill する。ハングしないことが必須。\n' +
+    '    Chromium が GPU を再起動する場合はその挙動を記録し、そうでなければ停止・非ゼロ終了する');
+  app.whenReady().then(() => app.exit(0));
   return;
 }
 
@@ -128,6 +157,17 @@ const stats = {
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
   distinctHandles: 0, firstCodedSize: null,
   renderRequests: 0, // M2: exe から受けた RenderRequest の件数。
+  releaseAttempts: 0, // M3: release() の試行回数（注入判定の分母）。
+  warmupDrops: 0, // M3: パターン描画の合図前の起動過渡 drop 数（転送前 drop。証拠用）。
+  rendererCrashed: 0, // M3: renderer 異常を検知したら 1。
+  gpuKillRequested: 0, // M3: --inject-gpu-kill の kill 信号を送ったら 1。
+  gpuKilledPid: null, // M3: kill 信号を送った GPU プロセスの pid。
+  gpuPidAfterKill: null, // M3: kill の約 2 秒後に再取得した GPU プロセスの pid。
+  gpuKillMethod: null, // M3: GPU kill に使った手段（taskkill /F）。
+  gpuKillExitCode: null, // M3: taskkill の終了コード（0 が成功の目安）。
+  gpuKillPidGone: 0, // M3: kill 直後に OS 上で対象 pid が消えていたら 1。
+  gpuKillPidGoneAfterWait: null, // M3: kill 約 5 秒後の再確認で消えていれば 1。
+  gpuPaintsAtKill: null, // M3: kill 時点の paint 累積数（kill 後も描画継続かの分母）。
 };
 const handleCounts = new Map();
 // ソースハンドルの初出時刻（複製前の生値 hex -> 初出時刻 ms）。
@@ -143,6 +183,18 @@ let winRef = null; // M2 のレコード転送先（createWindow が設定する
 let gpuPidStart = null;
 let stopTimer = null;
 let graceTimer = null;
+// M3 の異常検知状態。renderer 異常は検知したら非ゼロ終了にする（未 ACK があれば隔離）。
+// GPU kill は kill の成否と kill 後の pid を記録する（回復の有無の判定材料）。
+// いずれも既定 off であり、通常経路の挙動は変えない。
+let rendererCrashed = false;
+let rendererCrashTimer = null;
+let gpuKillTimer = null;
+let gpuKillObserveTimer = null;
+// M3 の描画準備ゲート。M1 はレンダラの最初のパターン描画の合図
+// （'[m1] pattern-live'）まで Offer しない。起動過渡の黒 paint を渡すと
+// exe の検査が全面不一致で落とす（起動過渡の混入であり破損ではない）。
+// 転送前 drop として即返却する。M2 は合図を出さないため最初から true。
+let patternLive = M2;
 // 終了コード確定の状態。パイプ close で finish(0) を確定し、後の exe 非ゼロを
 // 無視する競合をなくすため、close → exe 終了待ち（タイムアウト付き）→ 確定の順にする。
 let exeCode = null; // exe の終了コード（signal 死は非ゼロ扱い）。未終了は null。
@@ -151,11 +203,24 @@ let exeWaitTimer = null;
 const EXE_WAIT_MS = 5000; // パイプ close 後の exe 終了待ち上限。
 function exeBaseCode() { return exeCode === 0 ? 0 : 2; }
 
+// M3 テスト専用の注入点（1 箇所に集約。通常経路のコードを分岐で汚さない）。
+// N 回目の release() 呼び出しを例外にし、Electron 側の解放失敗を模擬する。
+// 実際に release せず投げるため、呼び出し側は隔離・世代終了の扱いにする。
+// 既定 0 は投げない（通常経路の挙動は変えない）。
+let releaseAttempts = 0;
+function doReleaseTexture(texture) {
+  releaseAttempts++;
+  if (INJECT_RELEASE_FAIL > 0 && releaseAttempts === INJECT_RELEASE_FAIL) {
+    throw new Error(`injected release failure at attempt ${releaseAttempts}`);
+  }
+  texture.release();
+}
+
 function releaseOnce(borrowId, why) {
   const tex = held.get(borrowId);
   if (tex === undefined) return false;
   try {
-    tex.release();
+    doReleaseTexture(tex);
   } catch (e) {
     // 台帳から先に消さない。参照を quarantined に残し、世代終了扱いにする。
     held.delete(borrowId);
@@ -172,9 +237,10 @@ function releaseOnce(borrowId, why) {
 
 // 借用登録前（台帳に載る前）の texture を返す共通処理。release() 自体が失敗したら
 // 参照を保持して隔離し、世代終了扱いにする（握り潰さない）。戻り値は返却の成否。
+// M3 の --inject-release-fail は doReleaseTexture の 1 箇所で投げる（ここでは分岐しない）。
 function releaseUnregistered(texture, why) {
   try {
-    texture.release();
+    doReleaseTexture(texture);
   } catch (e) {
     quarantinedPreBorrow.push(texture);
     stats.quarantined++;
@@ -217,6 +283,118 @@ function currentGpuPid() {
     log(`getAppMetrics 失敗: ${e && e.message}`);
     return null;
   }
+}
+
+// M3 テスト専用の注入点（renderer 強制クラッシュの予約。1 箇所に集約）。
+// 起動から Ms 後に webContents.forcefullyCrashRenderer() を呼ぶ。既定 0 は予約しない。
+function scheduleRendererCrash(win) {
+  if (INJECT_RENDERER_CRASH_MS <= 0) return;
+  log(`検証フック有効: --inject-renderer-crash=${INJECT_RENDERER_CRASH_MS}（起動からその ms 後に renderer を強制クラッシュさせる）`);
+  rendererCrashTimer = setTimeout(() => {
+    rendererCrashTimer = null;
+    try {
+      log('検証フック --inject-renderer-crash: renderer を強制クラッシュさせる');
+      win.webContents.forcefullyCrashRenderer();
+    } catch (e) {
+      log(`renderer の強制クラッシュに失敗: ${e && e.message}`);
+    }
+  }, INJECT_RENDERER_CRASH_MS);
+}
+
+// M3 の renderer 異常検知（render-process-gone）。新規受付を止め、未 ACK が残れば
+// 猶予後に隔離して終了する（timeout を返却許可にしない）。paint 停止後の計測終了待ちで
+// ハングしないよう、計測タイマーを前倒しして猶予へ移す。
+function onRendererGone(details) {
+  if (rendererCrashed) return;
+  rendererCrashed = true;
+  stats.rendererCrashed = 1;
+  stopping = true;
+  log(`renderer 異常を検知 reason=${details && details.reason} exitCode=${details && details.exitCode}（新規受付を止める）`);
+  maybeFinish();
+  if (!graceTimer) {
+    if (stopTimer) {
+      clearTimeout(stopTimer);
+      stopTimer = null;
+    }
+    graceTimer = setTimeout(() => {
+      log('grace 期限切れ（renderer 異常）。未 ACK を隔離して終了する');
+      finish(2);
+    }, 8000);
+  }
+}
+
+// OS 上に pid が存在するか（tasklist 照会。ASCII の pid 部分だけ見るため
+// 日本語ロケールの出力を UTF-8 誤読しても判定に影響しない）。
+// 照会自体に失敗した場合は存在扱いで安全側に倒す（誤って成功扱いにしない）。
+function pidExistsOnWindows(pid) {
+  try {
+    const r = spawnSync('tasklist.exe', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], { encoding: 'utf8' });
+    if (r.error) return true;
+    return String(r.stdout || '').includes(`"${pid}"`);
+  } catch {
+    return true;
+  }
+}
+
+// M3 テスト専用の注入点（GPU プロセス kill の予約。1 箇所に集約）。
+// 起動から Ms 後に app.getAppMetrics() の type=gpu の pid を taskkill /F で
+// 強制終了する。kill 直後に OS 上の pid 消滅を確認し、約 5 秒間の pid 再取得で
+// Chromium が GPU を再起動したかを記録する。
+// 既定 0 は予約しない。ハングしないことが必須であり、回復の有無で終了の扱いを分ける
+// （回復時はその旨を記録し、マトリクス側で合否を分ける）。
+// ADR: 以前は process.kill(pid) を使っていたが GPU プロセスが落ちないことを確認済み
+// （kill 前後で pid 不変・エラーなし）。Windows の taskkill /F が確実に落とす。
+function scheduleGpuKill() {
+  if (INJECT_GPU_KILL_MS <= 0) return;
+  log(`検証フック有効: --inject-gpu-kill=${INJECT_GPU_KILL_MS}（起動からその ms 後に GPU プロセスを kill する）`);
+  gpuKillTimer = setTimeout(() => {
+    gpuKillTimer = null;
+    const pid = currentGpuPid() !== null ? currentGpuPid() : gpuPidStart;
+    if (pid === null || pid === undefined) {
+      log('検証フック --inject-gpu-kill: GPU プロセスの pid が取れないため kill できない');
+      return;
+    }
+    stats.gpuKillRequested = 1;
+    stats.gpuKilledPid = pid;
+    stats.gpuKillMethod = 'taskkill /F';
+    log(`検証フック --inject-gpu-kill: GPU プロセス pid=${pid} を taskkill /F で終了させる`);
+    try {
+      // 出力はロケール文字化けを避けて捨て、終了コードだけを証拠にする。
+      // pid の消滅自体は pidExistsOnWindows と kill 後の pid 再取得で確認する。
+      const r = spawnSync('taskkill.exe', ['/F', '/PID', String(pid)], { stdio: 'ignore' });
+      stats.gpuKillExitCode = r.status;
+      log(`taskkill /F /PID ${pid} 終了 code=${r.status}`);
+      if (r.error) {
+        log(`taskkill の起動に失敗 pid=${pid}: ${r.error && r.error.message}`);
+        return;
+      }
+    } catch (e) {
+      log(`GPU プロセスの kill に失敗 pid=${pid}: ${e && e.message}`);
+      return;
+    }
+    const gone = !pidExistsOnWindows(pid);
+    stats.gpuKillPidGone = gone ? 1 : 0;
+    stats.gpuPaintsAtKill = paintTimes.length;
+    log(gone
+      ? `GPU プロセス pid=${pid} の消滅を確認（OS 上に存在しない）`
+      : `GPU プロセス pid=${pid} が OS 上に残っている（taskkill code=${stats.gpuKillExitCode}）`);
+    // kill 後約 5 秒間、1 秒ごとに GPU pid を再取得する。
+    // getAppMetrics が死んだ pid を返し続ける場合があるため、単発の一致では
+    // 生死を判断しない。OS 上の pid 消滅と終了時の gpu 有無を合わせて証拠にする。
+    const killPollStart = Date.now();
+    gpuKillObserveTimer = setInterval(() => {
+      const polled = currentGpuPid();
+      log(`GPU kill 後の観測 pid=${polled}（kill 前=${pid}）`);
+      if (Date.now() - killPollStart >= 5000) {
+        clearInterval(gpuKillObserveTimer);
+        gpuKillObserveTimer = null;
+        stats.gpuPidAfterKill = polled;
+        const goneAfter = !pidExistsOnWindows(pid);
+        stats.gpuKillPidGoneAfterWait = goneAfter ? 1 : 0;
+        log(`GPU kill 観測終了 pid=${polled}（kill 前=${pid}）。OS 上の消滅=${goneAfter ? '確認' : '残存'}`);
+      }
+    }, 1000);
+  }, INJECT_GPU_KILL_MS);
 }
 
 function makeOffer(borrowId, width, height, ntHandle) {
@@ -284,6 +462,13 @@ function onPaint(details) {
   const texture = details && details.texture;
   if (!texture) {
     stats.noTexture++;
+    return;
+  }
+  // M3 の描画準備ゲート（M1 のみ）。合図前の paint は転送前 drop として即返却する。
+  if (!patternLive) {
+    stats.drops++;
+    stats.warmupDrops++;
+    releaseUnregistered(texture, 'warming-up');
     return;
   }
   let ti = null;
@@ -426,6 +611,20 @@ function finish(code) {
   finished = true;
   // 終了確定。以後の新規 paint・pump・submit を止める。
   stopping = true;
+  if (rendererCrashTimer) {
+    clearTimeout(rendererCrashTimer);
+    rendererCrashTimer = null;
+  }
+  if (gpuKillTimer) {
+    clearTimeout(gpuKillTimer);
+    gpuKillTimer = null;
+  }
+  if (gpuKillObserveTimer) {
+    // 観測は setInterval のため clearInterval で止める（Node では clearTimeout も
+    // 効くが、意図を明確にする）。
+    clearInterval(gpuKillObserveTimer);
+    gpuKillObserveTimer = null;
+  }
   // M2 の XR ループは Offer 待ちで空フレームを回し続けるため、読取側を開いたままの
   // 半閉鎖（socket.end のみ）では切断を検知できず kill による統計消失が起きる。
   // 終了待ちの前に破棄して切断（BROKEN_PIPE）として知らせ、exe に統計を出させる。
@@ -476,9 +675,14 @@ function finish(code) {
   stats.distinctSourceHandles = handleCounts.size;
   stats.sourceNewLast60s = sourceNewLast60s;
   stats.sourceNewPer30s = sourceNewPer30s;
+  stats.releaseAttempts = releaseAttempts;
   const summary = {
     exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
     mode: MODE, exeMemLog: EXE_MEM_LOG || null,
+    injectReleaseFail: INJECT_RELEASE_FAIL,
+    injectRendererCrashMs: INJECT_RENDERER_CRASH_MS,
+    injectGpuKillMs: INJECT_GPU_KILL_MS,
+    dropDoneAt: DROP_DONE_AT, injectUnconfirmed: INJECT_UNCONFIRMED, delayMs: DELAY_MS,
     gpuPidStart, gpuPid: currentGpuPid(),
     paints: paintTimes.length,
     fps: total > 0 ? (intervals.length / (total / 1000)) : 0,
@@ -506,6 +710,7 @@ function finish(code) {
   if (stats.maxHeld > MAX_HELD) failures.push(`maxHeld=${stats.maxHeld}>${MAX_HELD}`);
   if (stats.offerFailures > 0) failures.push(`offerFailures=${stats.offerFailures}`);
   if (releaseFailed) failures.push('releaseFailed');
+  if (rendererCrashed) failures.push('rendererCrashed');
   if (failures.length > 0) {
     if (finalCode === 0) finalCode = 2;
     log(`終了コードを非ゼロ化 (${failures.join(' ')})`);
@@ -567,7 +772,18 @@ async function createWindow() {
 
   win.webContents.on('console-message', (_e, _level, message) => {
     log('renderer-console: ' + message);
+    // M3 の描画準備ゲートの合図（M1 の index.html が最初のパターン描画後に 1 回出す）。
+    if (!patternLive && typeof message === 'string' && message.startsWith('[m1] pattern-live')) {
+      patternLive = true;
+      log('レンダラのパターン描画を確認。以後の paint を Offer 対象にする');
+    }
   });
+  // M3: renderer 異常の検知。ハングせず停止し、未 ACK を隔離して非ゼロ終了する。
+  win.webContents.on('render-process-gone', (_e, details) => {
+    log(`render-process-gone: reason=${details && details.reason} exitCode=${details && details.exitCode}`);
+    onRendererGone(details);
+  });
+  scheduleRendererCrash(win);
   win.webContents.on('paint', (details) => {
     try {
       onPaint(details);
@@ -666,6 +882,12 @@ function start() {
   if (DROP_DONE_AT > 0) {
     log(`検証フック有効: --drop-done-at=${DROP_DONE_AT}（その個目の Done を捨てる。ACK 消失の模擬）`);
   }
+  if (INJECT_RELEASE_FAIL > 0) {
+    log(`検証フック有効: --inject-release-fail=${INJECT_RELEASE_FAIL}（その回目の release() を例外にする。解放失敗の模擬）`);
+  }
+  // M3 の renderer クラッシュ・GPU kill の予約は createWindow 後に行う。
+  // renderer 側は window が要るため createWindow 側で予約し、GPU 側はここで予約する。
+  scheduleGpuKill();
   exeProc = spawn(EXE_PATH, exeArgs, {
     stdio: ['ignore', 'inherit', 'inherit'],
   });

@@ -163,6 +163,13 @@ fn tileColor(f : u32, tx : u32, ty : u32) -> vec4f {
     pass.end();
     device.queue.submit([enc.finish()]);
     window.__m1Info.frames = frame;
+    // M3 の起動過渡対策の合図。最初のパターン描画の提出後に 1 回だけ出す。
+    // main 側はこの合図まで Offer しない（Chromium OSR は最初の present より前に
+    // 黒の paint を出すことがあり、それを渡すと全面不一致になる）。
+    if (!window.__m1LiveLogged) {
+      window.__m1LiveLogged = true;
+      console.log('[m1] pattern-live frame=' + frame);
+    }
     requestAnimationFrame(draw);
   }
   requestAnimationFrame(draw);
@@ -219,6 +226,11 @@ function runCanvas2D(canvas) {
       }
     }
     window.__m1Info.frames = frame;
+    // M3 の起動過渡対策の合図（WebGPU 経路と同じ。最初のパターン描画後に 1 回だけ出す）。
+    if (!window.__m1LiveLogged) {
+      window.__m1LiveLogged = true;
+      console.log('[m1] pattern-live frame=' + frame);
+    }
     requestAnimationFrame(draw);
   }
   requestAnimationFrame(draw);

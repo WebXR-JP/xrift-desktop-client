@@ -1,14 +1,19 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # M1 ハーネスの実行（再現手順）。
 #  - transfer-addon をビルドし、xrift_new.exe をビルドし、electron で main.js を起動する
 #  - electron は XRift-Client/node_modules のものを使う
 # 使い方: .\run.ps1 [-Seconds 60] [-Width 4096] [-Height 2048]
 #   [-InjectBadTile N] [-InjectStaleTile N] [-InjectBadCorner N] [-InjectBadBit N] [-NoGpuCheck]
 #   [-FailAfter N] [-InjectUnconfirmed N] [-DelayMs N] [-DropDoneAt N]
+#   [-InjectReleaseFail N] [-InjectRendererCrashMs Ms] [-InjectGpuKillMs Ms]
 #   [-Mode vulkan|d3d-open-only|no-gpu] [-MemLog <接頭辞>]
 #   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify]
+#   [-SkipBuild]
 #   -Mode は exe の診断モード（既定 vulkan=Vulkan 経路）。借用台帳・ACK・release は同じ。
 #   d3d-open-only は D3D11 Open 経路の診断専用であり、長時間動かすとメモリが増える。
+#   -InjectReleaseFail/-InjectRendererCrashMs/-InjectGpuKillMs は M3 の harness 側注入
+#   （いずれも既定 0=無効。通常経路の挙動は変えない）。詳細は README の M3 節を参照。
+#   -SkipBuild は fault-matrix.ps1 が初回に 1 回だけ建てるための省略用（通常は付けない）。
 #   -MemLog は計測用 CSV の接頭辞（例: logs\run1 → run1.exe.csv と run1.gpu.csv）。
 #     exe 側の 1 秒周期ログ（Private Bytes/RSS/ハンドル/生存 Vk 資源）と、
 #     GPU プロセスメモリの 1 秒周期ログ（Get-Counter の Local/Dedicated Usage）を出す。
@@ -24,6 +29,9 @@ param(
   [int]$InjectUnconfirmed = 0,
   [int]$DelayMs = 0,
   [int]$DropDoneAt = 0,
+  [int]$InjectReleaseFail = 0,
+  [int]$InjectRendererCrashMs = 0,
+  [int]$InjectGpuKillMs = 0,
   [ValidateSet('vulkan', 'd3d-open-only', 'no-gpu')]
   [string]$Mode = 'vulkan',
   [string]$MemLog = '',
@@ -31,7 +39,8 @@ param(
   [switch]$M2,
   [int]$InjectStaleRecord = 0,
   [string]$RenderScale = '0.5',
-  [switch]$NoSubmitVerify
+  [switch]$NoSubmitVerify,
+  [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
 $harness = $PSScriptRoot                    # native_new/harness/electron
@@ -40,14 +49,22 @@ $repo = Split-Path -Parent $root            # XRift-Client
 $electron = Join-Path $repo 'node_modules\electron\dist\electron.exe'
 
 Write-Host "== 1/4 transfer-addon のビルド =="
-& (Join-Path $root 'transfer-addon\build.ps1')
+if (-not $SkipBuild) {
+  & (Join-Path $root 'transfer-addon\build.ps1')
+} else {
+  Write-Host "(SkipBuild のため省略)"
+}
 
 Write-Host "== 2/4 xrift_new.exe のビルド =="
-Push-Location $root
-cmake --build --preset windows-vs-release
-$buildCode = $LASTEXITCODE
-Pop-Location
-if ($buildCode -ne 0) { throw "exe のビルドに失敗" }
+if (-not $SkipBuild) {
+  Push-Location $root
+  cmake --build --preset windows-vs-release
+  $buildCode = $LASTEXITCODE
+  Pop-Location
+  if ($buildCode -ne 0) { throw "exe のビルドに失敗" }
+} else {
+  Write-Host "(SkipBuild のため省略)"
+}
 
 Write-Host "== 3/4 プロトコル配置試験 =="
 node (Join-Path $harness 'protocol-test.js')
@@ -67,7 +84,10 @@ $electronArgs = @('.', "--exe=$exe", "--seconds=$Seconds", "--width=$Width", "--
   "--inject-bad-tile=$InjectBadTile", "--inject-stale-tile=$InjectStaleTile",
   "--inject-bad-corner=$InjectBadCorner", "--inject-bad-bit=$InjectBadBit",
   "--fail-after=$FailAfter", "--inject-unconfirmed=$InjectUnconfirmed",
-  "--delay-ms=$DelayMs", "--drop-done-at=$DropDoneAt")
+  "--delay-ms=$DelayMs", "--drop-done-at=$DropDoneAt",
+  "--inject-release-fail=$InjectReleaseFail",
+  "--inject-renderer-crash=$InjectRendererCrashMs",
+  "--inject-gpu-kill=$InjectGpuKillMs")
 if ($NoGpuCheck) { $electronArgs += '--no-gpu-check' }
 if ($M2) {
   $electronArgs += '--m2'

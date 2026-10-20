@@ -23,3 +23,4 @@ native_new/harness/electron/run-out.txt
 native_new/harness/electron/run-err.txt
 native_new/harness/electron/harness-stats.json
 native_new/harness/electron/logs/
+native_new/harness/electron/fault-matrix-results.*

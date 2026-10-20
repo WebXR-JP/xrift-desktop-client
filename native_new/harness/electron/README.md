@@ -37,6 +37,14 @@ Electron 側は借用台帳と `release()` 専任に徹し、提出には関与�
 .\run.ps1 -Seconds 30 -Width 2048 -Height 1024 -DelayMs 50
 # ACK 消失の模擬（N 個目の Done を main 側で捨てる。未 ACK は隔離され release されない。終了 2）。
 .\run.ps1 -Seconds 15 -Width 2048 -Height 1024 -DropDoneAt 100
+# M3 障害注入フック（いずれも既定 0=無効。通常経路の挙動は変えない）。
+# N 回目の texture.release() を例外にする（解放失敗の模擬。隔離して新規 Offer を止め、非ゼロ終了）。
+# N は定常到達後を狙う（約 175/s のため 1000 で約 6 秒後。小さすぎると起動過渡に当たる）。
+.\run.ps1 -Seconds 15 -Width 2048 -Height 1024 -InjectReleaseFail 1000
+# 起動から Ms 後に renderer を強制クラッシュさせる（ハングせず停止し、未 ACK を隔離、非ゼロ終了）。
+.\run.ps1 -Seconds 15 -Width 2048 -Height 1024 -InjectRendererCrashMs 5000
+# 起動から Ms 後に GPU プロセスを kill する（ハングしないことが必須。回復時は記録する）。
+.\run.ps1 -Seconds 15 -Width 2048 -Height 1024 -InjectGpuKillMs 5000
 # 既定経路の長時間計測（600 秒・4096x2048・90Hz・GPU 検査 on）。
 .\run.ps1 -Seconds 600 -MemLog logs\vulkan600
 # モード別の切り分け（各 120 秒・4096x2048・90Hz。プロセス再起動で 3 本）。
@@ -76,6 +84,54 @@ exe 側の統計は標準出力（`run-out.txt` に混ざる）に出る。
 - 4096x2048 が重い場合は 2048x1024 に落としてよいが、その場合は理由と数値を報告すること。
   勝手に縮小して黙らない。
 - 検証 readback は exe 側 `--verify` の範囲に隔離した部分的読み戻しであり、本番経路ではない。
+
+## M3 マトリクス（滞留制限・借用管理・正常終了/障害時停止。検証用）
+
+M3（DESIGN §5〜§6）の検証基盤。`fault-matrix.ps1` が各ケースを順に実行し、
+期待（DESIGN §6 に基づく判定基準。スクリプト内の `$Cases` が正本）と実測を突き合わせ、
+違反があれば非ゼロ終了する。製品経路の挙動は変えない（注入は既定 off）。
+
+```powershell
+# native_new/harness/electron から。1 ケース 15 秒・2048x1024、タイムアウト 60 秒。合計 5 分以内。
+.\fault-matrix.ps1
+# 短縮条件の指定（引数体系は run.ps1 と揃える）。
+.\fault-matrix.ps1 -Seconds 15 -Width 2048 -Height 1024
+# 指定ケースだけ実行する（デバッグ用）。
+.\fault-matrix.ps1 -Only normal,delay
+```
+
+ケースと期待（判定基準。変えたら根拠を報告する）:
+
+| ケース | 期待 |
+|---|---|
+| 正常 | harness 0 / exe 0、quarantine 0、offers=dones、maxHeld≤2 |
+| exe kill | harness 非ゼロ、quarantine≥1、release されない、ハングなし |
+| electron kill | exe が 10 秒以内に終了、ハングなし |
+| drop-done | harness 非ゼロ、quarantine≥1、maxHeld≤2 |
+| unconfirmed | exe 非ゼロ、Done を送っていない（offers−dones=1）、harness 非ゼロ、quarantine 1 |
+| release-fail | harness 非ゼロ、quarantine≥1、二重 release なし |
+| renderer-crash | ハングなし、非ゼロ、未 ACK があれば隔離 |
+| gpu-kill | ハングなし（非ゼロが望ましいが、Chromium が回復する場合はその旨を記録して合否を分ける） |
+| delay-ms=50 | harness 0 / exe 0、maxHeld≤2、drops 増、ハンドル数が増え続けない |
+
+各ケース共通の観測項目: harness 終了コード、exe 終了コード、offers/dones、
+quarantine、maxHeld、drops、ハング有無（タイムアウトで判定）、所要時間。
+結果は表形式で出力し、`fault-matrix-results.md` と `fault-matrix-results.csv` に保存する。
+ケース別の生証拠（`harness-stats.json`・`harness-run.log`・`run-out.txt`）は
+`logs\fault-matrix\<ケース名>\` に退避する。
+
+実装上の注意（DESIGN §5〜§6・§8）:
+
+- timeout は返却許可ではない。期限切れで release しない
+- 隔離した借用は release しない（参照保持）。二重 release をしない
+- 注入は通常経路のコードを分岐で汚さない（`main.js` のテスト専用注入点
+  `doReleaseTexture`・クラッシュ/ kill スケジューラの各 1 箇所に集約し、コメントで明示）
+- 起動過渡の黒 paint は渡さない（`index.html` が最初のパターン描画後に
+  `[m1] pattern-live` の合図を 1 回出し、`main.js` は合図まで転送前 drop する。
+  Chromium OSR は最初の present より前に黒を paint することがあり、
+  渡すと全面不一致になる。合図前の drop 数は `warmupDrops` に出す。M2 は対象外）
+- `run.ps1` と引数体系を揃え、二重実装しない（マトリクスは `run.ps1` を呼ぶ。
+  初回に 1 回だけ建てる `-SkipBuild` は時間合わせのためであり、通常は付けない）
 
 ## M2 ハーネス（pose/FOV と画像の対応・両眼提出。検証用）
 
