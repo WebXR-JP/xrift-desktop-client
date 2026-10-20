@@ -20,15 +20,15 @@ class PipeClient {
   PipeClient(const PipeClient&) = delete;
   PipeClient& operator=(const PipeClient&) = delete;
 
-  // 64 バイトちょうどを書き切る。失敗時は std::runtime_error を投げる。
+  // 1 メッセージ分を書き切る。失敗時は std::runtime_error を投げる。
   void Send(const TransferMessage& msg);
-  // 64 バイトちょうどを読み切る。相手の正常切断時は false を返す。
+  // 1 メッセージ分を読み切る。相手の正常切断時は false を返す。
   // それ以外の失敗時は std::runtime_error を投げる。
   bool Receive(TransferMessage* out);
   // 期限付きの受信。deadlineUs が 0 なら Receive と同じく無期限に待つ。
   // 戻り値は true=1 件受信、false=切断または期限切れ。timedOut に期限切れかを出す。
   // 到着待ちは overlapped I/O + イベント待機で行い、sleep ポーリングは使わない。
-  // 部分受信（64B 未満）は内部に溜めて次回に継続する。期限は終了判定のみであり、
+  // 部分受信（1 メッセージ未満）は内部に溜めて次回に継続する。期限は終了判定のみであり、
   // 返却許可にはならない。
   bool ReceiveWithDeadline(TransferMessage* out, uint64_t deadlineUs, bool* timedOut);
 

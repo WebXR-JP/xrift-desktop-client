@@ -41,7 +41,7 @@ EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float o
 
 int RunM2SelfTest() {
   // 1. 配置の実行時確認（static_assert の相手側。JS との一致は protocol-test.js で行う）。
-  Check(sizeof(TransferMessage) == 192, "メッセージ 192B");
+  Check(sizeof(TransferMessage) == 256, "メッセージ 256B");
   Check(offsetof(TransferMessage, renderId) == 40, "renderId オフセット 40");
   Check(offsetof(TransferMessage, spaceEpoch) == 52, "spaceEpoch オフセット 52");
   Check(offsetof(TransferMessage, leftPos) == 56, "leftPos オフセット 56");
@@ -171,7 +171,7 @@ int RunM2SelfTest() {
   Check(QuantizeStick(-1.0f) == static_cast<uint8_t>(static_cast<int8_t>(-127)) &&
             QuantizeStick(1.0f) == 127,
         "スティック量子化の両端");
-  Check(sizeof(TransferMessage) == 192, "M4 追加後もメッセージ 192B");
+  Check(sizeof(TransferMessage) == 256, "M5 追加後もメッセージ 256B");
 
   // 11. M4計測: 押下エッジの検出と 1 秒ラッチ（HMD 無しで形式を確認する）。
   // 実機の取りこぼし（短い押下・primary/menu の未記録）の切り分け用である。
@@ -256,6 +256,66 @@ int RunM2SelfTest() {
     const uint8_t* base = reinterpret_cast<const uint8_t*>(&plain);
     Check(plain.reserved[0] == 0 && plain.reserved[1] == 0, "既定ラッチは 0");
     Check(base[kInputHand0 + kInputHandButtons] == kBtnPrimary, "buttons 欄は従来どおり");
+  }
+
+  // 13. M5: InputState のコントローラ pose（左右の grip/aim）の往復。
+  // 配置は protocol.h の kInput*（C++ と JS の一致は protocol-test.js で行う）。
+  // 有効性は手 flags が表し、無効時の値は 0 のままである。
+  {
+    xr::InputSnapshot s{};
+    s.frameNo = 78;
+    s.hands[0].connected = true;
+    s.hands[0].gripValid = true;
+    s.hands[0].grip.position = {0.11f, 1.21f, -0.31f};
+    s.hands[0].grip.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    s.hands[0].aimValid = true;
+    s.hands[0].aim.position = {0.12f, 1.22f, -0.32f};
+    s.hands[0].aim.orientation = {0.0f, 0.7071f, 0.0f, 0.7071f};
+    s.hands[1].connected = true;
+    s.hands[1].gripValid = false;
+    s.hands[1].aimValid = true;
+    s.hands[1].aim.position = {-0.13f, 1.23f, -0.33f};
+    s.hands[1].aim.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    const TransferMessage pose_msg = MakeInputStateMessage(s, 2, 7);
+    const uint8_t* pbase = reinterpret_cast<const uint8_t*>(&pose_msg);
+    Check((pbase[kInputHand0 + kInputHandFlags] & 0b110) == 0b110, "左の grip/aim 有効 flags");
+    Check((pbase[kInputHand0 + kInputHandStride + kInputHandFlags] & 0b110) == 0b100,
+          "右は aim のみ有効 flags");
+    const ControllerPose lg = ReadInputPose(pose_msg, kInputGripLeft);
+    Check(lg.position[0] == 0.11f && lg.position[1] == 1.21f && lg.position[2] == -0.31f &&
+              lg.orientation[3] == 1.0f,
+          "左 grip pose の往復");
+    const ControllerPose la = ReadInputPose(pose_msg, kInputAimLeft);
+    Check(la.position[0] == 0.12f && la.orientation[1] == 0.7071f, "左 aim pose の往復");
+    const ControllerPose ra = ReadInputPose(pose_msg, kInputAimRight);
+    Check(ra.position[0] == -0.13f && ra.position[1] == 1.23f && ra.orientation[3] == 1.0f,
+          "右 aim pose の往復");
+    // 無効な右 grip の値は 0 のまま（受信側は flags を見て読まない）。
+    const ControllerPose rg = ReadInputPose(pose_msg, kInputGripRight);
+    Check(rg.position[0] == 0.0f && rg.position[1] == 0.0f && rg.position[2] == 0.0f &&
+              rg.orientation[0] == 0.0f && rg.orientation[3] == 0.0f,
+          "無効な右 grip pose は 0 のまま");
+    // pose 以外の予約域は 0（144〜159 の req・ラッチ外、216〜255 の拡張末尾）。
+    const uint8_t* raw = pbase;
+    bool tail_zero = true;
+    for (size_t i = 144; i < 152; ++i) {
+      tail_zero = tail_zero && (raw[i] == 0);
+    }
+    for (size_t i = 154; i < 160; ++i) {
+      tail_zero = tail_zero && (raw[i] == 0);
+    }
+    for (size_t i = 216; i < 256; ++i) {
+      tail_zero = tail_zero && (raw[i] == 0);
+    }
+    Check(tail_zero, "pose 以外の予約域は 0");
+    // 未接続の両手は flags=0 で pose も 0（0 埋めと区別するため flags を見る）。
+    xr::InputSnapshot empty{};
+    empty.frameNo = 79;
+    const TransferMessage empty_msg = MakeInputStateMessage(empty, 2, 7);
+    const uint8_t* ebase = reinterpret_cast<const uint8_t*>(&empty_msg);
+    Check(ebase[kInputHand0 + kInputHandFlags] == 0, "未接続の左 flags は 0");
+    const ControllerPose eg = ReadInputPose(empty_msg, kInputGripLeft);
+    Check(eg.position[0] == 0.0f && eg.orientation[3] == 0.0f, "未接続の左 grip pose は 0");
   }
 
   if (g_failures > 0) {

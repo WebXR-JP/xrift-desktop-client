@@ -1,12 +1,14 @@
 // プロトコルの配置試験（素の node で実行可）。protocol.h との一致を守る。
-// M2 で 192B 化した。使い方: node protocol-test.js
+// M2 で 192B 化し、M5 で 256B 化した。使い方: node protocol-test.js
 'use strict';
 const assert = require('node:assert');
 
-// M2: 64B → 192B。先頭 64B の配置は M1 と同じである。
-const MSG_LEN = 192;
+// M2: 64B → 192B、M5: 192B → 256B。先頭 64B の配置は M1 と同じである。
+// 既存欄（0〜151B）のオフセットは変えない。InputState の pose は
+// 88〜143B（左手）と 160〜215B（右手）に載る（種別で区別する再利用）。
+const MSG_LEN = 256;
 const MAGIC = 0x54465258;
-const VERSION = 2;
+const VERSION = 3;
 const TYPE_OFFER = 1;
 const TYPE_DONE = 2;
 const TYPE_RENDER_REQUEST = 3;
@@ -60,7 +62,7 @@ function parseRenderRequest(buf) {
 // static_assert 相当: 配置の固定（先頭 64B は M1 と同じ）。
 const offer = makeOffer(123456789, 4096, 2048, 0, 0x1234ABCDn);
 assert.strictEqual(offer.readUInt32LE(0), MAGIC);
-assert.strictEqual(offer.readUInt16LE(4), 2);
+assert.strictEqual(offer.readUInt16LE(4), VERSION);
 assert.strictEqual(offer.readUInt16LE(6), 1);
 assert.strictEqual(Number(offer.readBigUInt64LE(8)), 123456789);
 assert.strictEqual(offer.readUInt32LE(16), 4096);
@@ -158,7 +160,36 @@ assert.ok(Math.abs(st[58] / 255 - 0.5) < 0.01, 'trigger の量子化往復');
 assert.strictEqual(st.readInt8(60), -64, 'stick の int8 往復');
 assert.strictEqual(st[64], 0b11100, 'ボタン押下');
 assert.strictEqual(st[68], 0b11100, 'ボタン supported（0 と未対応の区別）');
-assert.ok(st.subarray(88, 152).every((b) => b === 0), 'InputState の未使用域は 0');
+// M5: InputState のコントローラ pose（C++ の WriteInputPose と同じ配置）。
+// 左 grip@88、左 aim@116、右 grip@160、右 aim@188。各 28B（pos xyz＋ori xyzw）。
+// 有効性は手 flags（bit1=grip・bit2=aim）が表す。
+const IPOSE = 28, GRIP_L = 88, AIM_L = 116, GRIP_R = 160, AIM_R = 188;
+function writePose(buf, off, pos, ori) {
+  buf.writeFloatLE(pos[0], off); buf.writeFloatLE(pos[1], off + 4); buf.writeFloatLE(pos[2], off + 8);
+  for (let i = 0; i < 4; i++) buf.writeFloatLE(ori[i], off + 12 + i * 4);
+}
+function readPose(buf, off) {
+  return {
+    pos: [buf.readFloatLE(off), buf.readFloatLE(off + 4), buf.readFloatLE(off + 8)],
+    ori: [0, 1, 2, 3].map((i) => buf.readFloatLE(off + 12 + i * 4)),
+  };
+}
+writePose(st, GRIP_L, [0.11, 1.21, -0.31], [0, 0, 0, 1]);
+writePose(st, AIM_L, [0.12, 1.22, -0.32], [0, 0.7071, 0, 0.7071]);
+writePose(st, AIM_R, [-0.13, 1.23, -0.33], [0, 0, 0, 1]);
+assert.strictEqual(st[56] & 0b110, 0b100, '左の flags は接続＋aim 有効のまま');
+const lg = readPose(st, GRIP_L);
+assert.ok(Math.abs(lg.pos[0] - 0.11) < 1e-6 && lg.ori[3] === 1, '左 grip pose の float 往復');
+const la = readPose(st, AIM_L);
+assert.ok(Math.abs(la.pos[1] - 1.22) < 1e-6 && Math.abs(la.ori[1] - 0.7071) < 1e-6, '左 aim pose の float 往復');
+const ra = readPose(st, AIM_R);
+assert.ok(Math.abs(ra.pos[0] + 0.13) < 1e-6 && ra.ori[3] === 1, '右 aim pose の float 往復');
+const rg = readPose(st, GRIP_R);
+assert.ok(rg.pos.every((v) => v === 0) && rg.ori.every((v) => v === 0), '未書き込みの右 grip pose は 0');
+// InputState では req 欄（144〜151）・ラッチ外の詰め物（154〜159）・拡張末尾（216〜255）は 0。
+assert.ok(st.subarray(144, 152).every((b) => b === 0), 'InputState の req 欄は 0');
+assert.ok(st.subarray(154, 160).every((b) => b === 0), 'InputState の詰め物は 0');
+assert.ok(st.subarray(216, 256).every((b) => b === 0), 'InputState の拡張末尾は 0');
 
 // M4計測: InputState の予約先頭 2B は左右の押下ラッチ（buttons と同じ bit 割付け）。
 // 短い押下の取りこぼし診断用。旧復号器は予約域を読まないため配置の追加である。
@@ -176,7 +207,10 @@ assert.strictEqual(st[153], 0b00001, '右ラッチ（stick）');
 assert.strictEqual(latchNames(st[152]), 'primary,secondary,menu', '左ラッチの人名');
 assert.strictEqual(latchNames(st[153]), 'stick', '右ラッチの人名');
 assert.strictEqual(latchNames(0), '-', '空ラッチは -');
-assert.ok(st.subarray(154).every((b) => b === 0), 'ラッチ以外の予約域は 0');
+// ラッチ以外の予約域は 0（右手 pose 域 160〜215B を除く。そちらは上で確認済み）。
+assert.ok(st.subarray(154, 160).every((b) => b === 0), 'ラッチ直後の詰め物は 0');
+assert.ok(st.subarray(216, 256).every((b) => b === 0), '拡張末尾は 0');
 
-console.log('protocol-test: ok（配置 192B・LE・予約 0・RenderRequest 往復を確認）');
+console.log('protocol-test: ok（配置 256B・LE・予約 0・RenderRequest 往復を確認）');
 console.log('protocol-test: ok（M4 の HapticCommand・InputState の配置を確認）');
+console.log('protocol-test: ok（M5 の InputState pose 配置を確認）');

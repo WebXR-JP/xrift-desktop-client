@@ -6,8 +6,10 @@
 #include "transfer/protocol.h"
 #include "xr/input.h"
 
-// M4 の入力スナップショットを 192B の InputState（exe → main）に畳む。
-// pose は載せない（exe 側のログで確認する。線路上は操作の要約のみ）。
+// M4 の入力スナップショットを 256B の InputState（exe → main）に畳む。
+// コントローラ pose（左右の grip/aim。position xyz＋orientation xyzw）は
+// protocol.h の kInput* 配置に載せる。有効性は手 flags（bit1=grip・bit2=aim）が
+// 表す。無効時の値は 0 のままにし、受信側は読まない。
 // 「0」と「未対応」の区別は active/supported の 2 段で行う（protocol.h の欄定義を参照）。
 // 未接続の手は flags=0 のまま全欄 0 で送る（0 埋めと区別するため flags を見る）。
 // latch0/latch1 は「その 1 秒間に押されたボタンの集合（ラッチ）」であり、
@@ -81,6 +83,32 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
                              (supported_value(hand.squeezeState) << 1) |
                              (supported_value(hand.thumbstickState) << 2) |
                              (supported_value(hand.trackpadState) << 3));
+    // コントローラ pose。XrPosef（position xyz＋orientation xyzw）をそのまま載せる。
+    // 有効性は上の flags が表す。無効時の値は 0 のままにし、受信側は読まない。
+    const size_t grip_off = (i == 0) ? kInputGripLeft : kInputGripRight;
+    const size_t aim_off = (i == 0) ? kInputAimLeft : kInputAimRight;
+    ControllerPose grip{};
+    grip.position[0] = hand.grip.position.x;
+    grip.position[1] = hand.grip.position.y;
+    grip.position[2] = hand.grip.position.z;
+    grip.orientation[0] = hand.grip.orientation.x;
+    grip.orientation[1] = hand.grip.orientation.y;
+    grip.orientation[2] = hand.grip.orientation.z;
+    grip.orientation[3] = hand.grip.orientation.w;
+    ControllerPose aim{};
+    aim.position[0] = hand.aim.position.x;
+    aim.position[1] = hand.aim.position.y;
+    aim.position[2] = hand.aim.position.z;
+    aim.orientation[0] = hand.aim.orientation.x;
+    aim.orientation[1] = hand.aim.orientation.y;
+    aim.orientation[2] = hand.aim.orientation.z;
+    aim.orientation[3] = hand.aim.orientation.w;
+    if (hand.gripValid) {
+      WriteInputPose(&m, grip_off, grip);
+    }
+    if (hand.aimValid) {
+      WriteInputPose(&m, aim_off, aim);
+    }
   }
   // 押下ラッチ（計測用）。buttons 欄と同じ bit 割付けであり、旧復号器は読まない。
   m.reserved[0] = latch0;

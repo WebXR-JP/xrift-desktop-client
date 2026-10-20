@@ -4,10 +4,13 @@
 #include <cstdint>
 
 // M2 転送プロトコル（Electron main ⇔ xrift_new.exe）の固定長バイナリ形式。
-// main がサーバ、exe がクライアント。1 メッセージ 192 バイト、リトルエンディアン。
+// main がサーバ、exe がクライアント。1 メッセージ 256 バイト、リトルエンディアン。
 // M1 の 64B 配置は先頭 64B として保存する（Offer/Done の既存オフセットは不変）。
-// 64〜191B に M2 の RenderRequest 領域を足す。Node 側（harness/electron/main.js と
-// protocol-test.js）は同じオフセットで Buffer を読み書きする。
+// 64〜191B に M2 の RenderRequest 領域を足し、M5 で 192〜255B に拡張する。
+// InputState のコントローラ pose は 88〜143B（InputState では未使用の
+// RenderRequest 欄の再利用。種別で区別する）と 160〜215B に載る（下の kInput* 配置）。
+// Node 側（app/src/protocol.ts と harness/electron/main.js と protocol-test.js）は
+// 同じオフセットで Buffer を読み書きする。
 // レイアウトを変えたら両側と static_assert を同時に更新する。
 
 namespace xrift::transfer {
@@ -15,7 +18,8 @@ namespace xrift::transfer {
 // "XRFT" をリトルエンディアン u32 で読んだ値。
 constexpr uint32_t kMagic = 0x54465258u;
 // M2 で 192B 化したため版を上げる。M1 の 64B 送信側とは枠が合わないため混用しない。
-constexpr uint16_t kVersion = 2;
+// M5 で 256B 化したため更に版を上げる。192B の相手とは枠が合わないため混用しない。
+constexpr uint16_t kVersion = 3;
 
 constexpr uint16_t kTypeOffer = 1;          // main → exe。借用中の複製ハンドルを渡す。
 constexpr uint16_t kTypeDone = 2;           // exe → main。GPU コピー完了（または失敗）を返す。
@@ -37,7 +41,7 @@ constexpr uint32_t kStatusVerifyFailed = 2;
 // 値は status 域と衝突しない番兵である。
 constexpr uint32_t kStatusNoAck = 0xFFFFFFFFu;
 
-constexpr size_t kMessageSize = 192;
+constexpr size_t kMessageSize = 256;
 
 // 左右の pose（position xyz + orientation xyzw）と FOV（left/right/up/down）。
 // 単位は XR そのまま（位置=m、角度=rad）。所有権の意味は持たない値束である。
@@ -57,13 +61,15 @@ struct EyeFov {
 // オフセット: magic 0, version 4, type 6, borrowId 8, width 16, height 20,
 // format 24, handle 28, status 36, renderId 40, connEpoch 48, spaceEpoch 52,
 // leftPos 56, leftOri 68, rightPos 84, rightOri 96, leftFov 112, rightFov 128,
-// reqWidth 144, reqHeight 148, reserved 152。合計 192 バイト。
+// reqWidth 144, reqHeight 148, reserved 152。合計 256 バイト。
 // Offer/Done では 40 以降を 0 で送り、受信側は読まない（M1 経路の挙動は変えない）。
 // RenderRequest（exe→main）では borrowId/handle/status を 0 にし、renderId 以降を使う。
 // width/height は RenderRequest では要求アトラス寸法（横並び全体）を入れる。
 // InputState（exe→main）では予約先頭 2B（reserved[0]=左、[1]=右）に押下ラッチ
 // （その 1 秒間に押されたボタンの集合。buttons 欄と同じ bit 割付け）を載せる。
 // 短い押下の取りこぼし診断用であり、旧復号器は予約域を読まないため版は上げない。
+// M5 の InputState のコントローラ pose（下の kInputGrip*・kInputAim* 配置）は
+// 種別で区別する再利用であり、RenderRequest の既存欄のオフセットは変えない。
 struct TransferMessage {
   uint32_t magic = 0;
   uint16_t version = 0;
@@ -85,11 +91,11 @@ struct TransferMessage {
   float rightFov[4] = {};
   uint32_t reqWidth = 0;
   uint32_t reqHeight = 0;
-  uint8_t reserved[40] = {};
+  uint8_t reserved[104] = {};
 };
 #pragma pack(pop)
 
-static_assert(sizeof(TransferMessage) == 192, "転送メッセージは 192 バイト固定であること");
+static_assert(sizeof(TransferMessage) == 256, "転送メッセージは 256 バイト固定であること");
 static_assert(sizeof(TransferMessage) == kMessageSize, "kMessageSize と実体は一致すること");
 static_assert(offsetof(TransferMessage, borrowId) == 8, "borrowId の位置は Node 側と一致すること");
 static_assert(offsetof(TransferMessage, handle) == 28, "handle の位置は Node 側と一致すること");
@@ -163,7 +169,8 @@ inline TransferMessage MakeRenderRequest(uint64_t renderId, uint32_t connEpoch,
 }
 
 // ---- M4: haptics 指令（main → exe）と入力スナップショット（exe → main） ----
-// どちらも 192B 固定の TransferMessage に載せる。版は上げない（kVersion=2 のまま）。
+// どちらも 256B 固定の TransferMessage に載せる。M5 で 192B→256B 化したため
+// 版を上げる（kVersion=3。枠が合わない 192B の相手とは混用しない）。
 // 未知の種別を読む側は無視するため、M1/M2 の既存経路の挙動は変えない。
 // レイアウトを変えたら C++ 側・JS 側（main.js と protocol-test.js）を同時に更新する。
 
@@ -319,5 +326,59 @@ constexpr size_t kInputHandFloatActive = 10;  // bit0=trigger、bit1=squeeze。
 constexpr size_t kInputHandVecActive = 11;    // bit0=thumbstick、bit1=trackpad。
 constexpr size_t kInputHandBtnSupported = 12;
 constexpr size_t kInputHandAnalogSupported = 13;  // bit0=trigger、bit1=squeeze、bit2=stick、bit3=pad。
+
+// InputState（exe → main）のコントローラ pose 配置。各 pose は position xyz＋
+// orientation xyzw の float LE（28B）である。
+// 左手 2 pose は InputState では未使用の 88〜143B（RenderRequest では rightPos 末尾・
+// rightOri・左右 FOV の位置）に、右手 2 pose は M5 拡張の 160〜215B に載せる。
+// 種別（type=5）で区別する再利用であり、RenderRequest の既存欄のオフセットは
+// 変えない。InputState では 144〜159B（req 欄・ラッチ・詰め物）と 216〜255B は 0 である。
+// 有効性は既存の手 flags（bit1=grip・bit2=aim）で表し、新たな欄は設けない。
+// 無効時の値は 0 のままにし、受信側は読まないこと（JS 側も flags を見て valid を決める）。
+constexpr size_t kInputPoseSize = 28;
+constexpr size_t kInputGripLeft = 88;
+constexpr size_t kInputAimLeft = 116;
+constexpr size_t kInputGripRight = 160;
+constexpr size_t kInputAimRight = 188;
+
+// pose 1 件の値束。所有権の意味は持たない。
+struct ControllerPose {
+  float position[3] = {};
+  float orientation[4] = {};
+};
+
+// InputState メッセージの指定オフセットへ pose を書く・読む。
+// 呼び出し側は 4B 境界の上記 kInput* 配置を使うこと。
+inline void WriteInputPose(TransferMessage* m, size_t offset, const ControllerPose& pose) {
+  uint8_t* base = reinterpret_cast<uint8_t*>(m);
+  float* dst = reinterpret_cast<float*>(base + offset);
+  for (int i = 0; i < 3; ++i) {
+    dst[i] = pose.position[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    dst[3 + i] = pose.orientation[i];
+  }
+}
+
+inline ControllerPose ReadInputPose(const TransferMessage& m, size_t offset) {
+  const uint8_t* base = reinterpret_cast<const uint8_t*>(&m);
+  const float* src = reinterpret_cast<const float*>(base + offset);
+  ControllerPose pose{};
+  for (int i = 0; i < 3; ++i) {
+    pose.position[i] = src[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    pose.orientation[i] = src[3 + i];
+  }
+  return pose;
+}
+
+// M5 の InputState pose 配置。左手 2 pose は 88〜143B、右手 2 pose は 160〜215B であり、
+// 境界は 4B 揃え、末尾は 256B に収まること。ラッチ（152,153）と req 欄（144〜151）は避ける。
+static_assert(kInputAimLeft == kInputGripLeft + kInputPoseSize, "左 aim pose は左 grip の直後であること");
+static_assert(kInputAimRight == kInputGripRight + kInputPoseSize,
+              "右 aim pose は右 grip の直後であること");
+static_assert(kInputAimRight + kInputPoseSize == 216, "pose 領域の末尾は 216 であること");
+static_assert(kInputAimRight + kInputPoseSize <= kMessageSize, "pose 領域はメッセージに収まること");
 
 }  // namespace xrift::transfer

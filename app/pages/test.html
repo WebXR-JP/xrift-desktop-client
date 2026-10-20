@@ -33,6 +33,19 @@ window.addEventListener('unhandledrejection', (e) => {
 })
 const info = { frames: 0, presenting: false, lastRecord: null, session: null }
 window.__m5info = info
+// 入力イベントの目視確認用（最新 6 件を HUD に残す）。
+const evLog = []
+window.__m5events = evLog
+function noteEv(text) {
+  evLog.push(`${new Date().toISOString().slice(11, 19)} ${text}`)
+  if (evLog.length > 6) evLog.splice(0, evLog.length - 6)
+  console.log('[XRift M5] ev', text)
+}
+function connText() {
+  const c = window.__m5input || { left: false, right: false, leftProfile: '', rightProfile: '' }
+  const side = (on, prof) => (on ? `接続${prof ? `(${prof})` : ''}` : '未接続')
+  return `conn L:${side(c.left, c.leftProfile)} R:${side(c.right, c.rightProfile)}`
+}
 
 const renderer = new THREE.WebGLRenderer({ antialias: true })
 renderer.setSize(innerWidth, innerHeight)
@@ -91,6 +104,48 @@ function sidePlate(color, x) {
 }
 scene.add(sidePlate(0xff00ff, -1.2))
 scene.add(sidePlate(0x00ffff, 1.2))
+// M5: 左右コントローラの追従キューブ（左=マゼンタ、右=シアン）。
+// `gripSpace` の pose が来ていれば手に追従し、無効時は隠す。
+// レイ・モデルの代わりの実機確認用である。
+const ctlCubes = [0xff44ff, 0x44ffff].map((color) => {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(0.06, 0.06, 0.06),
+    new THREE.MeshBasicMaterial({ color }),
+  )
+  m.visible = false
+  scene.add(m)
+  return m
+})
+let ctlRefSpace = null
+function updateControllers(frame, srcs) {
+  if (!ctlRefSpace) {
+    ctlCubes.forEach((c) => { c.visible = false })
+    return
+  }
+  for (let i = 0; i < 2; i++) {
+    const want = i === 0 ? 'left' : 'right'
+    const cube = ctlCubes[i]
+    const src = srcs.find((s) => s.handedness === want)
+    if (!src) { cube.visible = false; continue }
+    // 注入シム由来のため例外時は隠す側に倒す（描画ループを止めない）。
+    let pose = null
+    try {
+      pose = frame.getPose(src.gripSpace, ctlRefSpace)
+    } catch (e) {
+      console.log('[XRift M5] controller pose failed', e && e.message)
+    }
+    if (!pose) { cube.visible = false; continue }
+    cube.visible = true
+    const p = pose.transform.position, q = pose.transform.orientation
+    cube.position.set(p.x, p.y, p.z)
+    cube.quaternion.set(q.x, q.y, q.z, q.w)
+  }
+}
+function ctlNote() {
+  return ctlCubes
+    .map((c, i) => `${i === 0 ? 'L' : 'R'}:${c.visible ? `(${c.position.x.toFixed(2)},${c.position.y.toFixed(2)},${c.position.z.toFixed(2)})` : '-'}`)
+    .join(' ')
+}
 
 function padState(gp, prefix) {
   if (!gp) return `${prefix}: -`
@@ -111,6 +166,7 @@ renderer.setAnimationLoop((t, frame) => {
   if (frame) {
     info.frames++
     info.presenting = renderer.xr.isPresenting
+    if (xrSession) updateControllers(frame, xrSession.inputSources)
   }
   renderer.render(scene, cam)
   // XR フレームでは受理用の画素内ブロックを刻む（M2 画像配置が正典）。
@@ -127,17 +183,22 @@ renderer.setAnimationLoop((t, frame) => {
     const gp = (i) => (src[i] ? src[i].gamepad : null)
     const latch = window.__m5latch || { left: '-', right: '-' }
     const waitNote = info.frames === 0 ? '\nXR 待機中（HMD を装着してください）' : ''
+    const evNote = evLog.length > 0 ? `\nevents:\n${evLog.join('\n')}` : '\nevents: -'
     hud.textContent =
       `frames=${info.frames} presenting=${renderer.xr.isPresenting}${waitNote}\n` +
-      `inputs=${src.length} (${src.map((s) => s.handedness).join(',')})\n` +
+      `input sources: ${src.length} (${src.map((s) => s.handedness).join(',') || '-'})\n` +
+      `${connText()}\n` +
+      `controllers: ${ctlNote()}\n` +
       `${padState(gp(0), 'L')}\n` +
       `${padState(gp(1), 'R')}\n` +
       `latch L:${latch.left} R:${latch.right}\n` +
-      (info.lastStamp ? `stamp id=${info.lastStamp.renderId} id16=${info.lastStamp.id16} tag=${info.lastStamp.tag}` : 'stamp=-')
+      (info.lastStamp ? `stamp id=${info.lastStamp.renderId} id16=${info.lastStamp.id16} tag=${info.lastStamp.tag}` : 'stamp=-') +
+      evNote
   } else {
     const latch = window.__m5latch || { left: '-', right: '-' }
+    const evNote = evLog.length > 0 ? `\nevents:\n${evLog.join('\n')}` : ''
     hud.textContent = `frames=${info.frames} (no XR session yet)\n` +
-      `XR 待機中（HMD を装着してください）\nlatch L:${latch.left} R:${latch.right}`
+      `XR 待機中（HMD を装着してください）\n${connText()}\nlatch L:${latch.left} R:${latch.right}${evNote}`
   }
   updateWaiting()
 })
@@ -242,8 +303,37 @@ try {
   xrSession = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] })
   info.session = true
   await renderer.xr.setSession(xrSession)
+  // 追従キューブ用の基準空間。three の描画空間（既定 local-floor）と合わせる。
+  try {
+    ctlRefSpace = await xrSession.requestReferenceSpace('local-floor')
+  } catch (e) {
+    console.log('[XRift M5] controller refspace failed: ' + (e && e.message))
+  }
   console.log('[XRift M5] session started, layer',
     xrSession.renderState.baseLayer?.framebufferWidth, 'x', xrSession.renderState.baseLayer?.framebufferHeight)
+  // 入力イベントの目視確認: select/squeeze のエッジと inputsourceschange を HUD に出す。
+  // select では 0.8 / 120ms の pulse を打ち、実機で振動を確認できるようにする。
+  const shortHand = (src) => (src.handedness === 'left' ? 'L' : src.handedness === 'right' ? 'R' : '?')
+  for (const t of ['selectstart', 'select', 'selectend', 'squeezestart', 'squeeze', 'squeezeend']) {
+    xrSession.addEventListener(t, (e) => {
+      const h = shortHand(e.inputSource)
+      noteEv(`${t} ${h}`)
+      if (t === 'select') {
+        try {
+          const p = e.inputSource.gamepad.hapticActuators[0].pulse(0.8, 120)
+          if (p && typeof p.then === 'function') p.then(() => noteEv(`pulse ${h} 0.8/120ms ok`))
+          else noteEv(`pulse ${h} 0.8/120ms sent`)
+        } catch (err) {
+          noteEv(`pulse ${h} failed: ${err && err.message}`)
+        }
+      }
+    })
+  }
+  xrSession.addEventListener('inputsourceschange', (e) => {
+    const names = xrSession.inputSources.map((s) => s.handedness).join(',') || '-'
+    noteEv(`inputsourceschange +${e.added.length} -${e.removed.length} now:${xrSession.inputSources.length}(${names})`)
+  })
+  noteEv(`session started inputs=${xrSession.inputSources.length}`)
   xrSession.addEventListener('end', () => { console.log('[XRift M5] session ended'); xrSession = null })
 } catch (e) {
   console.log('[XRift M5] session failed: ' + (e && e.message))

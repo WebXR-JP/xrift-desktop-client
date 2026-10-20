@@ -48,7 +48,7 @@ bool IsDisconnect(DWORD code) {
 }
 
 // overlapped I/O の保持状態。PipeClient のメンバ（io_）が所有する。
-// 読みの部分受信（64B 未満）は staged に溜めて次回呼び出しへ継続する。
+// 読みの部分受信（1 メッセージ未満）は staged に溜めて次回呼び出しへ継続する。
 struct IoState {
   OVERLAPPED readOv{};
   HANDLE readEvent = nullptr;
@@ -150,8 +150,8 @@ PipeClient::PipeClient(const std::string& pipeName) {
     }
   }
   // Node の net.createServer が作るパイプはバイト型であり、ここでメッセージ型への
-  // 切り替えはできない（ERROR_INVALID_PARAMETER になる）。全メッセージが 64 バイト
-  // 固定のため、バイト型のまま枠合わせすれば境界は崩れない。
+  // 切り替えはできない（ERROR_INVALID_PARAMETER になる）。全メッセージが
+  // 固定長のため、バイト型のまま枠合わせすれば境界は崩れない。
   // メッセージモードの強制はしない。
   IoState* io = new IoState();
   io->readEvent = ::CreateEventA(nullptr, FALSE, FALSE, nullptr);

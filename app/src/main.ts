@@ -49,8 +49,39 @@ const SECONDS = Math.max(0, parseInt(arg('seconds', '0'), 10) || 0);
 const WIN_W = parseInt(arg('width', '2048'), 10) || 2048;
 const WIN_H = parseInt(arg('height', '1024'), 10) || 1024;
 const SPACE = arg('space', 'auto');
-const PAGE = arg('page', 'test.html');
-const URL = arg('url', '');
+const PAGE_ARG = arg('page', '');
+const URL_ARG = arg('url', '');
+/**
+ * 開く対象を決める。`--url` が正典であり、`--page` は互換のために残す。
+ *
+ * - `https?://`・`file://` で始まればそのまま URL として開く
+ * - それ以外の空でない文字（`pages/test.html`・`test.html` 等）は pages 配下の
+ *   ファイルとして開く（`--url=pages/test.html` の検証命令に対応するため）
+ * - どちらも空なら既定の `pages/test.html`
+ */
+function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: string } {
+  const raw = URL_ARG !== '' ? URL_ARG : PAGE_ARG !== '' ? PAGE_ARG : 'test.html';
+  if (/^https?:\/\//i.test(raw) || /^file:\/\//i.test(raw)) {
+    return { kind: 'url', url: raw };
+  }
+  if (path.isAbsolute(raw) && fs.existsSync(raw)) {
+    return { kind: 'file', file: raw };
+  }
+  const pagesBase = path.join(__dirname, '..', 'pages');
+  const candidates = [
+    path.join(pagesBase, path.basename(raw)),
+    path.join(pagesBase, raw),
+    path.join(__dirname, '..', raw),
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isFile()) return { kind: 'file', file: c };
+    } catch { /* 次の候補へ */ }
+  }
+  // ファイルとして見つからなければ URL として扱う（到達失敗は did-fail-load に残る）。
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return { kind: 'url', url: raw };
+  return { kind: 'file', file: candidates[0] };
+}
 const ADDON_PATH = arg(
   'addon',
   path.join(__dirname, '..', '..', 'native_new', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node'),
@@ -504,7 +535,8 @@ function onInputState(m: Buffer): void {
 function summarizeHand(h: InputSnapshot['left']): string {
   return `${h.connected ? '接続' : '未接続'} prof=${h.profile} ` +
     `trig=${h.trigger.toFixed(2)} sq=${h.squeeze.toFixed(2)} ` +
-    `stick=(${h.thumbstick[0].toFixed(2)},${h.thumbstick[1].toFixed(2)})`;
+    `stick=(${h.thumbstick[0].toFixed(2)},${h.thumbstick[1].toFixed(2)}) ` +
+    `grip=${h.grip.valid ? '有効' : '無効'} aim=${h.aim.valid ? '有効' : '無効'}`;
 }
 
 // HapticCommand を exe へ送る。送信結果（成功・inactive・失敗）は exe 側のログと統計に残る。
@@ -695,7 +727,11 @@ async function createWindow(): Promise<BrowserWindow> {
       if (typeof args[1] === 'number') level = args[1];
       if (typeof args[2] === 'string') message = args[2];
     }
-    if (message.includes('[XRift M5]') || message.includes('[M5') || level === 2) {
+    // 本番ページの XR 到達確認（isSessionSupported/requestSession の有無）を
+    // ログで追えるよう、XR 関連の行も拾う（通常ページの雑音は入れない）。
+    const interesting = message.includes('[XRift M5]') || message.includes('[M5') || level === 2 ||
+      /xr|immersive|session|haptic|pulse/i.test(message);
+    if (interesting) {
       log('renderer-console: ' + message.replace(/%c|color:#a07cff/g, '').trim().slice(0, 2000));
     }
   });
@@ -726,12 +762,54 @@ async function createWindow(): Promise<BrowserWindow> {
     }
   });
 
-  if (URL !== '') {
-    await win.loadURL(URL);
-    log(`loaded url=${URL}`);
+  // 認証・ポップアップ: window.open は VR 用 OSR には載せず、
+  // 通常の可視ウィンドウで開く（OSR は VR 用の 1 枚だけ）。
+  // 認証後の外部ホストへの遷移は許可し、止まった位置は will-navigate に残す。
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    log(`window.open 要求 url=${url}（認証用ポップアップとして可視ウィンドウで開く）`);
+    try {
+      const popup = new BrowserWindow({
+        width: 900,
+        height: 700,
+        show: true,
+        autoHideMenuBar: true,
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          backgroundThrottling: false,
+        },
+      });
+      void popup.loadURL(url).catch((e: unknown) => {
+        log(`popup load 失敗 url=${url}: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      popup.webContents.on('will-navigate', (_e, navUrl) => {
+        log(`popup will-navigate url=${navUrl}`);
+      });
+    } catch (e) {
+      log(`popup 作成に失敗 url=${url}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (_event, navUrl) => {
+    // 外部ホストへの遷移は許可する（阻止しない）。VR ウィンドウがどこに留まったかは
+    // この行で追える（app.xrift.net に留まることが期待値）。
+    log(`will-navigate url=${navUrl}`);
+  });
+  win.webContents.on('did-finish-load', () => {
+    log(`did-finish-load url=${win.webContents.getURL()}`);
+  });
+  win.webContents.on('did-fail-load', (_event, code, desc, validatedUrl) => {
+    log(`did-fail-load code=${code} desc=${desc} url=${validatedUrl}`);
+  });
+
+  const target = resolveTarget();
+  if (target.kind === 'url') {
+    await win.loadURL(target.url);
+    log(`loaded url=${target.url}`);
   } else {
-    await win.loadFile(path.join(__dirname, '..', 'pages', PAGE));
-    log(`loaded page=${PAGE}`);
+    await win.loadFile(target.file);
+    log(`loaded page=${target.file}`);
   }
   scheduleCapture(win);
 
@@ -894,11 +972,22 @@ function start(): void {
     sendHaptic(Math.trunc(hand), intensity, Math.trunc(durationMs));
   });
   // ページの到達確認用。exe 生存とパイプ接続だけを見る（HMD 装着の有無は見ない）。
-  ipcMain.handle('xr:probe', () => ({
-    ok: exeProc !== null && exeProc.exitCode === null && socket !== null && !socket.destroyed,
-    exeAlive: exeProc !== null && exeProc.exitCode === null,
-    pipeConnected: socket !== null && !socket.destroyed,
-  }));
+  // シムは準備前に最大 15 秒ポーリングするため、最初の数回と結果変化だけ記録する。
+  let probeCount = 0;
+  let lastProbeOk: boolean | null = null;
+  ipcMain.handle('xr:probe', () => {
+    const res = {
+      ok: exeProc !== null && exeProc.exitCode === null && socket !== null && !socket.destroyed,
+      exeAlive: exeProc !== null && exeProc.exitCode === null,
+      pipeConnected: socket !== null && !socket.destroyed,
+    };
+    probeCount++;
+    if (probeCount <= 5 || res.ok !== lastProbeOk) {
+      log(`xr:probe #${probeCount} ok=${res.ok} exeAlive=${res.exeAlive} pipe=${res.pipeConnected}`);
+    }
+    lastProbeOk = res.ok;
+    return res;
+  });
 
   createWindow().catch((e: unknown) => {
     log('createWindow FAILED: ' + (e instanceof Error ? e.stack : String(e)));

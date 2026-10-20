@@ -7,6 +7,6 @@
   "scripts": {
     "build": "tsc -p .",
     "start": "electron .",
-    "test": "npm run build && node test/m2codec.test.cjs"
+    "test": "npm run build && node test/m2codec.test.cjs && node test/protocol.test.cjs && node test/shim-pose.test.cjs"
   }
 }

@@ -26,9 +26,18 @@ export function installM5XR(): void {
     reqHeight: number;
     staleHint: boolean;
   }
+  interface M5Pose {
+    valid: boolean;
+    position: number[];
+    orientation: number[];
+  }
   interface M5Hand {
     connected: boolean;
     profile: string;
+    /** grip 空間の pose。無効時はシムの `gripSpace` が null を返す。 */
+    grip: M5Pose;
+    /** aim 空間の pose。無効時はシムの `targetRaySpace` が null を返す。 */
+    aim: M5Pose;
     trigger: number;
     squeeze: number;
     thumbstickClick: boolean;
@@ -234,11 +243,26 @@ export function installM5XR(): void {
     head: Float32Array;
     hands: HandPose[];
   }
-  /** 行列化済みの手。grip/aim は pipe が pose を運ばないため null のことがある。 */
+  /** 行列化済みの手。pose が無効なとき gripMat/aimMat は null である。 */
   interface HandPose extends M5Hand {
-    grip: Float32Array | null;
-    aim: Float32Array | null;
+    gripMat: Float32Array | null;
+    aimMat: Float32Array | null;
   }
+
+  // pipe 由来の pose をアプリ空間の行列にする。無効・不正なときは null を返す
+  // （`getPose` が null を返し、three はコントローラを出さない）。
+  // 受信値は外部入力のため、有効旗・有限数・回転の長さを確認してから行列化する。
+  function poseToMat(p: M5Pose | null | undefined): Float32Array | null {
+    if (!p || p.valid !== true) return null;
+    const pos = p.position, ori = p.orientation;
+    if (!Array.isArray(pos) || !Array.isArray(ori) || pos.length < 3 || ori.length < 4) return null;
+    if (![pos[0], pos[1], pos[2], ori[0], ori[1], ori[2], ori[3]]
+      .every((v) => typeof v === 'number' && Number.isFinite(v))) return null;
+    const len = Math.hypot(ori[0], ori[1], ori[2], ori[3]);
+    if (!(len > 1e-6)) return null;
+    return quatToMat([pos[0], pos[1], pos[2]], [ori[0] / len, ori[1] / len, ori[2] / len, ori[3] / len]);
+  }
+  const NO_POSE: M5Pose = { valid: false, position: [0, 0, 0], orientation: [0, 0, 0, 0] };
 
   class XRFrame {
     session: XRSession;
@@ -331,8 +355,8 @@ export function installM5XR(): void {
       this.profiles = PROFILES[profile] || ['generic-trigger-squeeze-thumbstick'];
       this.gamepad = new XRGamepad(i);
       this._profile = profile;
-      this.targetRaySpace = new XRSpace(session, (f) => (f._d.hands[i] && f._d.hands[i].aim) || null);
-      this.gripSpace = new XRSpace(session, (f) => (f._d.hands[i] && f._d.hands[i].grip) || null);
+      this.targetRaySpace = new XRSpace(session, (f) => (f._d.hands[i] && f._d.hands[i].aimMat) || null);
+      this.gripSpace = new XRSpace(session, (f) => (f._d.hands[i] && f._d.hands[i].gripMat) || null);
     }
   }
   class XRInputSourceEvent extends Event {
@@ -388,6 +412,11 @@ export function installM5XR(): void {
   // main 世界へ公開する（シム自体の入力駆動には使わない）。
   let latestLatch: { left: string; right: string } = { left: '-', right: '-' };
   (window as unknown as { __m5latch?: { left: string; right: string } }).__m5latch = latestLatch;
+  // InputState の左右接続（HUD がセッション前でも接続を表示できるよう公開する）。
+  // シム自体の入力駆動には使わない。
+  let latestConn: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } =
+    { left: false, right: false, leftProfile: '', rightProfile: '' };
+  (window as unknown as { __m5input?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__m5input = latestConn;
   const recordWaiters: ((rec: M5Record) => void)[] = [];
   B.onRecord((rec) => {
     latestRecord = rec;
@@ -404,6 +433,21 @@ export function installM5XR(): void {
       right: typeof snap.latchRight === 'string' ? snap.latchRight : '-',
     };
     (window as unknown as { __m5latch?: { left: string; right: string } }).__m5latch = latestLatch;
+    // 左右の接続・profile を HUD 用に公開する（欠けたら未接続扱い）。
+    const handOf = (h: unknown): { connected: boolean; profile: string } => {
+      if (h !== null && typeof h === 'object') {
+        const r = h as Record<string, unknown>;
+        return {
+          connected: r.connected === true,
+          profile: typeof r.profile === 'string' ? (r.profile as string) : '',
+        };
+      }
+      return { connected: false, profile: '' };
+    };
+    const l = handOf((snap as unknown as Record<string, unknown>).left);
+    const r = handOf((snap as unknown as Record<string, unknown>).right);
+    latestConn = { left: l.connected, right: r.connected, leftProfile: l.profile, rightProfile: r.profile };
+    (window as unknown as { __m5input?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__m5input = latestConn;
   });
   function nextRecord(timeoutMs: number): Promise<M5Record> {
     if (latestRecord) return Promise.resolve(latestRecord);
@@ -605,7 +649,8 @@ export function installM5XR(): void {
       ];
       const a = rec.leftPos, b = rec.rightPos;
       const head = quatToMat([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2], rec.leftOri);
-      // 入力は pipe が pose を運ばないため grip/aim は null（ボタン・軸だけが有効）。
+      // 入力 pose は pipe の InputState が運ぶ。有効なものだけ行列化し、
+      // 無効時は null のままにする（`getPose` が null を返す）。
       const inp = latestInput;
       const hands: HandPose[] = [0, 1].map((i) => {
         const h = inp ? (i === 0 ? inp.left : inp.right) : null;
@@ -613,8 +658,9 @@ export function installM5XR(): void {
           connected: false, profile: '', trigger: 0, squeeze: 0,
           thumbstickClick: false, trackpadClick: false, primary: false, secondary: false, menu: false,
           thumbstick: [0, 0], trackpad: [0, 0], hasThumbstick: false, hasTrackpad: false,
+          grip: NO_POSE, aim: NO_POSE,
         };
-        return { ...base, grip: null, aim: null };
+        return { ...base, gripMat: poseToMat(base.grip), aimMat: poseToMat(base.aim) };
       });
       this._captureOrigin(head);
       const frame = new XRFrame(this, { time: performance.now(), viewsValid: true, positionTracked: true, views, head, hands });
@@ -724,6 +770,23 @@ export function installM5XR(): void {
 
   // ------------------------------------------------------------ XRSystem
   const SUPPORTED = new Set(['viewer', 'local', 'local-floor', 'bounded-floor', 'unbounded']);
+  // 本番ページが起動直後に呼んでも exe の準備前は false にならないよう、
+  // 一定時間だけ到達確認を繰り返す（セッション開始要求の保留と対にする）。
+  function sleepMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  async function waitProbeOk(timeoutMs: number): Promise<boolean> {
+    const t0 = Date.now();
+    for (;;) {
+      try {
+        if ((await B.probe()).ok === true) return true;
+      } catch {
+        // 到達確認の失敗は未準備扱いとし、訴えない（タイムアウト時に 1 行だけ出す）。
+      }
+      if (Date.now() - t0 >= timeoutMs) return false;
+      await sleepMs(500);
+    }
+  }
   class XRSystem extends EventTarget {
     _active: XRSession | null = null;
     ondevicechange: ((ev: Event) => void) | null = null;
@@ -731,11 +794,11 @@ export function installM5XR(): void {
     async isSessionSupported(mode: string): Promise<boolean> {
       if (mode === 'inline') return true;
       if (mode !== 'immersive-vr') return false;
-      try {
-        return (await B.probe()).ok === true;
-      } catch {
-        return false;
-      }
+      // 本番ページの起動直後の呼び出しに備え、exe の準備ができるまで最大 15 秒待つ。
+      // main 側のログで結果を確認できるよう 1 行だけ出す。
+      const ok = await waitProbeOk(15000);
+      log(`isSessionSupported('immersive-vr') -> ${ok}`);
+      return ok;
     }
     async requestSession(mode: string, init: { requiredFeatures?: string[]; optionalFeatures?: string[] } = {}): Promise<XRSession> {
       if (mode !== 'immersive-vr') throw new DOMException(`"${mode}" is not supported`, 'NotSupportedError');
@@ -744,8 +807,11 @@ export function installM5XR(): void {
         if (!SUPPORTED.has(f)) throw new DOMException(`required feature "${f}" is not supported`, 'NotSupportedError');
       }
       const enabled = ['viewer', 'local', ...new Set([...(init.requiredFeatures || []), ...(init.optionalFeatures || [])].filter((f) => SUPPORTED.has(f)))];
+      log(`requestSession('${mode}') 要求あり（exe の描画要求待ち。最大 20 秒）`);
       // exe は main 起動時に既に動いているはずであり、ここでは最初の record を待つ。
+      // 非装着でも RenderRequest の 1 件目が来れば解決する（準備後の解決）。
       const rec = await nextRecord(20000);
+      if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
       if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
       const info: SessionInfo = {
         width: rec.reqWidth, height: rec.reqHeight,

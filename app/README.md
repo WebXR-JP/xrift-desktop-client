@@ -14,7 +14,7 @@ M5 の最初のスライス。exe 主導の描画要求（`RenderRequest`）を 
 | `src/preload.ts` | `contextBridge` で `window.__xriftXR`（`onRecord`/`onInput`/`haptic`/`probe`）だけを公開し、`executeInMainWorld` でシムを注入する。Node の機能は渡さない |
 | `src/m2codec.ts` | M2 制御ブロックのコーデック（正本は C++ の `render_record.h`・`m2_blocks.h`。harness の `m2-codec.js` の移植）。量子化・pose タグ・ブロック符号化。`test/m2codec.test.cjs` で C++ との一致を確認する |
 | `src/shim.ts` | WebXR シム。移植元は `electron/webxr-mainworld.cjs`（API 形状・数学・イベントロジックは同一）。旧ブリッジ `B` を新ブリッジに置換。`present` は無い（OSR の paint が提出を駆動する）。record ごとに M2 制御ブロック（renderId/pose タグ・左右マーカー）を overlay canvas に描く |
-| `pages/test.html` | three.js のテストページ（グリッド + 色キューブ + テキスト板 + 左右識別板 + 入力 HUD）。読み込み後に自動で `immersive-vr` セッションを開始する |
+| `pages/test.html` | three.js のテストページ（グリッド + 色キューブ + テキスト板 + 左右識別板 + 入力 HUD）。読み込み後に自動で `immersive-vr` セッションを開始する。HUD には `input sources: N`・左右の接続（`__m5input`）・直近の入力イベント（`select L`・`squeeze R` 等）を出し、`select` では `hapticActuators[0].pulse(0.8, 120)` を打つ |
 | `logs/` | 実行証拠（`m5-run.log`、`m5-stats.json`、capture PNG）。生成物でありコミットしない |
 
 ## 前提
@@ -42,8 +42,11 @@ npx electron app --seconds=20 --capture-at=15000,m5-cap.png
 #   --space=<auto|local|stage|local-floor>  exe の参照空間の要求（既定 auto）
 #   --seconds=N            N 秒で自動停止（既定 0=手動終了）
 #   --width=W --height=H   OSR ウィンドウ寸法（既定 2048x1024）
-#   --page=<file>          pages/ 以下の HTML（既定 test.html）
-#   --url=<url>            ファイルの代わりに URL を開く（未検証）
+#   --page=<file>          pages/ 以下の HTML（既定 test.html。`--url` があればそちらが優先）
+#   --url=<url>            開く対象（正典）。`https://…`/`file://…` は URL として開き、
+#                          それ以外（`pages/test.html`・`test.html` 等）は pages 配下の
+#                          ファイルとして開く。既定は `pages/test.html`。
+#                          例: `--url=pages/test.html`、`--url=https://app.xrift.net/`
 #   --capture-at=Ms,path[;Ms,path]  指定時刻に capturePage で PNG 保存（描画経路に入れない）
 #   --exe-log=<path>       exe の stdout/stderr の保存先（既定 m5-exe.log。logs/ 基準。空で保存しない）
 ```
@@ -99,9 +102,16 @@ root の `package.json` にもある（`pnpm app:build`、`pnpm app:start`）。
   `gripSpace`/`targetRaySpace` の `getPose` は `null` を返す。ボタン・軸・振動は有効。
 - 色は未決（exe 側の DESIGN §9 に準じる）。sRGB のみの環境では警告が出る場合がある。
 - `positionTracked` は常に `true` を報告する（非装着時の無効 pose の検出はしない）。
+- `isSessionSupported('immersive-vr')` は exe の準備ができるまで最大 15 秒待ってから
+  結果を返す。`requestSession` は最初の `RenderRequest` まで最大 20 秒待つ。
+- `window.open` は VR 用 OSR には載せず、認証用ポップアップとして通常の可視ウィンドウで
+  開く（OSR は VR 用の 1 枚だけ）。外部ホストへの遷移は阻止せず、`will-navigate` に記録する。
+  本番のホーム画面は VR に自動で入らないため、`isSessionSupported`/`requestSession` の
+  呼び出しはワールド入室等の操作があるまでログに出ない。
 - セッション状態（begin/end/visibility）は main が管理しない。
   シムは起動時から `visible` として record 駆動でフレームを進める。
 - SteamVR への登録（ライブラリ登録・ランチャー）は未対応。
-- `--url` での外部ページ（app.xrift.net 等）の動作は未検証。
+- `--url` での外部ページ（app.xrift.net 等）はホーム画面の読み込みとシム注入まで確認。
+  XR 呼び出しはページ側の操作待ち（詳細は「非装着実行の実測」を参照）。
 - 旧アプリ（`src/electron`・`electron/`・`native/`）とは無関係に動く。
   共通の依存（`electron`、`three`）は root の `node_modules` を使う。

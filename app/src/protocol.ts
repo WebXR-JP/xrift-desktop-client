@@ -5,12 +5,12 @@
  * @packageDocumentation
  */
 
-/** 1 メッセージの固定長（バイト）。 */
-export const MSG_LEN = 192;
+/** 1 メッセージの固定長（バイト）。M5 で 256B 化した。 */
+export const MSG_LEN = 256;
 /** メッセージ先頭の識別子。 */
 export const MAGIC = 0x54465258;
-/** プロトコル版。 */
-export const VERSION = 2;
+/** プロトコル版。M5 の 256B 化で 3 に上げた。 */
+export const VERSION = 3;
 
 export const TYPE_OFFER = 1;
 export const TYPE_DONE = 2;
@@ -39,10 +39,24 @@ export interface XrRecord {
   readonly staleHint: boolean;
 }
 
-/** 片手の入力。pose は含まない（「0」と「未対応」は active/supported で区別する）。 */
+/** コントローラの pose（grip または aim）。無効時は 0 埋めであり、シムは `null` を返す。 */
+export interface ControllerPose {
+  /** pose が locate できたか。手 flags（bit1=grip・bit2=aim）が正本である。 */
+  readonly valid: boolean;
+  /** 位置（メートル）。無効時は `[0, 0, 0]`。 */
+  readonly position: readonly [number, number, number];
+  /** 姿勢（xyzw）。無効時は `[0, 0, 0, 0]`。 */
+  readonly orientation: readonly [number, number, number, number];
+}
+
+/** 片手の入力。pose の有効性は `grip.valid`・`aim.valid` で表す。 */
 export interface InputHand {
   readonly connected: boolean;
   readonly profile: string;
+  /** grip 空間の pose。シムの `gripSpace` の源である。 */
+  readonly grip: ControllerPose;
+  /** aim 空間の pose。シムの `targetRaySpace` の源である。 */
+  readonly aim: ControllerPose;
   readonly trigger: number;
   readonly squeeze: number;
   readonly thumbstickClick: boolean;
@@ -96,7 +110,31 @@ function decodeLatch(bits: number): string {
   return names.length > 0 ? names.join(',') : '-';
 }
 
-function decodeHand(m: Buffer, base: number): InputHand {
+/**
+ * InputState 内の pose 1 件を復号する。
+ *
+ * @param m - 256 バイトのメッセージ本体。
+ * @param off - pose のオフセット（左 grip=88・左 aim=116・右 grip=160・右 aim=188）。
+ * @param valid - 手 flags の対応 bit（grip=bit1・aim=bit2）。偽のとき値は読まない。
+ * @returns 復号した pose。無効時は 0 埋めである。
+ */
+function decodePose(m: Buffer, off: number, valid: boolean): ControllerPose {
+  if (!valid) {
+    return { valid: false, position: [0, 0, 0], orientation: [0, 0, 0, 0] };
+  }
+  return {
+    valid: true,
+    position: [m.readFloatLE(off), m.readFloatLE(off + 4), m.readFloatLE(off + 8)],
+    orientation: [
+      m.readFloatLE(off + 12),
+      m.readFloatLE(off + 16),
+      m.readFloatLE(off + 20),
+      m.readFloatLE(off + 24),
+    ],
+  };
+}
+
+function decodeHand(m: Buffer, base: number, gripOff: number, aimOff: number): InputHand {
   const flags = m[base];
   const bits = m[base + 8];
   const btnSupported = m[base + 12];
@@ -107,6 +145,8 @@ function decodeHand(m: Buffer, base: number): InputHand {
   return {
     connected: (flags & 1) !== 0,
     profile: PROFILE_NAMES[m[base + 1]] ?? `id=${m[base + 1]}`,
+    grip: decodePose(m, gripOff, (flags & 2) !== 0),
+    aim: decodePose(m, aimOff, (flags & 4) !== 0),
     trigger: m[base + 2] / 255,
     squeeze: m[base + 3] / 255,
     thumbstickClick: pressed(0),
@@ -125,7 +165,7 @@ function decodeHand(m: Buffer, base: number): InputHand {
 /**
  * RenderRequest メッセージを復号する。
  *
- * @param m - 192 バイトのメッセージ本体。
+ * @param m - 256 バイトのメッセージ本体。
  * @returns 復号したレコード。不正な配置のときは `null`。
  */
 export function decodeRecord(m: Buffer): XrRecord | null {
@@ -149,7 +189,7 @@ export function decodeRecord(m: Buffer): XrRecord | null {
 /**
  * InputState メッセージを復号する。
  *
- * @param m - 192 バイトのメッセージ本体。
+ * @param m - 256 バイトのメッセージ本体。
  * @returns 復号したスナップショット。不正な配置のときは `null`。
  */
 export function decodeInput(m: Buffer): InputSnapshot | null {
@@ -158,8 +198,8 @@ export function decodeInput(m: Buffer): InputSnapshot | null {
     frame: m.readBigUInt64LE(40).toString(),
     connEpoch: m.readUInt32LE(48),
     spaceEpoch: m.readUInt32LE(52),
-    left: decodeHand(m, 56),
-    right: decodeHand(m, 72),
+    left: decodeHand(m, 56, 88, 116),
+    right: decodeHand(m, 72, 160, 188),
     latchLeft: decodeLatch(m[152]),
     latchRight: decodeLatch(m[153]),
   };

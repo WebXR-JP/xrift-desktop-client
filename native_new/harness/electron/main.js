@@ -171,11 +171,11 @@ if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
   return;
 }
 
-// プロトコル（native_new/src/transfer/protocol.h と同じ配置。192 バイト LE）。
-// M2 で 64B→192B 化した。先頭 64B の配置は M1 と同じである。
-const MSG_LEN = 192;
+// プロトコル（native_new/src/transfer/protocol.h と同じ配置。256 バイト LE）。
+// M2 で 64B→192B 化し、M5 で 192B→256B 化した。先頭 64B の配置は M1 と同じである。
+const MSG_LEN = 256;
 const MAGIC = 0x54465258;
-const VERSION = 2;
+const VERSION = 3;
 const TYPE_OFFER = 1;
 const TYPE_DONE = 2;
 const TYPE_RENDER_REQUEST = 3;
@@ -683,9 +683,10 @@ function forwardM2Record(m) {
   }
 }
 
-// M4: exe からの InputState を読む。操作の要約であり、pose は含まない
-// （pose の確認は exe 側のログで行う）。「0」と「未対応」の区別は
-// active/supported の 2 段で行う。1 秒に 1 回だけ要約をログに出す。
+// M4: exe からの InputState を読む。M5 で左右の grip/aim pose（position xyz＋
+// orientation xyzw の float LE。左 grip@88・左 aim@116・右 grip@160・右 aim@188）
+// を足した。有効性は手 flags（bit1=grip・bit2=aim）が表す。
+// 「0」と「未対応」の区別は active/supported の 2 段で行う。1 秒に 1 回だけ要約をログに出す。
 // 予約先頭 2B（offset 152,153）は左右の押下ラッチ（その 1 秒間に押された
 // ボタンの集合。buttons と同じ bit 割付け。protocol.h を参照）。
 const PROFILE_NAMES = {
@@ -728,6 +729,15 @@ function decodeInputHand(m, base) {
     stickState: stickActive ? '' : (((m[base + 13] & 4) !== 0) ? '(inactive)' : '(非対応)'),
   };
 }
+// M5 の pose 1 件（position xyz＋orientation xyzw の float LE）。無効時は 0 埋め。
+function decodeInputPose(m, off, valid) {
+  if (!valid) return { valid: false, position: [0, 0, 0], orientation: [0, 0, 0, 0] };
+  return {
+    valid: true,
+    position: [m.readFloatLE(off), m.readFloatLE(off + 4), m.readFloatLE(off + 8)],
+    orientation: [m.readFloatLE(off + 12), m.readFloatLE(off + 16), m.readFloatLE(off + 20), m.readFloatLE(off + 24)],
+  };
+}
 function onInputState(m) {
   const st = {
     frame: m.readBigUInt64LE(40).toString(),
@@ -738,14 +748,21 @@ function onInputState(m) {
     latchLeft: decodeLatch(m[152]),
     latchRight: decodeLatch(m[153]),
   };
+  // M5: コントローラ pose（左 grip@88・左 aim@116・右 grip@160・右 aim@188）。
+  st.left.grip = decodeInputPose(m, 88, st.left.gripValid);
+  st.left.aim = decodeInputPose(m, 116, st.left.aimValid);
+  st.right.grip = decodeInputPose(m, 160, st.right.gripValid);
+  st.right.aim = decodeInputPose(m, 188, st.right.aimValid);
   stats.inputStates++;
   stats.lastInput = st;
   const now = Date.now();
   if (now - lastInputLogAt >= 1000) {
     lastInputLogAt = now;
+    const poseText = (p) => (p.valid ? `(${p.position.map((v) => v.toFixed(2)).join(',')})` : '無効');
     const fmt = (h) => `${h.connected ? '接続' : '未接続'} prof=${h.profile} ` +
       `trig=${h.trigger.toFixed(2)} sq=${h.squeeze.toFixed(2)} ` +
-      `stick=(${h.stick[0].toFixed(2)},${h.stick[1].toFixed(2)})${h.stickState} btn=${h.buttons}`;
+      `stick=(${h.stick[0].toFixed(2)},${h.stick[1].toFixed(2)})${h.stickState} btn=${h.buttons} ` +
+      `grip=${poseText(h.grip)} aim=${poseText(h.aim)}`;
     log(`[M4入力] L: ${fmt(st.left)} | R: ${fmt(st.right)} ` +
       `(frame=${st.frame} conn=${st.connEpoch} space=${st.spaceEpoch} ` +
       `latch=L:${st.latchLeft} R:${st.latchRight})`);
