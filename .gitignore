@@ -16,3 +16,5 @@ test/*.png
 *.dmp
 .env*
 /dist/
+native_new/build/
+native_new/out/
