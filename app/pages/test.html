@@ -1,0 +1,252 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRift M5 test</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden}
+  canvas{display:block}
+  #hud{position:fixed;left:12px;top:12px;color:#fff;font:14px/1.6 monospace;
+       background:rgba(0,0,0,.55);padding:8px 12px;border-radius:8px;white-space:pre;z-index:10}
+  #err{position:fixed;left:12px;bottom:12px;color:#ffb0b0;font:14px/1.6 monospace;
+       background:rgba(0,0,0,.55);padding:8px 12px;border-radius:8px;z-index:10}
+  #waiting{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);color:#fff;
+       font:20px/1.8 monospace;background:rgba(0,0,0,.65);padding:16px 24px;border-radius:12px;
+       text-align:center;z-index:20}
+</style>
+<div id="hud">starting…</div>
+<div id="waiting">XR 待機中（HMD を装着してください）<br>frames=0</div>
+<div id="err"></div>
+<script type="importmap">{ "imports": { "three": "../../node_modules/three/build/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three'
+
+// M5 テストページ。XR 中はキャンバスサイズをシムが所有するため、ページ側では
+// XR 提示中に setSize しない（競合防止）。
+const hud = document.getElementById('hud')
+const errBox = document.getElementById('err')
+const waiting = document.getElementById('waiting')
+window.addEventListener('error', (e) => {
+  console.log('[XRift M5] page error', e.message)
+  errBox.textContent += e.message + '\n'
+})
+window.addEventListener('unhandledrejection', (e) => {
+  console.log('[XRift M5] page rejection', (e.reason && e.reason.stack) || e.reason)
+})
+const info = { frames: 0, presenting: false, lastRecord: null, session: null }
+window.__m5info = info
+
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setSize(innerWidth, innerHeight)
+renderer.xr.enabled = true
+document.body.appendChild(renderer.domElement)
+
+const scene = new THREE.Scene()
+scene.background = new THREE.Color(0x0a1a33)
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 2.5))
+const dir = new THREE.DirectionalLight(0xffffff, 1.5)
+dir.position.set(2, 4, 1)
+scene.add(dir)
+const cam = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100)
+cam.position.set(0, 1.2, 0) // 非 XR プレビュー用。XR 中は three がヘッド pose で上書きする
+
+// 視差の出るシーン: 地面グリッド + 色付きキューブ + テキスト板
+const grid = new THREE.GridHelper(20, 20, 0x88aaff, 0x334466)
+grid.position.y = 0
+scene.add(grid)
+const cubeColors = [0xff4040, 0x40ff40, 0x4040ff, 0xffff40, 0xff40ff, 0x40ffff]
+cubeColors.forEach((c, i) => {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(0.25, 0.25, 0.25),
+    new THREE.MeshStandardMaterial({ color: c }),
+  )
+  const col = i % 3, row = Math.floor(i / 3)
+  m.position.set((col - 1) * 0.6, 0.9 + row * 0.6, -2)
+  scene.add(m)
+})
+function textPlate(text) {
+  const cv = document.createElement('canvas')
+  cv.width = 1024; cv.height = 256
+  const ctx = cv.getContext('2d')
+  ctx.fillStyle = '#101018'; ctx.fillRect(0, 0, 1024, 256)
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 72px monospace'
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+  ctx.fillText(text, 512, 128)
+  const tex = new THREE.CanvasTexture(cv)
+  tex.colorSpace = THREE.SRGBColorSpace
+  const m = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.0, 0.5),
+    new THREE.MeshBasicMaterial({ map: tex }),
+  )
+  m.position.set(0, 1.35, -2.5)
+  return m
+}
+scene.add(textPlate('XRift M5 test'))
+// 左右識別板（左=マゼンタ、右=シアン）。取り違えの目視確認用。
+function sidePlate(color, x) {
+  const m = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.3, 0.3),
+    new THREE.MeshBasicMaterial({ color }),
+  )
+  m.position.set(x, 0.4, -1.5)
+  return m
+}
+scene.add(sidePlate(0xff00ff, -1.2))
+scene.add(sidePlate(0x00ffff, 1.2))
+
+function padState(gp, prefix) {
+  if (!gp) return `${prefix}: -`
+  const b = (i) => (gp.buttons[i] && gp.buttons[i].pressed ? 1 : 0)
+  return `${prefix}: trig=${gp.buttons[0].value.toFixed(2)} sq=${gp.buttons[1].value.toFixed(2)} ` +
+    `stick=(${gp.axes[2].toFixed(2)},${gp.axes[3].toFixed(2)}) ` +
+    `sel=${b(0)}${b(1)}${b(3)} AB=${b(4)}${b(5)}`
+}
+
+let xrSession = null
+function updateWaiting() {
+  // セッション開始後も frames=0 の間は真っ暗にせず待機表示を残す。
+  // 初フレームが来たら消す（以降は出さない）。
+  if (!waiting) return
+  waiting.style.display = info.frames === 0 ? 'block' : 'none'
+}
+renderer.setAnimationLoop((t, frame) => {
+  if (frame) {
+    info.frames++
+    info.presenting = renderer.xr.isPresenting
+  }
+  renderer.render(scene, cam)
+  // XR フレームでは受理用の画素内ブロックを刻む（M2 画像配置が正典）。
+  // three の描画の直後・同一タスク内で行い、OSR の提出に載せる。
+  if (frame && frame._m5Record) {
+    try {
+      stampM5Blocks(frame._m5Record)
+    } catch (e) {
+      console.log('[XRift M5] stamp failed', e && e.message)
+    }
+  }
+  if (xrSession) {
+    const src = xrSession.inputSources
+    const gp = (i) => (src[i] ? src[i].gamepad : null)
+    const latch = window.__m5latch || { left: '-', right: '-' }
+    const waitNote = info.frames === 0 ? '\nXR 待機中（HMD を装着してください）' : ''
+    hud.textContent =
+      `frames=${info.frames} presenting=${renderer.xr.isPresenting}${waitNote}\n` +
+      `inputs=${src.length} (${src.map((s) => s.handedness).join(',')})\n` +
+      `${padState(gp(0), 'L')}\n` +
+      `${padState(gp(1), 'R')}\n` +
+      `latch L:${latch.left} R:${latch.right}\n` +
+      (info.lastStamp ? `stamp id=${info.lastStamp.renderId} id16=${info.lastStamp.id16} tag=${info.lastStamp.tag}` : 'stamp=-')
+  } else {
+    const latch = window.__m5latch || { left: '-', right: '-' }
+    hud.textContent = `frames=${info.frames} (no XR session yet)\n` +
+      `XR 待機中（HMD を装着してください）\nlatch L:${latch.left} R:${latch.right}`
+  }
+  updateWaiting()
+})
+
+addEventListener('resize', () => {
+  // XR 提示中はシムの所有物のため触らない
+  if (renderer.xr.isPresenting) return
+  renderer.setSize(innerWidth, innerHeight)
+})
+
+// ---- M2 受理用の画素内ブロック（配置の正典は harness/electron/README.md） ----
+// 左半分に renderId 下位 16bit（64,64）と pose タグ（128,64）、
+// 左右マーカー（(160,8) マゼンタ、(halfW+160,8) シアン）を置く。
+// raw GL の scissor clear で刻むため three のトーンマッピングを迂回し、
+// 厳密な白黒が出る（復号はセル中心画素・しきい値 128）。
+function m5QuantizeByte(v, lo, hi) {
+  const t = ((v - lo) / (hi - lo)) * 255
+  if (t < 0) return 0
+  if (t > 255) return 255
+  return Math.floor(t + 0.5)
+}
+// C++ の PoseTag と同じバイト列（計 30B）の FNV-1a 下位 16bit。
+// harness の m2-codec.js と同一式であること（変えたら受理されない）。
+function m5PoseTag(renderId, connEpoch, spaceEpoch, leftPos, leftOri, rightPos, rightOri) {
+  const bytes = []
+  let id = BigInt(renderId)
+  for (let i = 0; i < 8; i++) { bytes.push(Number(id & 0xFFn)); id >>= 8n }
+  for (let i = 0; i < 4; i++) bytes.push((connEpoch >>> (i * 8)) & 0xFF)
+  for (let i = 0; i < 4; i++) bytes.push((spaceEpoch >>> (i * 8)) & 0xFF)
+  for (let i = 0; i < 3; i++) bytes.push(m5QuantizeByte(leftPos[i], -4, 4))
+  for (let i = 0; i < 4; i++) bytes.push(m5QuantizeByte(leftOri[i], -1, 1))
+  for (let i = 0; i < 3; i++) bytes.push(m5QuantizeByte(rightPos[i], -4, 4))
+  for (let i = 0; i < 4; i++) bytes.push(m5QuantizeByte(rightOri[i], -1, 1))
+  let hash = 2166136261 >>> 0
+  for (const b of bytes) { hash ^= b; hash = Math.imul(hash, 16777619) >>> 0 }
+  return hash & 0xFFFF
+}
+function m5StampRect(gl, dbW, dbH, fbW, fbH, ox, oy, w, h, r, g, b) {
+  const sx = dbW / fbW, sy = dbH / fbH
+  const x = Math.round(ox * sx), y = Math.round(dbH - (oy + h) * sy)
+  const ww = Math.max(1, Math.round(w * sx)), hh = Math.max(1, Math.round(h * sy))
+  gl.enable(gl.SCISSOR_TEST)
+  gl.scissor(x, y, ww, hh)
+  gl.clearColor(r, g, b, 1)
+  gl.clear(gl.COLOR_BUFFER_BIT)
+}
+function stampM5Blocks(rec) {
+  const gl = renderer.getContext()
+  const fbW = renderer.domElement.width, fbH = renderer.domElement.height
+  const halfW = Math.floor(fbW / 2)
+  const dbW = gl.drawingBufferWidth, dbH = gl.drawingBufferHeight
+  // three の後続描画に影響させないよう状態を保存・復元する
+  const prevScissor = gl.getParameter(gl.SCISSOR_TEST)
+  const prevBox = gl.getParameter(gl.SCISSOR_BOX)
+  const prevColor = gl.getParameter(gl.COLOR_CLEAR_VALUE)
+  try {
+    const id16 = Number(BigInt(rec.renderId) & 0xFFFFn)
+    const tag = m5PoseTag(rec.renderId, rec.connEpoch >>> 0, rec.spaceEpoch >>> 0,
+      rec.leftPos, rec.leftOri, rec.rightPos, rec.rightOri)
+    // ADR: OSR 共有テクスチャの WebGL 内容は bottom-up のまま渡される疑いが強い
+    // （drawing buffer では正しく読めた画素を exe が 0x0000 と復号した。compositor は
+    // 表示時に反転するため capturePage では正しく見える）。どちら向きで読まれても
+    // 当たるよう、ブロック・マーカーを上下対称に刻む。復号は固定位置だけ見るため、
+    // 片側の重なりは無い（fbH=1786 で 32px 品は干渉しない）。
+    const block = (ox, oy, value) => {
+      for (let bit = 0; bit < 16; bit++) {
+        const on = (((value >>> bit) & 1) === 1)
+        const c = on ? 1 : 0
+        const cx = ox + (bit % 8) * 4, cy = oy + Math.floor(bit / 8) * 4
+        m5StampRect(gl, dbW, dbH, fbW, fbH, cx, cy, 4, 4, c, c, c)
+        m5StampRect(gl, dbW, dbH, fbW, fbH, cx, fbH - cy - 4, 4, 4, c, c, c)
+      }
+    }
+    block(64, 64, id16)
+    block(128, 64, tag)
+    const marker = (ox, oy, r, g, b) => {
+      m5StampRect(gl, dbW, dbH, fbW, fbH, ox, oy, 32, 32, r, g, b)
+      m5StampRect(gl, dbW, dbH, fbW, fbH, ox, fbH - oy - 32, 32, 32, r, g, b)
+    }
+    marker(160, 8, 1, 0, 1)
+    marker(halfW + 160, 8, 0, 1, 1)
+    info.lastStamp = { renderId: rec.renderId, id16, tag }
+    // 描画証拠の読み戻しとログは最初の 3 回だけ（毎フレームは出さない。ログ肥大の防止）。
+    // 本命の刻みはシムの overlay が担い、ここは予備である。
+    if ((info.stampLogs ?? 0) < 3) {
+      info.stampLogs = (info.stampLogs ?? 0) + 1
+      const sx = dbW / fbW, sy = dbH / fbH
+      const px = new Uint8Array(4)
+      gl.readPixels(Math.round(66 * sx), Math.round(dbH - 66 * sy), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
+      console.log(`[XRift M5] xr stamp #${info.stampLogs} id=${rec.renderId} id16=${id16} tag=${tag} canvas=${fbW}x${fbH} bit0=[${px[0]},${px[1]},${px[2]}]`)
+    }
+  } finally {
+    gl.scissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3])
+    gl.clearColor(prevColor[0], prevColor[1], prevColor[2], prevColor[3])
+    if (prevScissor) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST)
+  }
+}
+
+console.log('[XRift M5] test page ready, xr=', typeof navigator.xr)
+try {
+  console.log('[XRift M5] supported:', await navigator.xr.isSessionSupported('immersive-vr'))
+  xrSession = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] })
+  info.session = true
+  await renderer.xr.setSession(xrSession)
+  console.log('[XRift M5] session started, layer',
+    xrSession.renderState.baseLayer?.framebufferWidth, 'x', xrSession.renderState.baseLayer?.framebufferHeight)
+  xrSession.addEventListener('end', () => { console.log('[XRift M5] session ended'); xrSession = null })
+} catch (e) {
+  console.log('[XRift M5] session failed: ' + (e && e.message))
+  errBox.textContent = 'session failed: ' + (e && e.message)
+}
+</script>

@@ -23,7 +23,9 @@
     "prebrowser:selftest": "pnpm build",
     "browser:selftest": "electron . --selftest",
     "prepackage": "pnpm build",
-    "package": "node scripts/package.js"
+    "package": "node scripts/package.js",
+    "app:build": "tsc -p app",
+    "app:start": "electron app"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",
