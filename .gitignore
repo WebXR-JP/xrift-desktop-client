@@ -26,3 +26,5 @@ native_new/harness/electron/logs/
 native_new/harness/electron/fault-matrix-results.*
 app/dist/
 app/logs/
+app/dist-package/
+app/xrift.vrmanifest

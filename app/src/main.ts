@@ -35,15 +35,35 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// パッケージ版（app.isPackaged）では argv にスクリプトパスが含まれないため、
+// 開発時（electron . …）より 1 つ前から読む。SteamVR からの起動引数もここに載る。
+// ADR: slice 位置を各所で直書きせず ARGV に一本化する（ずれると --self-test 等の
+// フラグが黙って無視され、通常起動として固まる）。
+const ARGV: readonly string[] = process.argv.slice(app.isPackaged ? 1 : 2);
 function arg(name: string, def: string): string {
   const prefix = `--${name}=`;
-  for (const a of process.argv.slice(2)) {
+  for (const a of ARGV) {
     if (a.startsWith(prefix)) return a.slice(prefix.length);
   }
   return def;
 }
 
-const EXE_PATH = arg('exe', path.join(__dirname, '..', '..', 'native_new', 'build', 'windows', 'Release', 'xrift_new.exe'));
+// パッケージ版では exe/addon を extraResource（process.resourcesPath 直下）から読む。
+// 開発時は従来の native_new 配下に退避する。--exe/--addon の明示指定が最優先である。
+// ADR: __dirname は開発時もパッケージ版も resources/app/dist を指すため、
+// pages/preload 等の相対解決は変えない。変わるのは exe/addon の既定値だけである。
+function packagedResource(fileName: string): string | null {
+  try {
+    const candidate = path.join(process.resourcesPath, fileName);
+    if (fs.existsSync(candidate)) return candidate;
+  } catch { /* 開発実行では resourcesPath が無い場合がある */ }
+  return null;
+}
+const DEV_EXE_PATH = path.join(__dirname, '..', '..', 'native_new', 'build', 'windows', 'Release', 'xrift_new.exe');
+const DEV_ADDON_PATH = path.join(
+  __dirname, '..', '..', 'native_new', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node',
+);
+const EXE_PATH = arg('exe', packagedResource('xrift_new.exe') ?? DEV_EXE_PATH);
 const PIPE_PATH = arg('pipe', `\\\\.\\pipe\\xrift_m5_${process.pid}`);
 const RENDER_SCALE = arg('render-scale', '0.5');
 const RECORD_TTL_MS = Math.max(1, parseInt(arg('record-ttl-ms', '2000'), 10) || 2000);
@@ -86,10 +106,7 @@ function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: s
   if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return { kind: 'url', url: raw };
   return { kind: 'file', file: candidates[0] };
 }
-const ADDON_PATH = arg(
-  'addon',
-  path.join(__dirname, '..', '..', 'native_new', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node'),
-);
+const ADDON_PATH = arg('addon', packagedResource('xrift_transfer_addon.node') ?? DEV_ADDON_PATH);
 // exe の stdout/stderr の保存先（受理/不明 ID の内訳用）。相対パスは logs/ 基準。
 // `--exe-log=`（空）で従来の inherit（保存しない）に戻す。
 const EXE_LOG = arg('exe-log', 'm5-exe.log');
@@ -122,9 +139,9 @@ const CAPTURE_AT_LIST: { ms: number; file: string }[] = (() => {
 // 検証専用の pace 無効化（`--no-pace-records`）。exe への `--pace-records` を
 // 渡さず、従来どおり毎フレーム発行させる。遅いページでの受理率の on/off 比較用。
 // 通常運用では付けない（既定は pace on）。
-const NO_PACE = process.argv.slice(2).includes('--no-pace-records');
-const NO_EXE = process.argv.slice(2).includes('--no-exe');
-const SELF_TEST = process.argv.slice(2).includes('--self-test');
+const NO_PACE = ARGV.includes('--no-pace-records');
+const NO_EXE = ARGV.includes('--no-exe');
+const SELF_TEST = ARGV.includes('--self-test');
 const MIRROR_FPS = Math.min(30, Math.max(1, parseInt(arg('mirror-fps', '10'), 10) || 10));
 // ADR: VR 中のミラーは既定で停止する（0=停止）。ブラウジング中は 10fps のまま。
 // 0 を許すため下限は 0 とし、数値以外は既定 0 に倒す。
@@ -198,7 +215,7 @@ try {
   const mod: unknown = require(ADDON_PATH);
   addon = asTransferAddon(mod);
   if (addon === null) throw new Error('duplicateHandle が無い');
-  log('addon loaded: xrift_transfer_addon.node');
+  log(`addon loaded: ${ADDON_PATH}`);
 } catch (e) {
   log('addon load FAILED: ' + (e instanceof Error ? e.message : String(e)));
   flushLog();

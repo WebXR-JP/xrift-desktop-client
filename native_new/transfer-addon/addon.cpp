@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void SetStr(napi_env env, napi_value obj, const char *name, const char *s) {
@@ -107,10 +108,179 @@ static napi_value DuplicateHandle(napi_env env, napi_callback_info info) {
   return out;
 }
 
+// ---- SteamVR アプリ登録（旧 native/src/addon.cpp の移植） ----
+// SteamVR 付属の openvr_api.dll をユーティリティとして初期化し、
+// IVRApplications のフラット関数テーブル（FnTable:IVRApplications_007）で
+// .vrmanifest を登録 / 解除 / 確認する。失敗は例外ではなく
+// {ok:false, error} で返し、プロセスを落とさない。
+typedef uint32_t(__cdecl *PFN_VR_InitInternal2)(int *peError, int eType, const char *pStartupInfo);
+typedef void(__cdecl *PFN_VR_ShutdownInternal)(void);
+typedef void *(__cdecl *PFN_VR_GetGenericInterface)(const char *pchInterfaceVersion, int *peError);
+typedef int(__stdcall *PFN_AddApplicationManifest)(const char *path, bool temporary);
+typedef int(__stdcall *PFN_RemoveApplicationManifest)(const char *path);
+typedef bool(__stdcall *PFN_IsApplicationInstalled)(const char *appKey);
+struct IVRApplicationsFnTable {
+  PFN_AddApplicationManifest AddApplicationManifest;
+  PFN_RemoveApplicationManifest RemoveApplicationManifest;
+  PFN_IsApplicationInstalled IsApplicationInstalled;
+};
+#define XRIFT_VRAPPLICATION_UTILITY 3
+
+// UTF-8 の napi 文字列引数をヒープ確保の C 文字列として取り出す。
+// 呼び出し側が free() する。失敗時は NULL を返す。
+static char *GetUtf8Arg(napi_env env, napi_value v) {
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, v, NULL, 0, &len) != napi_ok) return NULL;
+  char *buf = (char *)malloc(len + 1);
+  if (!buf) return NULL;
+  size_t written = 0;
+  if (napi_get_value_string_utf8(env, v, buf, len + 1, &written) != napi_ok) {
+    free(buf);
+    return NULL;
+  }
+  return buf;
+}
+
+// UTF-8 → ワイド文字列（LoadLibraryW 用）。呼び出し側が free() する。
+static wchar_t *Utf8ToWide(const char *s) {
+  if (!s) return NULL;
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+  if (wlen <= 0) return NULL;
+  wchar_t *w = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+  if (!w) return NULL;
+  if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wlen) <= 0) {
+    free(w);
+    return NULL;
+  }
+  return w;
+}
+
+// steamvrManifest(op, dllPath, manifestPath | appKey)
+// op: 'add' | 'remove' | 'check'。add/remove の第 3 引数はマニフェストのパス、
+// check の第 3 引数は app_key。戻り値は {ok, error?, installed?}。
+static napi_value SteamVRManifest(napi_env env, napi_callback_info info) {
+  napi_value out;
+  napi_create_object(env, &out);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  if (argc < 3) {
+    Fail(env, out, "引数が足りない（op, dllPath, manifestPath|appKeyが必要）", 0);
+    return out;
+  }
+  char *op = GetUtf8Arg(env, argv[0]);
+  char *dll = GetUtf8Arg(env, argv[1]);
+  char *arg = GetUtf8Arg(env, argv[2]);
+  if (!op || !dll || !arg) {
+    free(op);
+    free(dll);
+    free(arg);
+    Fail(env, out, "引数はすべて文字列であること", 0);
+    return out;
+  }
+  bool isAdd = strcmp(op, "add") == 0;
+  bool isRemove = strcmp(op, "remove") == 0;
+  bool isCheck = strcmp(op, "check") == 0;
+  if (!isAdd && !isRemove && !isCheck) {
+    Fail(env, out, "opは add/remove/check のいずれかであること", 0);
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+
+  wchar_t *wdll = Utf8ToWide(dll);
+  if (!wdll) {
+    Fail(env, out, "dllパスの変換に失敗", 0);
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+  HMODULE mod = LoadLibraryW(wdll);
+  free(wdll);
+  if (!mod) {
+    char msg[512];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "openvr_api.dll を読み込めない: %s", dll);
+    Fail(env, out, msg, (HRESULT)GetLastError());
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+  PFN_VR_InitInternal2 initFn =
+      (PFN_VR_InitInternal2)GetProcAddress(mod, "VR_InitInternal2");
+  PFN_VR_ShutdownInternal shutdownFn =
+      (PFN_VR_ShutdownInternal)GetProcAddress(mod, "VR_ShutdownInternal");
+  PFN_VR_GetGenericInterface getIfaceFn =
+      (PFN_VR_GetGenericInterface)GetProcAddress(mod, "VR_GetGenericInterface");
+  if (!initFn || !shutdownFn || !getIfaceFn) {
+    FreeLibrary(mod);
+    Fail(env, out, "openvr_api.dll に必要な関数が無い", 0);
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+  int err = 0;
+  initFn(&err, XRIFT_VRAPPLICATION_UTILITY, NULL);
+  if (err != 0) {
+    FreeLibrary(mod);
+    char msg[256];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                "VR_Init失敗 (EVRInitError %d)。SteamVR を起動してから実行すること", err);
+    Fail(env, out, msg, 0);
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+  int ifaceErr = 0;
+  struct IVRApplicationsFnTable *apps =
+      (struct IVRApplicationsFnTable *)getIfaceFn("FnTable:IVRApplications_007", &ifaceErr);
+  if (!apps || ifaceErr != 0) {
+    shutdownFn();
+    FreeLibrary(mod);
+    char msg[256];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                "IVRApplications_007 を取得できない (%d)", ifaceErr);
+    Fail(env, out, msg, 0);
+    free(op);
+    free(dll);
+    free(arg);
+    return out;
+  }
+  int appErr = 0;
+  if (isAdd) {
+    appErr = apps->AddApplicationManifest(arg, false);
+  } else if (isRemove) {
+    appErr = apps->RemoveApplicationManifest(arg);
+  } else {
+    SetBool(env, out, "installed", apps->IsApplicationInstalled(arg) ? true : false);
+  }
+  shutdownFn();
+  FreeLibrary(mod);
+  free(op);
+  free(dll);
+  free(arg);
+  if (appErr != 0) {
+    char msg[128];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "EVRApplicationError %d", appErr);
+    Fail(env, out, msg, 0);
+    return out;
+  }
+  SetBool(env, out, "ok", true);
+  return out;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_value fn;
   napi_create_function(env, "duplicateHandle", NAPI_AUTO_LENGTH, DuplicateHandle, NULL, &fn);
   napi_set_named_property(env, exports, "duplicateHandle", fn);
+  napi_value fnManifest;
+  napi_create_function(env, "steamvrManifest", NAPI_AUTO_LENGTH, SteamVRManifest, NULL, &fnManifest);
+  napi_set_named_property(env, exports, "steamvrManifest", fnManifest);
   return exports;
 }
 
