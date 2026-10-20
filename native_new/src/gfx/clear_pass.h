@@ -8,12 +8,14 @@
 
 // 両眼の単色クリアを担う。acquire/wait/clear/release の一連を 1 眼単位で行う。
 // コマンドバッファとフェンスは swapchain 画像ぶん事前に確保する。
+// VkDevice/VkQueue は VulkanContext が所有し、ここでは借用する。
 
 namespace xrift::gfx {
 
 class ClearPass {
  public:
-  ClearPass(VkDevice device, uint32_t queueFamilyIndex, VkQueue queue, const Swapchains& swapchains);
+  ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
+            const vk::raii::Queue& queue, const Swapchains& swapchains);
   ~ClearPass();
 
   ClearPass(const ClearPass&) = delete;
@@ -25,10 +27,11 @@ class ClearPass {
  private:
   struct EyeResources {
     XrSwapchain swapchain = XR_NULL_HANDLE;
-    VkExtent2D extent{0, 0};
-    std::vector<VkImage> images;
-    std::vector<VkCommandBuffer> commands;
-    std::vector<VkFence> fences;
+    vk::Extent2D extent{0, 0};
+    // XR 所有イメージの非所有ビュー。破棄しない。
+    std::vector<vk::Image> images;
+    std::vector<vk::raii::CommandBuffer> commands;
+    std::vector<vk::raii::Fence> fences;
   };
 
   // 眼ごとのクリア色（線形 float）。左=暗い赤、右=暗い青にし、両眼の出方を目視で判別する。
@@ -38,9 +41,13 @@ class ClearPass {
       {0.02f, 0.02f, 0.35f, 1.0f},
   };
 
-  VkDevice device_ = VK_NULL_HANDLE;
-  VkQueue queue_ = VK_NULL_HANDLE;
-  VkCommandPool pool_ = VK_NULL_HANDLE;
+  // 破棄順の担保: 借用 (device_/queue_) より子 (pool_/eyes_) を先に破棄する。
+  // メンバは宣言順に構築・逆順に破棄されるため、pool_ と commands/fences が
+  // device_ より後に破棄されることは型で防止される。
+  // なお device_/queue_ 自体の寿命は VulkanContext が持ち、ClearPass より長生きすることが前提である。
+  const vk::raii::Device* device_ = nullptr;
+  const vk::raii::Queue* queue_ = nullptr;
+  vk::raii::CommandPool pool_{nullptr};
   std::vector<EyeResources> eyes_;
 };
 

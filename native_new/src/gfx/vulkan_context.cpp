@@ -1,5 +1,9 @@
 #include "gfx/vulkan_context.h"
 
+// 動的ディスパッチャの既定実体の定義。全 TU で 1 回のみ。
+// 本 exe は vk::raii::Context 起点のディスパッチャだけを使い、既定ディスパッチャ経由の呼び出しは行わない。
+VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -10,13 +14,25 @@
 namespace xrift::gfx {
 namespace {
 
-void CheckVk(VkResult result, const char* what) {
-  if (result == VK_SUCCESS) {
+// vk::Result を返す呼び出しの検査。成功以外は vk::to_string 付きの例外にする。
+void CheckVk(vk::Result result, const char* what) {
+  if (result == vk::Result::eSuccess) {
     return;
   }
-  // volk 経由の呼び出しは XrResult ではないため、数値付きの例外にする。
-  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" +
-                           std::to_string(static_cast<int>(result)) + ")");
+  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
+}
+
+// 例外 (vk::SystemError) を投げる raii 呼び出しを、従来の CheckVk と同じ粒度に揃える。
+// 型は std::runtime_error、文面は "<what> に失敗 (VkResult=<名前>)" とする。
+template <typename F>
+void InvokeVk(const char* what, F&& f) {
+  try {
+    f();
+  } catch (const vk::SystemError& e) {
+    const vk::Result result = static_cast<vk::Result>(e.code().value());
+    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
+                             ")");
+  }
 }
 
 // ランタイムが返す拡張名一覧を string の配列に分解する。
@@ -63,8 +79,8 @@ void LogVersion(const char* label, XrVersion version) {
 }  // namespace
 
 VulkanContext::VulkanContext(const xr::Instance& xr) {
-  // 1. volk を初期化する(libvulkan の読み込みを含む)。
-  CheckVk(volkInitialize(), "volkInitialize");
+  // 1. vk::raii::Context の生成時に読み込みが行われる (vulkan-1.dll の動的読み込みを含む)。
+  //    明示の初期化呼び出しは不要である。
 
   // 2. ランタイムの Vulkan 要件を取得する。
   XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
@@ -85,9 +101,8 @@ VulkanContext::VulkanContext(const xr::Instance& xr) {
     Info("  %s", name.c_str());
   }
 
-  // 4. VkInstance を作り、volk に関数群を読み込ませる。
-  VkApplicationInfo app_info{};
-  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  // 4. VkInstance を作る。
+  vk::ApplicationInfo app_info{};
   app_info.pApplicationName = "xrift_new";
   app_info.applicationVersion = 1;
   app_info.pEngineName = "xrift";
@@ -95,21 +110,23 @@ VulkanContext::VulkanContext(const xr::Instance& xr) {
   // 要件の最小版を使う。XrVersion と Vk apiVersion は符号化が異なるため組み立て直す。
   // 0 が返る異常系では 1.0 に退避する。
   app_info.apiVersion = requirements.minApiVersionSupported != 0
-                            ? VK_MAKE_VERSION(XR_VERSION_MAJOR(requirements.minApiVersionSupported),
-                                              XR_VERSION_MINOR(requirements.minApiVersionSupported),
-                                              XR_VERSION_PATCH(requirements.minApiVersionSupported))
+                            ? VK_MAKE_API_VERSION(0, XR_VERSION_MAJOR(requirements.minApiVersionSupported),
+                                                  XR_VERSION_MINOR(requirements.minApiVersionSupported),
+                                                  XR_VERSION_PATCH(requirements.minApiVersionSupported))
                             : VK_API_VERSION_1_0;
-  VkInstanceCreateInfo instance_info{};
-  instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  vk::InstanceCreateInfo instance_info{};
+  instance_info.sType = vk::StructureType::eInstanceCreateInfo;
   instance_info.pApplicationInfo = &app_info;
   instance_info.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());
   instance_info.ppEnabledExtensionNames = instance_exts.data();
-  CheckVk(vkCreateInstance(&instance_info, nullptr, &instance_), "vkCreateInstance");
-  volkLoadInstance(instance_);
+  InvokeVk("vkCreateInstance", [&] { instance_ = vk::raii::Instance(context_, instance_info); });
 
-  // 5. ランタイムに物理デバイスを選ばせる。
-  CheckXr(xr.vulkanGraphicsDeviceProc()(xr.handle(), xr.systemId(), instance_, &physical_device_),
+  // 5. ランタイムに物理デバイスを選ばせる。境界は生ハンドルで行い、所有は raii に巻き直す。
+  VkPhysicalDevice chosen = VK_NULL_HANDLE;
+  CheckXr(xr.vulkanGraphicsDeviceProc()(xr.handle(), xr.systemId(),
+                                        static_cast<VkInstance>(*instance_), &chosen),
           "xrGetVulkanGraphicsDeviceKHR");
+  physical_device_ = vk::raii::PhysicalDevice(instance_, chosen);
 
   // 6. デバイス拡張を取得し、VK_KHR_swapchain が無ければ足す。
   std::vector<std::string> device_ext_names =
@@ -132,13 +149,11 @@ VulkanContext::VulkanContext(const xr::Instance& xr) {
   Info("VkDevice 拡張: %u 件", static_cast<unsigned>(device_ext_names.size()));
 
   // 7. グラフィックス対応の queue family を選び、空の feature で VkDevice を作る。
-  uint32_t family_count = 0;
-  vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, nullptr);
-  std::vector<VkQueueFamilyProperties> families(family_count);
-  vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, families.data());
+  const std::vector<vk::QueueFamilyProperties> families =
+      physical_device_.getQueueFamilyProperties();
   uint32_t graphics_family = UINT32_MAX;
-  for (uint32_t i = 0; i < family_count; ++i) {
-    if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+  for (uint32_t i = 0; i < families.size(); ++i) {
+    if ((families[i].queueFlags & vk::QueueFlagBits::eGraphics) != vk::QueueFlags{}) {
       graphics_family = i;
       break;
     }
@@ -149,40 +164,31 @@ VulkanContext::VulkanContext(const xr::Instance& xr) {
   queue_family_index_ = graphics_family;
 
   const float priority = 1.0f;
-  VkDeviceQueueCreateInfo queue_info{};
-  queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  vk::DeviceQueueCreateInfo queue_info{};
+  queue_info.sType = vk::StructureType::eDeviceQueueCreateInfo;
   queue_info.queueFamilyIndex = graphics_family;
   queue_info.queueCount = 1;
   queue_info.pQueuePriorities = &priority;
-  const VkPhysicalDeviceFeatures features{};
-  VkDeviceCreateInfo device_info{};
-  device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  const vk::PhysicalDeviceFeatures features{};
+  vk::DeviceCreateInfo device_info{};
+  device_info.sType = vk::StructureType::eDeviceCreateInfo;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
   device_info.enabledExtensionCount = static_cast<uint32_t>(device_exts.size());
   device_info.ppEnabledExtensionNames = device_exts.data();
   device_info.pEnabledFeatures = &features;
-  CheckVk(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), "vkCreateDevice");
-  volkLoadDevice(device_);
-  vkGetDeviceQueue(device_, graphics_family, 0, &queue_);
+  InvokeVk("vkCreateDevice", [&] { device_ = vk::raii::Device(physical_device_, device_info); });
+  InvokeVk("vkGetDeviceQueue", [&] { queue_ = device_.getQueue(graphics_family, 0); });
 
   // 8. GPU 名を保持する。
-  VkPhysicalDeviceProperties props{};
-  vkGetPhysicalDeviceProperties(physical_device_, &props);
-  gpu_name_ = props.deviceName;
+  const vk::PhysicalDeviceProperties props = physical_device_.getProperties();
+  gpu_name_ = props.deviceName.data();
   Info("GPU: %s (queue family %u)", gpu_name_.c_str(), static_cast<unsigned>(graphics_family));
 }
 
 VulkanContext::~VulkanContext() {
-  // 生成の逆順に破棄する。
-  if (device_ != VK_NULL_HANDLE) {
-    vkDestroyDevice(device_, nullptr);
-    device_ = VK_NULL_HANDLE;
-  }
-  if (instance_ != VK_NULL_HANDLE) {
-    vkDestroyInstance(instance_, nullptr);
-    instance_ = VK_NULL_HANDLE;
-  }
+  // 破棄はメンバの逆順 (queue_ → device_ → physical_device_ → instance_ → context_) に自動で行われる。
+  // queue_ と physical_device_ は非所有のため実処理はなく、device_ → instance_ の順が保たれる。
 }
 
 }  // namespace xrift::gfx

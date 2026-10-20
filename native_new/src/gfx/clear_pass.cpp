@@ -9,24 +9,37 @@
 namespace xrift::gfx {
 namespace {
 
-void CheckVk(VkResult result, const char* what) {
-  if (result == VK_SUCCESS) {
+// vk::Result を返す呼び出しの検査。成功以外は vk::to_string 付きの例外にする。
+void CheckVk(vk::Result result, const char* what) {
+  if (result == vk::Result::eSuccess) {
     return;
   }
-  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" +
-                           std::to_string(static_cast<int>(result)) + ")");
+  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
+}
+
+// 例外 (vk::SystemError) を投げる raii 呼び出しを、従来の CheckVk と同じ粒度に揃える。
+// 型は std::runtime_error、文面は "<what> に失敗 (VkResult=<名前>)" とする。
+template <typename F>
+void InvokeVk(const char* what, F&& f) {
+  try {
+    f();
+  } catch (const vk::SystemError& e) {
+    const vk::Result result = static_cast<vk::Result>(e.code().value());
+    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
+                             ")");
+  }
 }
 
 }  // namespace
 
-ClearPass::ClearPass(VkDevice device, uint32_t queueFamilyIndex, VkQueue queue,
-                     const Swapchains& swapchains)
-    : device_(device), queue_(queue) {
-  VkCommandPoolCreateInfo pool_info{};
-  pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+ClearPass::ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
+                     const vk::raii::Queue& queue, const Swapchains& swapchains)
+    : device_(&device), queue_(&queue) {
+  vk::CommandPoolCreateInfo pool_info{};
+  pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
+  pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
   pool_info.queueFamilyIndex = queueFamilyIndex;
-  CheckVk(vkCreateCommandPool(device_, &pool_info, nullptr, &pool_), "vkCreateCommandPool");
+  InvokeVk("vkCreateCommandPool", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
 
   const uint32_t eyes = swapchains.eyeCount();
   eyes_.reserve(eyes);
@@ -39,44 +52,44 @@ ClearPass::ClearPass(VkDevice device, uint32_t queueFamilyIndex, VkQueue queue,
     for (uint32_t i = 0; i < images; ++i) {
       res.images.push_back(swapchains.image(e, i));
     }
-    res.commands.resize(images);
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = pool_;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    vk::CommandBufferAllocateInfo alloc{};
+    alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
+    alloc.commandPool = *pool_;
+    alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = images;
-    CheckVk(vkAllocateCommandBuffers(device_, &alloc, res.commands.data()),
-            "vkAllocateCommandBuffers");
-    res.fences.resize(images);
-    VkFenceCreateInfo fence_info{};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    res.commands.reserve(images);
+    InvokeVk("vkAllocateCommandBuffers", [&] {
+      vk::raii::CommandBuffers allocated = device_->allocateCommandBuffers(alloc);
+      for (vk::raii::CommandBuffer& cmd : allocated) {
+        res.commands.push_back(std::move(cmd));
+      }
+    });
+    vk::FenceCreateInfo fence_info{};
+    fence_info.sType = vk::StructureType::eFenceCreateInfo;
     // 初回の待機を素通りさせるため、生成時は signaled にする。
-    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
+    res.fences.reserve(images);
     for (uint32_t i = 0; i < images; ++i) {
-      CheckVk(vkCreateFence(device_, &fence_info, nullptr, &res.fences[i]), "vkCreateFence");
+      vk::raii::Fence fence{nullptr};
+      InvokeVk("vkCreateFence", [&] { fence = vk::raii::Fence(*device_, fence_info); });
+      res.fences.push_back(std::move(fence));
     }
     eyes_.push_back(std::move(res));
   }
 }
 
 ClearPass::~ClearPass() {
-  if (pool_ == VK_NULL_HANDLE) {
+  if (static_cast<VkCommandPool>(*pool_) == VK_NULL_HANDLE) {
     return;
   }
   // 仕掛かりの提出が残っていればここで吸収する。
-  const VkResult idle = vkDeviceWaitIdle(device_);
-  if (idle != VK_SUCCESS) {
-    Warn("vkDeviceWaitIdle に失敗 (VkResult=%d)", static_cast<int>(idle));
+  try {
+    device_->waitIdle();
+  } catch (const vk::SystemError& e) {
+    Warn("vkDeviceWaitIdle に失敗 (VkResult=%s)",
+         vk::to_string(static_cast<vk::Result>(e.code().value())).c_str());
   }
-  for (EyeResources& res : eyes_) {
-    for (VkFence fence : res.fences) {
-      vkDestroyFence(device_, fence, nullptr);
-    }
-    res.fences.clear();
-  }
-  // プールの破棄でコマンドバッファもまとめて解放される。
-  vkDestroyCommandPool(device_, pool_, nullptr);
-  pool_ = VK_NULL_HANDLE;
+  // fences と pool_ (および commands) は raii の破棄で解放される。破棄順は宣言の逆順である。
 }
 
 void ClearPass::Draw(uint32_t eye) {
@@ -96,57 +109,62 @@ void ClearPass::Draw(uint32_t eye) {
     throw std::runtime_error("swapchain 画像番号が範囲外です");
   }
 
-  VkFence fence = res.fences[image_index];
-  VkCommandBuffer cmd = res.commands[image_index];
-  CheckVk(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-  CheckVk(vkResetFences(device_, 1, &fence), "vkResetFences");
-  CheckVk(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
+  vk::raii::Fence& fence = res.fences[image_index];
+  vk::raii::CommandBuffer& cmd = res.commands[image_index];
+  CheckVk(device_->waitForFences(*fence, vk::True, UINT64_MAX), "vkWaitForFences");
+  InvokeVk("vkResetFences", [&] { device_->resetFences(*fence); });
+  InvokeVk("vkResetCommandBuffer", [&] { cmd.reset(); });
 
-  VkCommandBufferBeginInfo begin{};
-  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+  vk::CommandBufferBeginInfo begin{};
+  begin.sType = vk::StructureType::eCommandBufferBeginInfo;
+  begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+  InvokeVk("vkBeginCommandBuffer", [&] { cmd.begin(begin); });
 
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  VkImageMemoryBarrier to_dst{};
-  to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  to_dst.srcAccessMask = 0;
-  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  vk::ImageSubresourceRange range{};
+  range.aspectMask = vk::ImageAspectFlagBits::eColor;
+  range.baseMipLevel = 0;
+  range.levelCount = 1;
+  range.baseArrayLayer = 0;
+  range.layerCount = 1;
+  vk::ImageMemoryBarrier to_dst{};
+  to_dst.sType = vk::StructureType::eImageMemoryBarrier;
+  to_dst.srcAccessMask = {};
+  to_dst.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+  to_dst.oldLayout = vk::ImageLayout::eUndefined;
+  to_dst.newLayout = vk::ImageLayout::eTransferDstOptimal;
   to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.image = res.images[image_index];
   to_dst.subresourceRange = range;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                       0, nullptr, 0, nullptr, 1, &to_dst);
+  cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+                      {}, nullptr, nullptr, to_dst);
 
-  VkClearColorValue color{};
+  vk::ClearColorValue color{};
   color.float32[0] = kEyeClearColors[eye][0];
   color.float32[1] = kEyeClearColors[eye][1];
   color.float32[2] = kEyeClearColors[eye][2];
   color.float32[3] = kEyeClearColors[eye][3];
-  vkCmdClearColorImage(cmd, res.images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color,
-                       1, &range);
+  cmd.clearColorImage(res.images[image_index], vk::ImageLayout::eTransferDstOptimal, color, range);
 
   // コンポジタ渡し用に COLOR_ATTACHMENT_OPTIMAL で終える。以降の書き手は存在しないため、
   // 可視性の起点は TRANSFER_WRITE の公開、順序は TRANSFER → COLOR_ATTACHMENT_OUTPUT で保つ。
-  VkImageMemoryBarrier to_present = to_dst;
-  to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_present.dstAccessMask = 0;
-  to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_present.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr,
-                       1, &to_present);
+  vk::ImageMemoryBarrier to_present = to_dst;
+  to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+  to_present.dstAccessMask = {};
+  to_present.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+  to_present.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+  cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                      vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
+                      to_present);
 
-  CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-  VkSubmitInfo submit{};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  InvokeVk("vkEndCommandBuffer", [&] { cmd.end(); });
+  vk::CommandBuffer raw_cmd = *cmd;
+  vk::SubmitInfo submit{};
+  submit.sType = vk::StructureType::eSubmitInfo;
   submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &cmd;
-  CheckVk(vkQueueSubmit(queue_, 1, &submit, fence), "vkQueueSubmit");
-  CheckVk(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(描画完了)");
+  submit.pCommandBuffers = &raw_cmd;
+  InvokeVk("vkQueueSubmit", [&] { queue_->submit(submit, *fence); });
+  CheckVk(device_->waitForFences(*fence, vk::True, UINT64_MAX), "vkWaitForFences(描画完了)");
 
   XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
   CheckXr(xrReleaseSwapchainImage(res.swapchain, &release), "xrReleaseSwapchainImage");

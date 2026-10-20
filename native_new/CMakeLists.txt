@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 依存の取得定義（OpenXR-SDK-Source / volk）。
+# 依存の取得定義（OpenXR-SDK-Source / Vulkan-Headers）。
 include(cmake/Dependencies.cmake)
 
 add_executable(xrift_new
@@ -26,6 +26,7 @@ target_include_directories(xrift_new PRIVATE src)
 target_compile_definitions(xrift_new PRIVATE
   VK_NO_PROTOTYPES
   XR_USE_GRAPHICS_API_VULKAN
+  VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
 )
 
 if(WIN32)
@@ -45,11 +46,9 @@ else()
   target_link_libraries(xrift_new PRIVATE openxr_loader)
 endif()
 
-if(TARGET volk::volk)
-  target_link_libraries(xrift_new PRIVATE volk::volk)
-else()
-  target_link_libraries(xrift_new PRIVATE volk)
-endif()
+# Vulkan-Hpp はヘッダオンリーのため Vulkan::Headers (インターフェース) のみを付ける。
+# vulkan-1.lib にはリンクしない。実行時の読み込みは vk::raii::Context が行う。
+target_link_libraries(xrift_new PRIVATE Vulkan::Headers)
 
 # loader が共有ビルドの場合だけ、openxr_loader.dll を exe の隣に置く。静的なら不要。
 get_target_property(_xrift_loader_type openxr_loader TYPE)

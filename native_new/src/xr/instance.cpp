@@ -38,59 +38,68 @@ PFN_xrVoidFunction LoadProc(XrInstance instance, const char* name) {
 }  // namespace
 
 Instance::Instance() {
-  // 1. インスタンス拡張を列挙し、XR_KHR_vulkan_enable の有無を確認する。
-  uint32_t ext_count = 0;
-  CheckXr(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr),
-          "xrEnumerateInstanceExtensionProperties(件数)");
-  std::vector<XrExtensionProperties> extensions(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
-  CheckXr(xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, extensions.data()),
-          "xrEnumerateInstanceExtensionProperties(列挙)");
-  if (!HasExtension(extensions.data(), ext_count, kVulkanEnableExtension)) {
-    throw std::runtime_error(
-        "XR_KHR_vulkan_enable がランタイムに存在しません。対応ランタイム(例: SteamVR)を導入してください");
+  // コンストラクタが例外で抜けるとデストラクタは呼ばれないため、生成済みインスタンスは
+  // ここで破棄する。Destroy() は冪等であり、部分構築状態でも安全に呼べる。
+  try {
+    // 1. インスタンス拡張を列挙し、XR_KHR_vulkan_enable の有無を確認する。
+    uint32_t ext_count = 0;
+    CheckXr(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr),
+            "xrEnumerateInstanceExtensionProperties(件数)");
+    std::vector<XrExtensionProperties> extensions(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
+    CheckXr(xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, extensions.data()),
+            "xrEnumerateInstanceExtensionProperties(列挙)");
+    if (!HasExtension(extensions.data(), ext_count, kVulkanEnableExtension)) {
+      throw std::runtime_error(
+          "XR_KHR_vulkan_enable がランタイムに存在しません。対応ランタイム(例: SteamVR)を導入してください");
+    }
+    has_local_floor_ = HasExtension(extensions.data(), ext_count, kLocalFloorExtension);
+
+    // 2. インスタンスを生成する。
+    XrApplicationInfo app_info{};
+    std::snprintf(app_info.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "xrift_new");
+    app_info.applicationVersion = 1;
+    app_info.apiVersion = XR_API_VERSION_1_0;
+    const char* enabled[] = {kVulkanEnableExtension};
+    XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
+    create_info.applicationInfo = app_info;
+    create_info.enabledExtensionCount = 1;
+    create_info.enabledExtensionNames = enabled;
+    CheckXr(xrCreateInstance(&create_info, &instance_), "xrCreateInstance");
+
+    CheckXr(xrGetInstanceProperties(instance_, &instance_props_), "xrGetInstanceProperties");
+
+    // 3. HMD の system を解決する。見つからない場合は環境要因が分かる文面にする。
+    XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
+    system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    const XrResult system_result = xrGetSystem(instance_, &system_info, &system_);
+    if (system_result == XR_ERROR_FORM_FACTOR_UNAVAILABLE) {
+      throw std::runtime_error(
+          std::string("HMD が見つかりません。SteamVR などが起動しているか確認してください (xrGetSystem: ") +
+          XrResultToString(system_result) + ")");
+    }
+    CheckXr(system_result, "xrGetSystem");
+    CheckXr(xrGetSystemProperties(instance_, system_, &system_props_), "xrGetSystemProperties");
+
+    // 4. XR_KHR_vulkan_enable の拡張関数を取得する。
+    pfn_requirements_ = reinterpret_cast<PFN_xrGetVulkanGraphicsRequirementsKHR>(
+        LoadProc(instance_, "xrGetVulkanGraphicsRequirementsKHR"));
+    pfn_instance_extensions_ = reinterpret_cast<PFN_xrGetVulkanInstanceExtensionsKHR>(
+        LoadProc(instance_, "xrGetVulkanInstanceExtensionsKHR"));
+    pfn_device_extensions_ = reinterpret_cast<PFN_xrGetVulkanDeviceExtensionsKHR>(
+        LoadProc(instance_, "xrGetVulkanDeviceExtensionsKHR"));
+    pfn_graphics_device_ = reinterpret_cast<PFN_xrGetVulkanGraphicsDeviceKHR>(
+        LoadProc(instance_, "xrGetVulkanGraphicsDeviceKHR"));
+
+    Info("runtime: %s, system: %s", instance_props_.runtimeName, system_props_.systemName);
+  } catch (...) {
+    Destroy();
+    throw;
   }
-  has_local_floor_ = HasExtension(extensions.data(), ext_count, kLocalFloorExtension);
-
-  // 2. インスタンスを生成する。
-  XrApplicationInfo app_info{};
-  std::snprintf(app_info.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "xrift_new");
-  app_info.applicationVersion = 1;
-  app_info.apiVersion = XR_API_VERSION_1_0;
-  const char* enabled[] = {kVulkanEnableExtension};
-  XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
-  create_info.applicationInfo = app_info;
-  create_info.enabledExtensionCount = 1;
-  create_info.enabledExtensionNames = enabled;
-  CheckXr(xrCreateInstance(&create_info, &instance_), "xrCreateInstance");
-
-  CheckXr(xrGetInstanceProperties(instance_, &instance_props_), "xrGetInstanceProperties");
-
-  // 3. HMD の system を解決する。見つからない場合は環境要因が分かる文面にする。
-  XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
-  system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-  const XrResult system_result = xrGetSystem(instance_, &system_info, &system_);
-  if (system_result == XR_ERROR_FORM_FACTOR_UNAVAILABLE) {
-    throw std::runtime_error(
-        std::string("HMD が見つかりません。SteamVR などが起動しているか確認してください (xrGetSystem: ") +
-        XrResultToString(system_result) + ")");
-  }
-  CheckXr(system_result, "xrGetSystem");
-  CheckXr(xrGetSystemProperties(instance_, system_, &system_props_), "xrGetSystemProperties");
-
-  // 4. XR_KHR_vulkan_enable の拡張関数を取得する。
-  pfn_requirements_ = reinterpret_cast<PFN_xrGetVulkanGraphicsRequirementsKHR>(
-      LoadProc(instance_, "xrGetVulkanGraphicsRequirementsKHR"));
-  pfn_instance_extensions_ = reinterpret_cast<PFN_xrGetVulkanInstanceExtensionsKHR>(
-      LoadProc(instance_, "xrGetVulkanInstanceExtensionsKHR"));
-  pfn_device_extensions_ = reinterpret_cast<PFN_xrGetVulkanDeviceExtensionsKHR>(
-      LoadProc(instance_, "xrGetVulkanDeviceExtensionsKHR"));
-  pfn_graphics_device_ = reinterpret_cast<PFN_xrGetVulkanGraphicsDeviceKHR>(
-      LoadProc(instance_, "xrGetVulkanGraphicsDeviceKHR"));
-
-  Info("runtime: %s, system: %s", instance_props_.runtimeName, system_props_.systemName);
 }
 
-Instance::~Instance() {
+Instance::~Instance() { Destroy(); }
+
+void Instance::Destroy() {
   if (instance_ != XR_NULL_HANDLE) {
     const XrResult result = xrDestroyInstance(instance_);
     if (result != XR_SUCCESS) {

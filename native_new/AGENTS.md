@@ -15,3 +15,7 @@ Nativeを新規で作り直す
 - Vulkan
 - CPUコピーを経由せず、ElectronからGPU内コピーだけでバッファを引っ張る
 - Linux対応 (将来的に)
+
+# 特記事項
+
+- OpenXR-Hppは更新が停止しているため使用しない

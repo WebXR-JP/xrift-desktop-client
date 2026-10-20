@@ -39,7 +39,7 @@ int Probe() {
 
     // フォーマット列挙には session が要るため、ここでは優先候補の表示に留める。
     Info("swapchain format 候補（優先順）:");
-    for (int64_t format : gfx::PreferredSwapchainFormats()) {
+    for (vk::Format format : gfx::PreferredSwapchainFormats()) {
       Info("  %s", gfx::SwapchainFormatName(format));
     }
     Info("probe 成功: セッションは作成していません");

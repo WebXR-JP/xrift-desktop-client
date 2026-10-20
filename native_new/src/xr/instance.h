@@ -26,8 +26,8 @@ class Instance {
 
   // PRIMARY_STEREO の view 構成を返す。session を必要としない。
   std::vector<XrViewConfigurationView> QueryStereoViews() const;
-
-  PFN_xrGetVulkanGraphicsRequirementsKHR vulkanRequirementsProc() const { return pfn_requirements_; }
+  // 明示破棄。多重呼び出しと未生成呼び出しは無視する。
+  void Destroy();  PFN_xrGetVulkanGraphicsRequirementsKHR vulkanRequirementsProc() const { return pfn_requirements_; }
   PFN_xrGetVulkanInstanceExtensionsKHR vulkanInstanceExtensionsProc() const {
     return pfn_instance_extensions_;
   }

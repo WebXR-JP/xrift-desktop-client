@@ -8,15 +8,18 @@ OpenXR + Vulkan の単体 exe。Electron / Node に依存せず、HMD の両眼�
 
 - CMake 3.24 以上
 - Visual Studio 2022（Windows）または C++17 コンパイラ
-- Python 3（任意。依存の取得には使わない）
+- Python 3（必須。OpenXR-SDK-Source の loader コード生成に使う。実測では Python 3.13 で configure/build した）
 - ネットワーク（初回 configure 時に FetchContent で依存を取得する）
 
 依存は `cmake/Dependencies.cmake` で固定している。
 
 - OpenXR-SDK-Source `release-1.1.65`
-- volk `vulkan-sdk-1.4.363.0`（Vulkan-Headers 内包）
+- Vulkan-Headers `v1.4.363`（Vulkan-Hpp `vulkan.hpp` + `vk::raii` 同梱）
 
-Vulkan SDK への依存は作らない。volk が実行時に `vulkan-1.dll` を読み込む。
+Vulkan SDK のインストールは不要（`vulkan-1.lib` にリンクしない）。
+実行時は `vulkan.hpp` の動的ディスパッチャ（`vk::raii::Context`）が `vulkan-1.dll` を読み込む。
+ただし OpenXR-SDK-Source 側の configure は、インストール済みの Vulkan SDK があれば任意検出する
+（configure 時に `Found Vulkan: ...` と出ることがあるが、`xrift_new` 本体は SDK にリンクしない）。
 
 ## ビルド
 
@@ -44,13 +47,13 @@ build/windows/Release/xrift_new.exe
 - `src/main.cpp` … CLI（`--probe` / `--help`）と `XrApp` の起動
 - `src/app.h` / `src/app.cpp` … ライフサイクルとフレームループ、イベント処理、投影レイヤ提出
 - `src/common/log.h` / `.cpp` … `[info]` / `[warn]` / `[error]` 出力
-- `src/common/xr_vulkan.h` … volk→OpenXR の読み順を固定する共通 include
+- `src/common/xr_vulkan.h` … vulkan.hpp→OpenXR の読み順を固定する共通 include
 - `src/common/xr_result.h` / `.cpp` … `XrResult` の文字列化と `CheckXr`
 - `src/xr/instance.h` / `.cpp` … `XrInstance` と system、拡張列挙と必須チェック
 - `src/xr/session.h` / `.cpp` … Vk バインディング付き session、LOCAL 空間、view 構成、状態遷移
-- `src/gfx/vulkan_context.h` / `.cpp` … OpenXR 要件からの `VkInstance` / `VkPhysicalDevice` / `VkDevice` 生成
-- `src/gfx/swapchains.h` / `.cpp` … 両眼の `XrSwapchain` とフォーマット選択
-- `src/gfx/clear_pass.h` / `.cpp` … acquire / wait / clear / release とコマンド・フェンス管理
+- `src/gfx/vulkan_context.h` / `.cpp` … OpenXR 要件からの `vk::raii::Instance` / `PhysicalDevice` / `Device` 生成
+- `src/gfx/swapchains.h` / `.cpp` … 両眼の `XrSwapchain` とフォーマット選択（`vk::Format` 保持）
+- `src/gfx/clear_pass.h` / `.cpp` … acquire / wait / clear / release とコマンド・フェンス管理（`vk::raii` 所有）
 
 ## OpenXR の呼び出し順
 
@@ -75,7 +78,7 @@ build/windows/Release/xrift_new.exe
 3. `shouldRender` かつ位置・向きが有効なら両眼クリア描画
 4. `xrEndFrame`（描画しないフレームは `layerCount=0`、必ず呼ぶ）
 
-終了時は session → swapchain → device → instance の順に破棄する。
+終了時は clear_pass → swapchain → session → device → instance の順に破棄する。
 
 ## 現状の制限
 
