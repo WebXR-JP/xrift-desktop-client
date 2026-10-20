@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "transfer/protocol.h"
 #include "transfer/render_record.h"
 #include "transfer/shared_texture.h"
+#include "xr/input.h"
 #include "xr/session.h"
 
 namespace xrift::transfer {
@@ -487,6 +489,77 @@ class BlitPass {
   vk::Format format_ = vk::Format::eUndefined;
 };
 
+// 入力スナップショットを 192B の InputState（exe → main）に畳む。
+// pose は載せない（exe 側のログで確認する。線路上は操作の要約のみ）。
+// 「0」と「未対応」の区別は active/supported の 2 段で行う（protocol.h の欄定義を参照）。
+// 未接続の手は flags=0 のまま全欄 0 で送る（0 埋めと区別のため flags を見る）。
+TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, uint32_t connEpoch,
+                                      uint32_t spaceEpoch) {
+  TransferMessage m{};
+  m.magic = kMagic;
+  m.version = kVersion;
+  m.type = kTypeInputState;
+  m.renderId = snapshot.frameNo;
+  m.connEpoch = connEpoch;
+  m.spaceEpoch = spaceEpoch;
+  uint8_t* base = reinterpret_cast<uint8_t*>(&m);
+  for (int i = 0; i < 2; ++i) {
+    const xr::HandInput& hand = snapshot.hands[i];
+    uint8_t* h = base + kInputHand0 + static_cast<size_t>(i) * kInputHandStride;
+    uint8_t flags = 0;
+    if (hand.connected) {
+      flags |= 1u << 0;
+    }
+    if (hand.gripValid) {
+      flags |= 1u << 1;
+    }
+    if (hand.aimValid) {
+      flags |= 1u << 2;
+    }
+    h[kInputHandFlags] = flags;
+    h[kInputHandProfile] = ProfileIdFromName(hand.profile.c_str());
+    const auto active_value = [](xr::FieldState s) { return s == xr::FieldState::Active ? 1 : 0; };
+    const auto supported_value = [](xr::FieldState s) {
+      return s == xr::FieldState::Unsupported ? 0 : 1;
+    };
+    h[kInputHandTrigger] = QuantizeUnitFloat(hand.trigger);
+    h[kInputHandSqueeze] = QuantizeUnitFloat(hand.squeeze);
+    h[kInputHandStickX] = QuantizeStick(hand.thumbstick[0]);
+    h[kInputHandStickY] = QuantizeStick(hand.thumbstick[1]);
+    h[kInputHandPadX] = QuantizeStick(hand.trackpad[0]);
+    h[kInputHandPadY] = QuantizeStick(hand.trackpad[1]);
+    uint8_t buttons = 0;
+    uint8_t btn_active = 0;
+    uint8_t btn_supported = 0;
+    const xr::InputButton* btns[5] = {&hand.thumbstickClick, &hand.trackpadClick, &hand.primary,
+                                      &hand.secondary, &hand.menu};
+    for (int b = 0; b < 5; ++b) {
+      if (btns[b]->pressed && btns[b]->state == xr::FieldState::Active) {
+        buttons |= static_cast<uint8_t>(1u << b);
+      }
+      if (btns[b]->state == xr::FieldState::Active) {
+        btn_active |= static_cast<uint8_t>(1u << b);
+      }
+      if (btns[b]->state != xr::FieldState::Unsupported) {
+        btn_supported |= static_cast<uint8_t>(1u << b);
+      }
+    }
+    h[kInputHandButtons] = buttons;
+    h[kInputHandBtnActive] = btn_active;
+    h[kInputHandFloatActive] = static_cast<uint8_t>((active_value(hand.triggerState) << 0) |
+                                                    (active_value(hand.squeezeState) << 1));
+    h[kInputHandVecActive] = static_cast<uint8_t>((active_value(hand.thumbstickState) << 0) |
+                                                   (active_value(hand.trackpadState) << 1));
+    h[kInputHandBtnSupported] = btn_supported;
+    h[kInputHandAnalogSupported] =
+        static_cast<uint8_t>((supported_value(hand.triggerState) << 0) |
+                             (supported_value(hand.squeezeState) << 1) |
+                             (supported_value(hand.thumbstickState) << 2) |
+                             (supported_value(hand.trackpadState) << 3));
+  }
+  return m;
+}
+
 struct XrStats {
   uint64_t frames = 0;
   uint64_t rendered = 0;
@@ -502,8 +575,15 @@ struct XrStats {
   uint64_t verifyNg = 0;
   uint64_t firstUs = 0;
   uint64_t lastUs = 0;
+  // M4: 入力・haptics・空間・再生成の統計。
+  uint64_t inputSent = 0;       // main へ送った InputState の件数。
+  uint64_t hapticReceived = 0;  // main から受けた HapticCommand の件数。
+  uint64_t spaceChanges = 0;    // spaceEpoch を進めた回数。
+  uint64_t restarts = 0;        // セッション再生成の成功回数。
+  uint64_t restartAttempts = 0;  // セッション再生成の試行回数。
+  uint32_t connEpoch = 1;       // 現在の接続世代。
 
-  void Print(const RenderLedger::Stats& ledger) const {
+  void Print(const RenderLedger::Stats& ledger, const xr::InputStats& input) const {
     const double spanS =
         firstUs != 0 && lastUs > firstUs ? static_cast<double>(lastUs - firstUs) / 1e6 : 0.0;
     const double fps = spanS > 0.0 ? static_cast<double>(frames) / spanS : 0.0;
@@ -527,17 +607,38 @@ struct XrStats {
          static_cast<unsigned long long>(emptyFrames));
     Info("XR転送統計: 左右分離検証 ok=%llu ng=%llu",
          static_cast<unsigned long long>(verifyOk), static_cast<unsigned long long>(verifyNg));
+    Info("M4統計: connEpoch=%u InputState送信=%llu haptic受信=%llu space変更=%llu",
+         connEpoch, static_cast<unsigned long long>(inputSent),
+         static_cast<unsigned long long>(hapticReceived),
+         static_cast<unsigned long long>(spaceChanges));
+    Info("M4統計: セッション再生成 成功=%llu 試行=%llu",
+         static_cast<unsigned long long>(restarts),
+         static_cast<unsigned long long>(restartAttempts));
+    Info("M4統計: 入力 sync=%llu 失敗=%llu snapshot=%llu profile変化=%llu",
+         static_cast<unsigned long long>(input.syncs),
+         static_cast<unsigned long long>(input.syncFailed),
+         static_cast<unsigned long long>(input.snapshots),
+         static_cast<unsigned long long>(input.profileChanges));
+    Info("M4統計: haptics 成功=%llu 未送信(inactive等)=%llu 失敗=%llu",
+         static_cast<unsigned long long>(input.hapticOk),
+         static_cast<unsigned long long>(input.hapticInactive),
+         static_cast<unsigned long long>(input.hapticFailed));
   }
 };
 
 }  // namespace
 
 int RunXrTransfer(const XrTransferOptions& options) {
-  Info("XR転送開始: pipe=%s render-scale=%.2f submit-verify=%s", options.pipeName.c_str(),
-       options.renderScale, options.submitVerify ? "on" : "off");
+  Info("XR転送開始: pipe=%s render-scale=%.2f submit-verify=%s space=%s", options.pipeName.c_str(),
+       options.renderScale, options.submitVerify ? "on" : "off", options.space.c_str());
   if (options.injectStaleRecord > 0) {
     Info("検証フック有効: --inject-stale-record=%d（そのフレームの要求に旧 pose 混入の合図）",
          options.injectStaleRecord);
+  }
+  if (options.injectSessionRestartMs > 0) {
+    Info("検証フック有効: --inject-session-restart=%d（起動からその ms 後に意図的にセッションを"
+         "破棄・再生成する）",
+         options.injectSessionRestartMs);
   }
 
   // 転送セッションを先に作る。同一 VkDevice を XR セッションと共有し、
@@ -547,28 +648,70 @@ int RunXrTransfer(const XrTransferOptions& options) {
   transfer_opts.verify = false;    // M1 の部分検証は行わない。M2 の照合で行う。
   transfer_opts.gpuCheck = false;  // M1b の全画面検査は行わない。制御メタのみ読む。
   TransferSession transfer(transfer_opts);
-  xr::Session session(transfer.XrInstance(), transfer.Vulkan());
-  gfx::Swapchains swapchains(transfer.XrInstance().handle(), session.handle(), session.views(),
-                             gfx::M2PreferredSwapchainFormats());
-  if (swapchains.format() != vk::Format::eB8G8R8A8Unorm) {
+  xr::SpacePreference space_pref = xr::SpacePreference::Auto;
+  try {
+    space_pref = xr::ParseSpacePreference(options.space);
+  } catch (const std::exception& e) {
+    Error("%s", e.what());
+    return 1;
+  }
+  if (options.injectSessionRestartMs < 0) {
+    Error("--inject-session-restart は 0 以上であること");
+    return 1;
+  }
+
+  // セッション束（セッション・参照空間・swapchain・blit・入力空間）。
+  // LOSS_PENDING や --inject-session-restart ではこの束だけを破棄・再生成する。
+  // TransferSession（instance・Vulkan device）・M2BlockReader・PipeClient は保つ。
+  // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（DESIGN §6・§10）。
+  std::unique_ptr<xr::Session> session;
+  std::unique_ptr<gfx::Swapchains> swapchains;
+  std::unique_ptr<BlitPass> blit;
+  xr::InputManager input;
+  uint32_t conn_epoch = 1;
+  RenderLedger ledger(conn_epoch, 1);
+  XrStats stats{};
+  stats.connEpoch = conn_epoch;
+  try {
+    session = std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan(), space_pref);
+  } catch (const std::exception& e) {
+    Error("XR セッションの生成に失敗: %s", e.what());
+    return 1;
+  }
+  try {
+    input.Create(transfer.XrInstance().handle());
+  } catch (const std::exception& e) {
+    Error("入力アクションの生成に失敗: %s", e.what());
+    return 1;
+  }
+  if (!input.AttachSpaces(session->handle())) {
+    Warn("入力アクションの attach に失敗したため入力は inactive のまま続行する");
+  }
+  try {
+    swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
+                                                   session->handle(), session->views(),
+                                                   gfx::M2PreferredSwapchainFormats());
+  } catch (const std::exception& e) {
+    Error("swapchain の生成に失敗: %s", e.what());
+    return 1;
+  }
+  if (swapchains->format() != vk::Format::eB8G8R8A8Unorm) {
     Warn("swapchain が %s（受理画像と不一致。二重符号化の疑いが残る。DESIGN §9 の未決）",
-         gfx::SwapchainFormatName(swapchains.format()));
+         gfx::SwapchainFormatName(swapchains->format()));
   } else {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
-  BlitPass blit(transfer.Vulkan(), swapchains);
+  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
   M2BlockReader reader(transfer.Vulkan());
   PipeClient pipe(options.pipeName);
   Info("パイプ接続: main プロセスと接続した");
 
-  RenderLedger ledger(1, 1);
-  XrStats stats{};
   XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
   XrCompositionLayerProjectionView proj_views[2] = {
       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
   };
-  layer.space = session.space();
+  layer.space = session->space();
   layer.viewCount = 2;
   layer.views = proj_views;
   std::vector<XrView> views(2, {XR_TYPE_VIEW});
@@ -583,6 +726,19 @@ int RunXrTransfer(const XrTransferOptions& options) {
 
   bool session_running = false;
   bool quit = false;
+  // M4: セッション再生成の状態。LOSS_PENDING で束を破棄し、1 秒周期で再生成を試みる。
+  // 試行上限（30 回≒30 秒）を超えたらランタイム未復帰として安全に終了する（統計出力）。
+  // 上限 30・間隔 1 秒はいずれも意図的な値であり、仮置きではない。
+  bool needs_rebuild = false;
+  int rebuild_attempts_left = 0;
+  uint64_t last_rebuild_try_us = 0;
+  // REFERENCE_SPACE_CHANGE_PENDING の受付。適用はフレーム側で行う。
+  bool pending_space_change = false;
+  // --inject-session-restart の発火済み合図（1 回だけ送る）。
+  bool restart_injected = false;
+  const uint64_t start_us = NowUs();
+  // M4 の毎秒入力ログの前回出力時刻。0 は未出力である。
+  uint64_t last_input_log_us = 0;
   // パイプの生死と終了コード。切断（hard close）は新規受付の停止と統計付き終了の合図
   // であり（DESIGN §6③）、未完了の借用へ Done は送らない。プロトコルに終了合図が無い
   // ため、少なくともハングせず統計を残すことを優先し、正常な切断は 0、異常は非ゼロで返す。
@@ -597,35 +753,116 @@ int RunXrTransfer(const XrTransferOptions& options) {
   const uint64_t deadlineUs =
       options.seconds > 0 ? NowUs() + static_cast<uint64_t>(options.seconds) * 1000000u : 0;
 
+  // セッション束の破棄・再生成。LOSS_PENDING と --inject-session-restart で使う。
+  // 成功時は新しい connEpoch で ledger を切り替え、旧世代のレコードを失効させる。
+  // 入力空間・swapchain・blit は作り直し、instance・device・reader・pipe は保つ。
+  // 失敗時は false を返す（呼び出し側は再試行か安全な終了を選ぶ）。
+  // 再試行の上限 30 回・間隔 1 秒はいずれも意図的な値であり、仮置きではない。
+  static constexpr int kRebuildMaxAttempts = 30;
+  static constexpr uint64_t kRebuildRetryIntervalUs = 1000000u;
+  auto rebuild_session = [&](const char* why) -> bool {
+    ++stats.restartAttempts;
+    Info("セッション再生成を開始（%s）。connEpoch=%u→%u", why, conn_epoch, conn_epoch + 1);
+    input.DetachSpaces();
+    blit.reset();
+    swapchains.reset();
+    session.reset();
+    session_running = false;
+    hasFresh = false;
+    ++conn_epoch;
+    ledger.AdvanceConnEpoch(conn_epoch);
+    stats.connEpoch = conn_epoch;
+    try {
+      session =
+          std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan(), space_pref);
+    } catch (const std::exception& e) {
+      Warn("セッション再生成に失敗（%s）: %s", why, e.what());
+      return false;
+    }
+    if (input.hasActionSet()) {
+      if (!input.AttachSpaces(session->handle())) {
+        Warn("再生成後の attach に失敗したため入力は inactive のまま続行する");
+      }
+    }
+    try {
+      swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
+                                                     session->handle(), session->views(),
+                                                     gfx::M2PreferredSwapchainFormats());
+      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
+    } catch (const std::exception& e) {
+      Warn("再生成後の swapchain 生成に失敗（%s）: %s", why, e.what());
+      session.reset();
+      return false;
+    }
+    layer.space = session->space();
+    ++stats.restarts;
+    Info("セッション再生成に成功（%s）。connEpoch=%u space=%s", why, conn_epoch,
+         xr::SpaceTypeName(session->spaceType()));
+    return true;
+  };
+
+  // REFERENCE_SPACE_CHANGE_PENDING の適用。新しい原点で locate できることを確認してから
+  // spaceEpoch を進め、旧世代のレコードを失効させる（DESIGN §10）。
+  auto apply_pending_space = [&]() {
+    if (!pending_space_change || !session) {
+      return;
+    }
+    if (session->RecreateSpaceForPendingChange()) {
+      ledger.AdvanceSpaceEpoch(ledger.spaceEpoch() + 1);
+      hasFresh = false;
+      ++stats.spaceChanges;
+      Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
+    } else {
+      Warn("reference space 変更の適用に失敗したため旧空間・旧世代を保つ");
+    }
+    pending_space_change = false;
+  };
+
   auto poll_events = [&]() {
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(transfer.XrInstance().handle(), &event) == XR_SUCCESS) {
       switch (event.type) {
         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
           const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
-          if (changed->session != session.handle()) {
+          if (!session || changed->session != session->handle()) {
             break;
           }
-          session.setState(changed->state);
-          Info("session 状態: %d", static_cast<int>(changed->state));
+          session->setState(changed->state);
+          Info("session 状態: %d (connEpoch=%u)", static_cast<int>(changed->state), conn_epoch);
           switch (changed->state) {
             case XR_SESSION_STATE_READY:
               if (!session_running) {
-                session.Begin();
+                session->Begin();
                 session_running = true;
                 Info("セッション開始");
               }
               break;
             case XR_SESSION_STATE_STOPPING:
+              // STOPPING → xrEndSession。脱着は loss とは限らないため束は保つ
+              // （focus/visible/shouldRender に従って提出だけ止める）。
               if (session_running) {
-                session.End();
+                session->End();
                 session_running = false;
-                Info("セッション終了");
+                Info("セッション終了（STOPPING。束は保持し READY で再開する）");
               }
               break;
             case XR_SESSION_STATE_EXITING:
-            case XR_SESSION_STATE_LOSS_PENDING:
+              // EXITING はランタイムの終了要求であり、再生成せず安全に終わる。
               quit = true;
+              break;
+            case XR_SESSION_STATE_LOSS_PENDING:
+              // loss 時は束を破棄し、新しい connEpoch で再生成する。
+              // ランタイムが復帰しなければ再試行の末に安全に終了する。
+              Info("セッション loss を検知したため束を破棄し再生成する");
+              input.DetachSpaces();
+              blit.reset();
+              swapchains.reset();
+              session.reset();
+              session_running = false;
+              hasFresh = false;
+              needs_rebuild = true;
+              rebuild_attempts_left = kRebuildMaxAttempts;
+              last_rebuild_try_us = 0;
               break;
             default:
               break;
@@ -635,13 +872,15 @@ int RunXrTransfer(const XrTransferOptions& options) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
           quit = true;
           break;
+        case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+          // 実 profile の読みは毎フレームの Snapshot 側で行い、変化を記録する。
+          Info("interaction profile 変更イベントを受信（次フレームの取得で確認する）");
+          break;
         case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-          // 適用時刻の追跡は行わず、受信時点で世代を進める。
-          // 旧世代のレコードは即座に失効する（DESIGN §10）。
-          ledger.AdvanceSpaceEpoch(ledger.spaceEpoch() + 1);
-          hasFresh = false;
-          Info("reference space 変更: spaceEpoch=%u へ進行し旧レコードを失効させた",
-               ledger.spaceEpoch());
+          // 適用時刻に従い、新しい原点で locate できるタイミングで世代を進める。
+          // ここでは受付だけ行い、適用はフレーム側で行う。
+          pending_space_change = true;
+          Info("reference space 変更予定を受信（次フレームで適用を試みる）");
           break;
         default:
           break;
@@ -654,6 +893,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 中間画像の受理は行わない（最新優先の方針。破棄数は統計に出る）。
   // shouldRender が false のフレーム（SYNCHRONIZED 等）でも毎フレーム呼ぶこと。
   // 受信・ACK は描画可否と無関係に進め、止めるのは提出だけである。
+  // M4: 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにし、
+  // producer 生存の証拠（haveOfferEver）には数えない。
   auto drain_offers = [&]() {
     TransferMessage msg{};
     bool have_last = false;
@@ -686,6 +927,31 @@ int RunXrTransfer(const XrTransferOptions& options) {
           return;
         }
         break;
+      }
+      // M4: main → exe の HapticCommand は Offer とは別扱いにする。
+      // producer 生存の証拠には数えず、借用台帳にも触れない。
+      // セッションが無い・実行中でない場合は inactive として記録する（例外にしない）。
+      if (msg.magic == kMagic && msg.version == kVersion && msg.type == kTypeHapticCommand) {
+        if (!IsValidHapticCommand(msg)) {
+          Warn("不正な HapticCommand を破棄（hand/amplitude/duration の不一致）");
+          continue;
+        }
+        ++stats.hapticReceived;
+        const uint32_t hand = HapticHand(msg);
+        const float amp = HapticAmplitude(msg);
+        const uint32_t dur = HapticDurationMs(msg);
+        // FOCUSED でなければ送らず inactive に数える（入力の sync と同じ基準）。
+        const bool haptic_focused =
+            session && session->state() == XR_SESSION_STATE_FOCUSED;
+        bool sent = false;
+        if (session) {
+          sent = input.ApplyHaptic(session->handle(), hand, amp, dur, haptic_focused);
+        } else {
+          input.ApplyHaptic(XR_NULL_HANDLE, hand, amp, dur, false);
+        }
+        Info("haptics %s: %s 振幅=%.2f 持続=%ums（inactive・失敗は統計に残る）",
+             sent ? "送信" : "未送信", hand == 0 ? "左" : "右", amp, dur);
+        continue;
       }
       // 何らかの受信があれば producer は生存している（有効・無効を問わない）。
       haveOfferEver = true;
@@ -759,7 +1025,36 @@ int RunXrTransfer(const XrTransferOptions& options) {
       break;
     }
     poll_events();
-    if (!session_running) {
+    if (quit) {
+      break;
+    }
+    // M4: --inject-session-restart の発火（1 回だけ。復帰経路の検証用）。
+    // ランタイムが受け付ける範囲で束を破棄・再生成し、成功/失敗を統計に残す。
+    if (!restart_injected && options.injectSessionRestartMs > 0 && session &&
+        NowUs() - start_us >= static_cast<uint64_t>(options.injectSessionRestartMs) * 1000u) {
+      restart_injected = true;
+      if (!rebuild_session("--inject-session-restart")) {
+        needs_rebuild = true;
+        rebuild_attempts_left = kRebuildMaxAttempts;
+        last_rebuild_try_us = NowUs();
+      }
+    }
+    // M4: loss 後の再生成の再試行（1 秒周期）。上限を超えたらランタイム未復帰として
+    // 安全に終了する（統計出力。非ゼロにはしない。こちらの破損ではないため）。
+    if (needs_rebuild && !session && rebuild_attempts_left > 0 &&
+        NowUs() - last_rebuild_try_us >= kRebuildRetryIntervalUs) {
+      last_rebuild_try_us = NowUs();
+      --rebuild_attempts_left;
+      if (rebuild_session("loss 後の再試行")) {
+        needs_rebuild = false;
+      } else if (rebuild_attempts_left == 0) {
+        Info("ランタイムが復帰しないため安全に終了する（再試行の上限に到達）");
+        break;
+      }
+    }
+    // M4: 参照空間変更の適用（新しい原点で locate できる確認が取れてから世代を進める）。
+    apply_pending_space();
+    if (!session_running || !session) {
       // 実行中でない間も Offer の受付・ACK と切断検知は進める。受信した Offer は
       // drain_offers が Done を返すため、消費して返せなくなることはない。
       // 以前はここで切断を見ず --seconds か kill 待ちでぶら下がったため、
@@ -786,19 +1081,19 @@ int RunXrTransfer(const XrTransferOptions& options) {
 
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
-    CheckXr(xrWaitFrame(session.handle(), &wait_info, &frame_state), "xrWaitFrame");
+    CheckXr(xrWaitFrame(session->handle(), &wait_info, &frame_state), "xrWaitFrame");
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-    CheckXr(xrBeginFrame(session.handle(), &begin_info), "xrBeginFrame");
+    CheckXr(xrBeginFrame(session->handle(), &begin_info), "xrBeginFrame");
 
     bool rendered = false;
     if (frame_state.shouldRender == XR_TRUE) {
       XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
       locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
       locate_info.displayTime = frame_state.predictedDisplayTime;
-      locate_info.space = session.space();
+      locate_info.space = session->space();
       XrViewState view_state{XR_TYPE_VIEW_STATE};
       uint32_t view_count = 0;
-      CheckXr(xrLocateViews(session.handle(), &locate_info, &view_state,
+      CheckXr(xrLocateViews(session->handle(), &locate_info, &view_state,
                             static_cast<uint32_t>(views.size()), &view_count, views.data()),
               "xrLocateViews");
       const bool pose_valid =
@@ -807,8 +1102,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
       if (view_count == views.size() && pose_valid) {
         // 要求アトラス寸法は左右各眼の描画倍率から求める。swapchain 自体は
         // XR 推奨サイズのまま作る（VRAM 圧迫を避ける。既定 0.5）。
-        const vk::Extent2D eye0 = swapchains.extent(0);
-        const vk::Extent2D eye1 = swapchains.extent(1);
+        const vk::Extent2D eye0 = swapchains->extent(0);
+        const vk::Extent2D eye1 = swapchains->extent(1);
         const auto scaled = [](uint32_t v, double s) {
           return static_cast<uint32_t>(static_cast<double>(v) * s + 0.5);
         };
@@ -858,6 +1153,28 @@ int RunXrTransfer(const XrTransferOptions& options) {
       pipeAlive = false;
       quit = true;
     }
+    // M4: 入力の取得と main への送信。FOCUSED 時に sync し、それ以外は inactive の
+    // スナップショットとして出す（「0」と「未対応」を区別できる形。毎フレーム送信し、
+    // ログは毎秒に抑える）。脱着時は focus を失うため提出だけ止め、受信・送信は続ける。
+    if (!quit) {
+      const bool focused = session->state() == XR_SESSION_STATE_FOCUSED;
+      input.Sync(session->handle(), focused);
+      const xr::InputSnapshot snapshot = input.Snapshot(
+          session->handle(), session->space(), frame_state.predictedDisplayTime, focused, frame_no);
+      try {
+        pipe.Send(MakeInputStateMessage(snapshot, conn_epoch, ledger.spaceEpoch()));
+        ++stats.inputSent;
+      } catch (const std::exception& e) {
+        Error("InputState 送信に失敗: %s", e.what());
+        pipeAlive = false;
+        exitCode = 1;
+        quit = true;
+      }
+      if (NowUs() - last_input_log_us >= 1000000u) {
+        last_input_log_us = NowUs();
+        Info("[M4入力] %s", xr::InputManager::Summarize(snapshot).c_str());
+      }
+    }
     // 提出は受理画像のレコードの pose/FOV で行う。最新 pose への付け替えはしない。
     // 新規受理が無ければ layerCount=0 で終える（対応不明の画像の再投影頼みは禁止。
     // DESIGN §7）。受理から 500ms 超のレコードは失効として棄却する。
@@ -872,8 +1189,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
       if (age <= kRenderRecordMaxAgeUs) {
         try {
           const vk::Image own = transfer.OwnImage();
-          const BlitPass::Result r0 = blit.Blit(0, own, freshW, freshH, 0, options.submitVerify);
-          const BlitPass::Result r1 = blit.Blit(1, own, freshW, freshH, 1, options.submitVerify);
+          const BlitPass::Result r0 = blit->Blit(0, own, freshW, freshH, 0, options.submitVerify);
+          const BlitPass::Result r1 = blit->Blit(1, own, freshW, freshH, 1, options.submitVerify);
           const uint64_t blit_us = r0.blitUs + r1.blitUs;
           ++stats.blits;
           stats.blitUsTotal += blit_us;
@@ -901,12 +1218,12 @@ int RunXrTransfer(const XrTransferOptions& options) {
             proj_views[eye].fov.angleRight = f.right;
             proj_views[eye].fov.angleUp = f.up;
             proj_views[eye].fov.angleDown = f.down;
-            proj_views[eye].subImage.swapchain = swapchains.handle(eye);
+            proj_views[eye].subImage.swapchain = swapchains->handle(eye);
             proj_views[eye].subImage.imageRect.offset = {0, 0};
             proj_views[eye].subImage.imageRect.extent.width =
-                static_cast<int32_t>(swapchains.extent(eye).width);
+                static_cast<int32_t>(swapchains->extent(eye).width);
             proj_views[eye].subImage.imageRect.extent.height =
-                static_cast<int32_t>(swapchains.extent(eye).height);
+                static_cast<int32_t>(swapchains->extent(eye).height);
             proj_views[eye].subImage.imageArrayIndex = 0;
           }
           Info("M2 提出: renderId=%llu 年齢=%lluus（画像対応レコードの pose/FOV）",
@@ -930,10 +1247,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
       end_info.layerCount = 0;
       ++stats.emptyFrames;
     }
-    CheckXr(xrEndFrame(session.handle(), &end_info), "xrEndFrame");
+    CheckXr(xrEndFrame(session->handle(), &end_info), "xrEndFrame");
   }
 
-  stats.Print(ledger.stats());
+  stats.Print(ledger.stats(), input.stats());
   Info("M2 中間破棄: %llu（最新優先のため Done のみ返した件数）",
        static_cast<unsigned long long>(droppedIntermediate));
   if (stats.submitLayers == 0) {

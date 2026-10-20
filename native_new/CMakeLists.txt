@@ -16,6 +16,7 @@ add_executable(xrift_new
   src/common/xr_result.cpp
   src/xr/instance.cpp
   src/xr/session.cpp
+  src/xr/input.cpp
   src/gfx/vulkan_context.cpp
   src/gfx/swapchains.cpp
   src/gfx/clear_pass.cpp

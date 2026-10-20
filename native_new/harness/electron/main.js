@@ -76,7 +76,13 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
     '  --inject-renderer-crash=Ms … 起動から Ms 後に renderer を強制クラッシュさせる。\n' +
     '    ハングせず停止し、未 ACK を隔離し、非ゼロ終了する。exe は切断で終了する\n' +
     '  --inject-gpu-kill=Ms … 起動から Ms 後に GPU プロセスを kill する。ハングしないことが必須。\n' +
-    '    Chromium が GPU を再起動する場合はその挙動を記録し、そうでなければ停止・非ゼロ終了する');
+    '    Chromium が GPU を再起動する場合はその挙動を記録し、そうでなければ停止・非ゼロ終了する\n' +
+    '  M4（--m2 時のみ）:\n' +
+    '  --space=<auto|local|stage|local-floor> … exe の参照空間の要求（既定 auto）。\n' +
+    '    不可なら落とさず後退し、理由は exe のログに出る\n' +
+    '  --haptic-at=Ms … 起動から Ms 後に HapticCommand を 1 回送る（既定 0=無効。\n' +
+    '    左手・振幅 0.8・300ms。inactive・失敗は exe 側の統計に残る）\n' +
+    '  --inject-session-restart=Ms … exe に渡す意図的セッション再生成フック（既定 0=無効）');
   app.whenReady().then(() => app.exit(0));
   return;
 }
@@ -90,6 +96,18 @@ const M2 = process.argv.includes('--m2');
 const INJECT_STALE_RECORD = Math.max(0, parseInt(arg('inject-stale-record', '0'), 10) || 0);
 const RENDER_SCALE = arg('render-scale', '0.5');
 const NO_SUBMIT_VERIFY = process.argv.includes('--no-submit-verify');
+// M4: 参照空間の要求（exe の --space へ渡す。既定 auto）。
+const SPACE = arg('space', 'auto');
+// M4: haptics 指令の送信時刻（起動から Ms 後に 1 回送る。既定 0=無効）。
+const HAPTIC_AT_MS = Math.max(0, parseInt(arg('haptic-at', '0'), 10) || 0);
+// M4: 意図的セッション再生成の検証フック（exe の --inject-session-restart へ渡す。既定 0=無効）。
+const INJECT_SESSION_RESTART_MS = Math.max(0, parseInt(arg('inject-session-restart', '0'), 10) || 0);
+if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
+  console.error(`unknown --space=${SPACE}（auto / local / stage / local-floor のいずれか）`);
+  process.exitCode = 1;
+  app.whenReady().then(() => app.exit(1));
+  return;
+}
 
 // プロトコル（native_new/src/transfer/protocol.h と同じ配置。192 バイト LE）。
 // M2 で 64B→192B 化した。先頭 64B の配置は M1 と同じである。
@@ -99,6 +117,8 @@ const VERSION = 2;
 const TYPE_OFFER = 1;
 const TYPE_DONE = 2;
 const TYPE_RENDER_REQUEST = 3;
+const TYPE_HAPTIC_COMMAND = 4; // main → exe。haptics 指令（M4）。
+const TYPE_INPUT_STATE = 5;    // exe → main。入力スナップショット（M4）。
 const FORMAT_BGRA = 0;
 const STATUS_OK = 0;
 
@@ -157,6 +177,9 @@ const stats = {
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
   distinctHandles: 0, firstCodedSize: null,
   renderRequests: 0, // M2: exe から受けた RenderRequest の件数。
+  inputStates: 0, // M4: exe から受けた InputState の件数。
+  lastInput: null, // M4: 最後に受けた InputState の要約（統計用）。
+  hapticSent: 0, // M4: exe へ送った HapticCommand の件数（--haptic-at 用）。
   releaseAttempts: 0, // M3: release() の試行回数（注入判定の分母）。
   warmupDrops: 0, // M3: パターン描画の合図前の起動過渡 drop 数（転送前 drop。証拠用）。
   rendererCrashed: 0, // M3: renderer 異常を検知したら 1。
@@ -188,6 +211,7 @@ let graceTimer = null;
 // いずれも既定 off であり、通常経路の挙動は変えない。
 let rendererCrashed = false;
 let rendererCrashTimer = null;
+let hapticTimer = null; // M4 の --haptic-at 用（1 回だけ送る）。
 let gpuKillTimer = null;
 let gpuKillObserveTimer = null;
 // M3 の描画準備ゲート。M1 はレンダラの最初のパターン描画の合図
@@ -595,6 +619,93 @@ function forwardM2Record(m) {
   }
 }
 
+// M4: exe からの InputState を読む。操作の要約であり、pose は含まない
+// （pose の確認は exe 側のログで行う）。「0」と「未対応」の区別は
+// active/supported の 2 段で行う。1 秒に 1 回だけ要約をログに出す。
+const PROFILE_NAMES = {
+  0: '-', 1: 'simple', 2: 'oculus', 3: 'index', 4: 'vive', 5: 'motion',
+  6: 'pico4', 7: 'pico-neo3', 8: 'pico-ultra', 9: 'pico-g3', 255: 'other',
+};
+let lastInputLogAt = 0;
+function decodeInputHand(m, base) {
+  const flags = m[base];
+  const btns = ['stick', 'pad', 'primary', 'secondary', 'menu'];
+  const pressed = [];
+  const bits = m[base + 8];
+  for (let b = 0; b < 5; b++) {
+    if ((bits & (1 << b)) !== 0) pressed.push(btns[b]);
+  }
+  const stickActive = (m[base + 11] & 1) !== 0;
+  return {
+    connected: (flags & 1) !== 0,
+    gripValid: (flags & 2) !== 0,
+    aimValid: (flags & 4) !== 0,
+    profile: PROFILE_NAMES[m[base + 1]] || `id=${m[base + 1]}`,
+    trigger: m[base + 2] / 255,
+    squeeze: m[base + 3] / 255,
+    stick: [m.readInt8(base + 4) / 127, m.readInt8(base + 5) / 127],
+    pad: [m.readInt8(base + 6) / 127, m.readInt8(base + 7) / 127],
+    buttons: pressed.length ? pressed.join(',') : '-',
+    btnActive: m[base + 9],
+    floatActive: m[base + 10],
+    vecActive: m[base + 11],
+    btnSupported: m[base + 12],
+    analogSupported: m[base + 13],
+    stickState: stickActive ? '' : (((m[base + 13] & 4) !== 0) ? '(inactive)' : '(非対応)'),
+  };
+}
+function onInputState(m) {
+  const st = {
+    frame: m.readBigUInt64LE(40).toString(),
+    connEpoch: m.readUInt32LE(48),
+    spaceEpoch: m.readUInt32LE(52),
+    left: decodeInputHand(m, 56),
+    right: decodeInputHand(m, 72),
+  };
+  stats.inputStates++;
+  stats.lastInput = st;
+  const now = Date.now();
+  if (now - lastInputLogAt >= 1000) {
+    lastInputLogAt = now;
+    const fmt = (h) => `${h.connected ? '接続' : '未接続'} prof=${h.profile} ` +
+      `trig=${h.trigger.toFixed(2)} sq=${h.squeeze.toFixed(2)} ` +
+      `stick=(${h.stick[0].toFixed(2)},${h.stick[1].toFixed(2)})${h.stickState} btn=${h.buttons}`;
+    log(`[M4入力] L: ${fmt(st.left)} | R: ${fmt(st.right)} ` +
+      `(frame=${st.frame} conn=${st.connEpoch} space=${st.spaceEpoch})`);
+  }
+}
+
+// M4: HapticCommand を exe へ 1 回送る（--haptic-at 用。左手・振幅 0.8・300ms）。
+// 配置は protocol.h の MakeHapticCommand と同じ（hand@40、amplitude@56、duration@48）。
+function sendHapticOnce() {
+  if (socket === null || socket.destroyed) {
+    log('haptics 未送信: パイプが無い（--haptic-at）');
+    return;
+  }
+  const buf = Buffer.alloc(MSG_LEN);
+  buf.writeUInt32LE(MAGIC, 0);
+  buf.writeUInt16LE(VERSION, 4);
+  buf.writeUInt16LE(TYPE_HAPTIC_COMMAND, 6);
+  buf.writeUInt32LE(0, 40); // hand=0（左）。
+  buf.writeFloatLE(0.8, 56);
+  buf.writeUInt32LE(300, 48);
+  try {
+    socket.write(buf);
+    stats.hapticSent++;
+    log('haptics 指令を送信（左・振幅 0.8・300ms。inactive・失敗は exe 側の統計に残る）');
+  } catch (e) {
+    log(`haptics 送信に失敗: ${e && e.message}`);
+  }
+}
+function scheduleHaptic() {
+  if (HAPTIC_AT_MS <= 0) return;
+  log(`検証フック有効: --haptic-at=${HAPTIC_AT_MS}（起動からその ms 後に HapticCommand を 1 回送る）`);
+  hapticTimer = setTimeout(() => {
+    hapticTimer = null;
+    sendHapticOnce();
+  }, HAPTIC_AT_MS);
+}
+
 function maybeFinish() {
   if (!stopping || finished) return;
   if (inFlight !== null) return;  // 未 offer の保留は転送前 drop と同じ扱いで finish 側が release するため、
@@ -614,6 +725,10 @@ function finish(code) {
   if (rendererCrashTimer) {
     clearTimeout(rendererCrashTimer);
     rendererCrashTimer = null;
+  }
+  if (hapticTimer) {
+    clearTimeout(hapticTimer);
+    hapticTimer = null;
   }
   if (gpuKillTimer) {
     clearTimeout(gpuKillTimer);
@@ -839,15 +954,20 @@ function start() {
   // M2 モードは XR 提出ループを起動する。M1 の --transfer 経路は変えない。
   const exeArgs = M2
     ? ['--xr-transfer', `--pipe=${pipePath}`, `--render-scale=${RENDER_SCALE}`,
-       `--seconds=${SECONDS + 30}`]
+       `--seconds=${SECONDS + 30}`, `--space=${SPACE}`]
     : ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`,
        `--mode=${MODE}`];
   if (M2) {
-    log(`exe の M2 XR提出モード: render-scale=${RENDER_SCALE}`);
+    log(`exe の M2 XR提出モード: render-scale=${RENDER_SCALE} space=${SPACE}`);
     if (INJECT_STALE_RECORD > 0) {
       exeArgs.push(`--inject-stale-record=${INJECT_STALE_RECORD}`);
       log(`検証フック有効: exe に --inject-stale-record=${INJECT_STALE_RECORD} を渡す ` +
           `（その要求に旧 pose 混入の合図。不一致で棄却される想定）`);
+    }
+    if (INJECT_SESSION_RESTART_MS > 0) {
+      exeArgs.push(`--inject-session-restart=${INJECT_SESSION_RESTART_MS}`);
+      log(`検証フック有効: exe に --inject-session-restart=${INJECT_SESSION_RESTART_MS} を渡す ` +
+          `（その ms 後に意図的にセッションを破棄・再生成する）`);
     }
     if (NO_SUBMIT_VERIFY) {
       exeArgs.push('--no-submit-verify');
@@ -888,6 +1008,8 @@ function start() {
   // M3 の renderer クラッシュ・GPU kill の予約は createWindow 後に行う。
   // renderer 側は window が要るため createWindow 側で予約し、GPU 側はここで予約する。
   scheduleGpuKill();
+  // M4 の haptics 指令（--haptic-at。M2 モード以外では送り先が無いため M2 限定）。
+  if (M2) scheduleHaptic();
   exeProc = spawn(EXE_PATH, exeArgs, {
     stdio: ['ignore', 'inherit', 'inherit'],
   });
@@ -932,6 +1054,11 @@ function start() {
         // M2: exe→main の描画要求。借用台帳には触れずレンダラへ渡す。
         if (msgType === TYPE_RENDER_REQUEST) {
           forwardM2Record(m);
+          continue;
+        }
+        // M4: exe→main の入力スナップショット。台帳には触れず記録する。
+        if (msgType === TYPE_INPUT_STATE) {
+          onInputState(m);
           continue;
         }
         if (msgType !== TYPE_DONE) {

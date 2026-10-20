@@ -143,6 +143,16 @@ class RenderLedger {
     records_.clear();
   }
 
+  // セッション再生成に伴い接続世代を進める。旧世代のレコードは失効させる
+  // （DESIGN §6・§10。旧 ACK・旧画像を受け付けないことと連動する）。
+  void AdvanceConnEpoch(uint32_t next) {
+    if (next == connEpoch_) {
+      return;
+    }
+    connEpoch_ = next;
+    records_.clear();
+  }
+
   // レコードを発行して保持する。renderId 0 は使わない（画像の未初期値と区別する）。
   const RenderRecord& Issue(uint64_t renderId, const EyePose& left, const EyePose& right,
                             const EyeFov& leftFov, const EyeFov& rightFov, uint32_t reqWidth,

@@ -131,6 +131,45 @@ int RunM2SelfTest() {
   Check(ledger.Accept(id16, tag, 7, t0 + 5000) == RejectReason::SpaceMismatch,
         "旧世代の画像は進行後も棄却");
 
+  // 8. M4: 接続世代の進行で旧レコードは失効する（セッション再生成時の切り替え）。
+  RenderLedger conn_ledger(1, 7);
+  conn_ledger.Issue(42, left, right, lf, rf, 2048, 1024, t0);
+  conn_ledger.AdvanceConnEpoch(2);
+  Check(conn_ledger.size() == 0, "接続世代の進行で台帳は空になる");
+  Check(conn_ledger.connEpoch() == 2, "接続世代の保持");
+
+  // 9. M4: HapticCommand の往復と妥当性（配置は protocol.h の定義どおり）。
+  {
+    const TransferMessage haptic = MakeHapticCommand(1, 0.8f, 300);
+    Check(IsValidHapticCommand(haptic), "HapticCommand 有効");
+    Check(HapticHand(haptic) == 1 && HapticAmplitude(haptic) == 0.8f &&
+              HapticDurationMs(haptic) == 300,
+          "HapticCommand の値の保持");
+    TransferMessage bad_hand = haptic;
+    bad_hand.renderId = 2;
+    Check(!IsValidHapticCommand(bad_hand), "hand 2 の指令は無効");
+    TransferMessage bad_amp = haptic;
+    bad_amp.leftPos[0] = 1.5f;
+    Check(!IsValidHapticCommand(bad_amp), "振幅 1 超の指令は無効");
+    TransferMessage bad_dur = haptic;
+    bad_dur.connEpoch = 0;
+    Check(!IsValidHapticCommand(bad_dur), "持続 0 の指令は無効");
+  }
+
+  // 10. M4: profile 識別子と量子化（JS 側 protocol-test.js と同じ表・同じ式）。
+  Check(ProfileIdFromName("") == 0, "空 profile は未取得");
+  Check(ProfileIdFromName("/interaction_profiles/bytedance/pico4_controller") == 6,
+        "PICO 4 の識別子");
+  Check(ProfileIdFromName("/interaction_profiles/oculus/touch_controller") == 2,
+        "oculus の識別子");
+  Check(ProfileIdFromName("/interaction_profiles/unknown/future_controller") == 255,
+        "未知 profile は 255");
+  Check(QuantizeUnitFloat(0.0f) == 0 && QuantizeUnitFloat(1.0f) == 255, "アナログ量子化の両端");
+  Check(QuantizeStick(-1.0f) == static_cast<uint8_t>(static_cast<int8_t>(-127)) &&
+            QuantizeStick(1.0f) == 127,
+        "スティック量子化の両端");
+  Check(sizeof(TransferMessage) == 192, "M4 追加後もメッセージ 192B");
+
   if (g_failures > 0) {
     std::printf("[m2-selftest] FAIL %d 件\n", g_failures);
     return 1;

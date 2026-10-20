@@ -8,12 +8,14 @@
 #   [-InjectReleaseFail N] [-InjectRendererCrashMs Ms] [-InjectGpuKillMs Ms]
 #   [-Mode vulkan|d3d-open-only|no-gpu] [-MemLog <接頭辞>]
 #   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify]
+#   [-Space auto|local|stage|local-floor] [-HapticAtMs Ms] [-InjectSessionRestartMs Ms]
 #   [-SkipBuild]
 #   -Mode は exe の診断モード（既定 vulkan=Vulkan 経路）。借用台帳・ACK・release は同じ。
 #   d3d-open-only は D3D11 Open 経路の診断専用であり、長時間動かすとメモリが増える。
 #   -InjectReleaseFail/-InjectRendererCrashMs/-InjectGpuKillMs は M3 の harness 側注入
 #   （いずれも既定 0=無効。通常経路の挙動は変えない）。詳細は README の M3 節を参照。
 #   -SkipBuild は fault-matrix.ps1 が初回に 1 回だけ建てるための省略用（通常は付けない）。
+#   -Space/-HapticAtMs/-InjectSessionRestartMs は M4 用（-M2 と併用。詳細は README の M4 節を参照）。
 #   -MemLog は計測用 CSV の接頭辞（例: logs\run1 → run1.exe.csv と run1.gpu.csv）。
 #     exe 側の 1 秒周期ログ（Private Bytes/RSS/ハンドル/生存 Vk 資源）と、
 #     GPU プロセスメモリの 1 秒周期ログ（Get-Counter の Local/Dedicated Usage）を出す。
@@ -40,6 +42,10 @@ param(
   [int]$InjectStaleRecord = 0,
   [string]$RenderScale = '0.5',
   [switch]$NoSubmitVerify,
+  [ValidateSet('auto', 'local', 'stage', 'local-floor')]
+  [string]$Space = 'auto',
+  [int]$HapticAtMs = 0,
+  [int]$InjectSessionRestartMs = 0,
   [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -93,8 +99,11 @@ if ($M2) {
   $electronArgs += '--m2'
   $electronArgs += "--inject-stale-record=$InjectStaleRecord"
   $electronArgs += "--render-scale=$RenderScale"
+  $electronArgs += "--space=$Space"
+  if ($HapticAtMs -gt 0) { $electronArgs += "--haptic-at=$HapticAtMs" }
+  if ($InjectSessionRestartMs -gt 0) { $electronArgs += "--inject-session-restart=$InjectSessionRestartMs" }
   if ($NoSubmitVerify) { $electronArgs += '--no-submit-verify' }
-  Write-Host "M2 モード: --m2 --inject-stale-record=$InjectStaleRecord --render-scale=$RenderScale"
+  Write-Host "M2 モード: --m2 --inject-stale-record=$InjectStaleRecord --render-scale=$RenderScale --space=$Space"
 }
 # 計測用 CSV（-MemLog <接頭辞>）。exe 側は <接頭辞>.exe.csv（--mem-log 経由）、
 # GPU プロセスメモリは <接頭辞>.gpu.csv（このスクリプトが 1 秒周期で採取）。

@@ -143,10 +143,13 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 - `src/common/xr_vulkan.h` … vulkan.hpp→OpenXR の読み順を固定する共通 include
 - `src/common/xr_result.h` / `.cpp` … `XrResult` の文字列化と `CheckXr`
 - `src/xr/instance.h` / `.cpp` … `XrInstance` と system、拡張列挙と必須チェック
-- `src/xr/session.h` / `.cpp` … Vk バインディング付き session、LOCAL 空間、view 構成、状態遷移
+- `src/xr/session.h` / `.cpp` … Vk バインディング付き session、参照空間、view 構成、状態遷移
+- `src/xr/input.h` / `.cpp` … M4 の入力アクション（セット `xrift`、12 アクション、
+  profile 別 suggest、毎フレームの sync・スナップショット、haptics 適用）
 - `src/gfx/vulkan_context.h` / `.cpp` … OpenXR 要件からの `vk::raii::Instance` / `PhysicalDevice` / `Device` 生成
   （転送用の追加デバイス拡張を受け付ける。既存呼び出しの動きは不変）
-- `src/transfer/protocol.h` … 64 バイト固定の転送メッセージ（C++ と Node で同配置）
+- `src/transfer/protocol.h` … 192 バイト固定の転送メッセージ（C++ と Node で同配置。
+  M2 で 64B→192B 化。M4 で HapticCommand・InputState の種別を追加。版は 2 のまま）
 - `src/transfer/pipe_client.h` / `.cpp` … 名前付きパイプのクライアント（5 秒リトライ、固定長送受信）
 - `src/transfer/shared_texture.h` / `.cpp` … 外部メモリ import、自前イメージへのコピー、部分検証
 - `src/transfer/gpu_check.h` / `.cpp` … M1b 全画面 GPU 検査（compute 提出と結果読み）
@@ -186,7 +189,8 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 ## 現状の制限
 
 - 単色クリアのみ。シェーダ描画はない
-- 入力アクション未実装
+- 入力アクションは取得・haptics 適用まで実装済みだが、実機のコントローラ操作・
+  haptics の体感・追従は未検証（M4 の検証は HMD 非装着の構造確認まで。下の M4 節を参照）
 - 投影行列未使用（pose / fov をレイヤに載せるだけ）
 - Windows のみ検証。Linux 対応は preset を用意した段階
 - 転送の既知の制約:
@@ -197,9 +201,102 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 
 ## 次のステージ案
 
-- 入力アクション（コントローラの pose / ボタン）
 - シェーダ描画（単色クリアの置き換え）
-- local-floor 対応（`XR_EXT_local_floor` の検出済みフラグを使う）
+- 実機での M4 確認（下のチェックリスト。コントローラ操作・haptics 体感・追従は未検証）
 - Linux 対応（ビルド検証と動作確認）
+
+## 入力・haptics・参照空間・再接続（M4）
+
+`--xr-transfer`（M2）を土台に、入力アクション・haptics・reference space 変更・
+HMD 脱着/再接続を実装する（DESIGN §10・§11 M4）。
+実機のコントローラ操作・haptics の体感・追従は未検証であり、
+下の「実機装着時の確認項目」が終わるまで未検証と書く。
+
+```powershell
+build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
+  [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]
+```
+
+- `--space`（既定 `auto`）… 参照空間の要求。起動時に `xrEnumerateReferenceSpaces` で
+  availability を確認し、`auto` は local-floor→stage→local の順で後退する。
+  明示指定が不可なら落とさず後退し、理由をログに出す。選択結果は起動ログに出る。
+- `--inject-session-restart=Ms`（既定 0=無効）… 起動から Ms 後に意図的にセッション束を
+  破棄・再生成する（復帰経路の検証用）。成功/失敗は統計に出る。
+- ハーネス側（`harness/electron/run.ps1 -M2`）:
+  `-Space`（exe の `--space` へ渡す）、`-HapticAtMs`（起動から Ms 後に
+  HapticCommand を 1 回送る。既定 0=無効。左手・振幅 0.8・300ms）、
+  `-InjectSessionRestartMs`（exe へ渡す。既定 0=無効）。
+
+入力の取得内容（`src/xr/input.h`）: 左右 grip/aim pose、trigger、squeeze、
+thumbstick＋click、primary/secondary、menu、haptic の適用。trackpad＋click も
+データ項目として維持する（束縛を持つ profile でのみ有効になる）。
+suggest 先は khr/simple、oculus/touch、valve/index、htc/vive、microsoft/motion に
+加え、bytedance 系（pico4、pico_neo3、pico_ultra_controller_bd、pico_g3）を
+仕様（OpenXR 1.1.65 の xr.xml）に確認して追加した。
+ランタイムが知らない profile への suggest は失敗として記録し、他を止めない
+（実測: SteamVR は bytedance 系を `XR_ERROR_PATH_UNSUPPORTED` で拒否する）。
+
+観測点:
+
+- 起動ログ: アクションセット作成・attach、suggest の profile 別成否、
+  参照空間の一覧と選択結果、実際に選ばれた profile（変化時に記録）。
+- 毎フレーム: `xrSyncActions`（FOCUSED 時のみ）とスナップショット取得。
+  main へは毎フレーム InputState（種別 5）を送り、ログは毎秒に抑える
+  （接続状態、profile 名、押下中のボタン、trigger/squeeze 値、thumbstick）。
+- inactive / 未接続 / 非対応の区別: 値とは別に active/supported の 2 段を持つ。
+  supported=0 は非対応、supported=1 かつ active=0 は inactive、active=1 は有効値。
+  未接続の手は flags=0 のまま全欄 0 で送る。
+- haptics: main からの HapticCommand（種別 4。hand@40、amplitude@56、duration@48）を受け、
+  `xrApplyHapticFeedback` を呼ぶ。非対応・inactive の失敗は統計に残し、
+  例外でループを止めない。
+- `REFERENCE_SPACE_CHANGE_PENDING` を受けたら次フレームで空間を作り直し、
+  新しい原点で locate できる確認が取れてから `spaceEpoch` を進め、
+  旧世代の RenderLedger レコードを失効させる。挙動はログと統計（`space変更`）に出る。
+- `STOPPING` → `xrEndSession`（束は保持し `READY` で再開）。
+  `LOSS_PENDING` → 束を破棄し、新しい `connEpoch` で再生成する（1 秒周期・上限 30 回。
+  ランタイム未復帰なら安全に終了し、統計を出す）。`EXITING` は再生成せず終了する。
+  脱着は loss とは限らないため、focus/visible/`shouldRender` に従って提出だけ止める。
+- 終了統計（`M4統計`）: connEpoch、InputState 送信数、haptic 受信数、space 変更数、
+  再生成の成功/試行、入力 sync/失敗/snapshot/profile 変化、haptics 成功/未送信/失敗。
+
+### HMD 非装着での検証手順（構造確認まで）
+
+```powershell
+# 1. 配置と値層（HMD 不要）。
+node harness/electron/protocol-test.js
+build/windows/Release/xrift_new.exe --m2-selftest
+build/windows/Release/xrift_new.exe --probe
+# 2. XR 転送＋M4（HMD 非装着で可。SteamVR 起動中・HMD 未装着のまま行う）。
+#    セッションは SYNCHRONIZED 止まり・入力は inactive のままである。
+.\harness\electron\run.ps1 -Seconds 10 -Width 2048 -Height 1024 -M2 -Space stage `
+  -HapticAtMs 5000 -InjectSessionRestartMs 8000
+# 3. ハーネスの回帰（M1 経路が壊れていないこと）。
+.\harness\electron\fault-matrix.ps1
+```
+
+確認する証拠（HMD 非装着で取れる範囲）:
+
+- アクションセット作成・attach が成功し、エラーログが無いこと
+- suggest した profile と成否のログ（bytedance 系の失敗と続行を含む）
+- 実際に選ばれた profile のログ（未装着時は未取得のまま。装着・追従後に記録される）
+- inactive 時のスナップショットが「未接続/inactive」として出ること（0 と区別）
+- haptics 指令が例外なく処理され、inactive として記録されること
+- 参照空間の選択結果と `--space` 指定時の選択（`--space` 不正値は起動時に拒否）
+- `--inject-session-restart` で破棄→再生成が走り、`connEpoch` が進み、統計が残ること
+- `fault-matrix.ps1` が全 PASS であること
+
+### 実機装着時にしか確認できない項目（チェックリスト。未検証）
+
+- [ ] コントローラ装着・追従後に interaction profile が記録されること（PICO 4 の想定）
+- [ ] 左右 grip/aim の `接続` 表示と pose 追従（HMD を動かしたときの値変化）
+- [ ] trigger / squeeze のアナログ値（0〜1 の変化）
+- [ ] thumbstick の 2 軸値と click、primary（A/X）/ secondary（B/Y）、menu の押下表示
+- [ ] trackpad が非対応として出ること（PICO 系に trackpad は無い）
+- [ ] haptics の体感（`-HapticAtMs` 送信時にコントローラが振動すること）
+- [ ] FOCUSED 時の `xrSyncActions` 成功（統計の `sync` が進むこと）
+- [ ] 再センタリング（ダッシュボード等）後の `REFERENCE_SPACE_CHANGE_PENDING` と
+      `spaceEpoch` の進行、旧レコードの失効（統計の `space変更`）
+- [ ] HMD 脱着で提出だけ止まり・復帰すること（exe が終了しないこと）
+- [ ] SteamVR 再起動等の再接続で loss→新 `connEpoch` の再生成が走ること
 
 設計: docs/DESIGN.md

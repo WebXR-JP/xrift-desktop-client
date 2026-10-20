@@ -10,6 +10,8 @@ const VERSION = 2;
 const TYPE_OFFER = 1;
 const TYPE_DONE = 2;
 const TYPE_RENDER_REQUEST = 3;
+const TYPE_HAPTIC_COMMAND = 4; // M4: main → exe。
+const TYPE_INPUT_STATE = 5;    // M4: exe → main。
 
 function makeOffer(borrowId, width, height, format, handle) {
   const buf = Buffer.alloc(MSG_LEN);
@@ -111,4 +113,52 @@ assert.strictEqual(p.reqWidth, 2048);
 assert.strictEqual(p.reqHeight, 1024);
 assert.ok(req.subarray(152).every((b) => b === 0), '予約領域は 0');
 
+// M4: HapticCommand の往復（C++ の MakeHapticCommand と同じ配置）。
+// hand@40、amplitude@56、durationMs@48。
+const hap = Buffer.alloc(MSG_LEN);
+hap.writeUInt32LE(MAGIC, 0);
+hap.writeUInt16LE(VERSION, 4);
+hap.writeUInt16LE(TYPE_HAPTIC_COMMAND, 6);
+hap.writeUInt32LE(1, 40);
+hap.writeFloatLE(0.8, 56);
+hap.writeUInt32LE(300, 48);
+assert.strictEqual(hap.readUInt16LE(6), TYPE_HAPTIC_COMMAND);
+assert.strictEqual(hap.readUInt32LE(40), 1);
+assert.ok(Math.abs(hap.readFloatLE(56) - 0.8) < 1e-6, 'amplitude の float 往復');
+assert.strictEqual(hap.readUInt32LE(48), 300);
+assert.ok(hap.subarray(52, 54).every((b) => b === 0), 'HapticCommand の space 域は 0');
+assert.ok(hap.subarray(60).every((b) => b === 0), 'HapticCommand の未使用域は 0');
+
+// M4: InputState の配置（C++ の MakeInputStateMessage と同じ）。
+// frame@40、conn@48、space@52、手 0 は 56〜71、手 1 は 72〜87（各 16B）。
+const profiles = { 0: '-', 1: 'simple', 2: 'oculus', 3: 'index', 4: 'vive', 5: 'motion',
+  6: 'pico4', 7: 'pico-neo3', 8: 'pico-ultra', 9: 'pico-g3', 255: 'other' };
+assert.strictEqual(profiles[6], 'pico4', 'profile 表の PICO 4');
+assert.strictEqual(profiles[2], 'oculus', 'profile 表の oculus');
+const st = Buffer.alloc(MSG_LEN);
+st.writeUInt32LE(MAGIC, 0);
+st.writeUInt16LE(VERSION, 4);
+st.writeUInt16LE(TYPE_INPUT_STATE, 6);
+st.writeBigUInt64LE(1234n, 40);
+st.writeUInt32LE(2, 48);
+st.writeUInt32LE(7, 52);
+st[56] = 0b101; // flags: 接続 + aim 有効。
+st[57] = 6;     // profile=pico4。
+st[58] = 128; st[59] = 64; // trigger/squeeze の量子化値。
+st.writeInt8(-64, 60); st.writeInt8(32, 61); // thumbstick。
+st[64] = 0b11100; st[65] = 0b11100; // buttons/active: primary/secondary/menu が押下中。
+st[66] = 0b11; st[67] = 0b01; // float/vector の active。
+st[68] = 0b11100; st[69] = 0b1111; // supported。
+assert.strictEqual(st.readBigUInt64LE(40), 1234n);
+assert.strictEqual(st.readUInt32LE(48), 2);
+assert.strictEqual(st.readUInt32LE(52), 7);
+assert.strictEqual(st[56] & 1, 1, '接続フラグ');
+assert.strictEqual(st[57], 6, 'profile 識別子');
+assert.ok(Math.abs(st[58] / 255 - 0.5) < 0.01, 'trigger の量子化往復');
+assert.strictEqual(st.readInt8(60), -64, 'stick の int8 往復');
+assert.strictEqual(st[64], 0b11100, 'ボタン押下');
+assert.strictEqual(st[68], 0b11100, 'ボタン supported（0 と未対応の区別）');
+assert.ok(st.subarray(88, 152).every((b) => b === 0), 'InputState の未使用域は 0');
+
 console.log('protocol-test: ok（配置 192B・LE・予約 0・RenderRequest 往復を確認）');
+console.log('protocol-test: ok（M4 の HapticCommand・InputState の配置を確認）');

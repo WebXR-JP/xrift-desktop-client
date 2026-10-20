@@ -37,6 +37,11 @@ void PrintHelp(const char* argv0) {
       "            --render-scale は既定 0.5。--inject-stale-record=N は N フレーム目の\n"
       "            RenderRequest に旧 pose 混入の合図を載せる（harness 側フック用）。\n"
       "            --no-submit-verify で blit 後の左右分離 readback を止める\n"
+      "            [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]\n"
+      "            --space は参照空間の要求（既定 auto=local-floor→stage→local の後退。\n"
+      "            不可なら落とさず後退し、理由をログに出す）\n"
+      "            --inject-session-restart=Ms は起動から Ms 後に意図的にセッションを\n"
+      "            破棄・再生成する（復帰経路の検証用。既定 0=無効）\n"
       "  --m2-selftest  M2 の値層（配置・pose タグ・受理/棄却）を HMD 無しに検証する\n"
       "  --help    この表示\n",
       argv0);
@@ -152,6 +157,22 @@ int main(int argc, char** argv) {
         }
       } else if (std::strcmp(argv[i], "--no-submit-verify") == 0) {
         opts.submitVerify = false;
+      } else if (StartsWith(argv[i], "--space=")) {
+        opts.space = argv[i] + std::strlen("--space=");
+        if (opts.space != "auto" && opts.space != "local" && opts.space != "stage" &&
+            opts.space != "local-floor") {
+          xrift::Error("--space は auto/local/stage/local-floor のいずれかであること（指定=%s）",
+                       opts.space.c_str());
+          PrintHelp(argv[0]);
+          return 1;
+        }
+      } else if (StartsWith(argv[i], "--inject-session-restart=")) {
+        // 検証用の意図的セッション再生成フック。既定 0=無効。通常経路では使わない。
+        opts.injectSessionRestartMs =
+            std::atoi(argv[i] + std::strlen("--inject-session-restart="));
+        if (opts.injectSessionRestartMs < 0) {
+          opts.injectSessionRestartMs = 0;
+        }
       } else {
         xrift::Error("不明な引数: %s", argv[i]);
         PrintHelp(argv[0]);

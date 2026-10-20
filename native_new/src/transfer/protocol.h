@@ -20,6 +20,8 @@ constexpr uint16_t kVersion = 2;
 constexpr uint16_t kTypeOffer = 1;          // main → exe。借用中の複製ハンドルを渡す。
 constexpr uint16_t kTypeDone = 2;           // exe → main。GPU コピー完了（または失敗）を返す。
 constexpr uint16_t kTypeRenderRequest = 3;  // exe → main。描画要求（pose/FOV と要求を供給）。
+constexpr uint16_t kTypeHapticCommand = 4;  // main → exe。haptics 指令（M4）。
+constexpr uint16_t kTypeInputState = 5;     // exe → main。入力スナップショット（M4）。
 
 constexpr uint32_t kFormatBgra8Unorm = 0;  // OSR pixelFormat "bgra" に対応。
 
@@ -156,5 +158,163 @@ inline TransferMessage MakeRenderRequest(uint64_t renderId, uint32_t connEpoch,
   m.reqHeight = height;
   return m;
 }
+
+// ---- M4: haptics 指令（main → exe）と入力スナップショット（exe → main） ----
+// どちらも 192B 固定の TransferMessage に載せる。版は上げない（kVersion=2 のまま）。
+// 未知の種別を読む側は無視するため、M1/M2 の既存経路の挙動は変えない。
+// レイアウトを変えたら C++ 側・JS 側（main.js と protocol-test.js）を同時に更新する。
+
+// HapticCommand（main → exe）の配置。hand 以外は 0 で送らない。
+// hand: u32（renderId の下位 32bit。0=左、1=右。上位 32bit は 0）、
+// amplitude: float（leftPos[0] と同位置。0〜1）、durationMs: u32（connEpoch と同位置）。
+// いずれも M2 の RenderRequest とは種別で区別するため、既存オフセットの再利用である。
+inline TransferMessage MakeHapticCommand(uint32_t hand, float amplitude, uint32_t durationMs) {
+  TransferMessage m{};
+  m.magic = kMagic;
+  m.version = kVersion;
+  m.type = kTypeHapticCommand;
+  m.renderId = hand;
+  m.leftPos[0] = amplitude;
+  m.connEpoch = durationMs;
+  return m;
+}
+
+// HapticCommand の最低限の正当性。hand は 0/1 のみ、振幅は 0〜1、持続は正であること。
+inline bool IsValidHapticCommand(const TransferMessage& m) {
+  if (m.magic != kMagic || m.version != kVersion || m.type != kTypeHapticCommand) {
+    return false;
+  }
+  if (m.renderId > 1) {
+    return false;
+  }
+  const float amp = m.leftPos[0];
+  if (!(amp >= 0.0f && amp <= 1.0f)) {
+    return false;
+  }
+  return m.connEpoch > 0;
+}
+
+inline uint32_t HapticHand(const TransferMessage& m) {
+  return static_cast<uint32_t>(m.renderId & 0xFFFFFFFFu);
+}
+inline float HapticAmplitude(const TransferMessage& m) { return m.leftPos[0]; }
+inline uint32_t HapticDurationMs(const TransferMessage& m) { return m.connEpoch; }
+
+// interaction profile の識別子（InputState の profile 欄用）。
+// 0 は未取得・未装着、255 は未知の profile である。JS 側も同じ表を持つ。
+constexpr uint8_t kProfileNone = 0;
+constexpr uint8_t kProfileSimple = 1;    // /interaction_profiles/khr/simple_controller
+constexpr uint8_t kProfileOculus = 2;    // /interaction_profiles/oculus/touch_controller
+constexpr uint8_t kProfileIndex = 3;     // /interaction_profiles/valve/index_controller
+constexpr uint8_t kProfileVive = 4;      // /interaction_profiles/htc/vive_controller
+constexpr uint8_t kProfileMotion = 5;    // /interaction_profiles/microsoft/motion_controller
+constexpr uint8_t kProfilePico4 = 6;     // /interaction_profiles/bytedance/pico4_controller
+constexpr uint8_t kProfilePicoNeo3 = 7;  // /interaction_profiles/bytedance/pico_neo3_controller
+constexpr uint8_t kProfilePicoUltra = 8;  // /interaction_profiles/bytedance/pico_ultra_controller_bd
+constexpr uint8_t kProfilePicoG3 = 9;    // /interaction_profiles/bytedance/pico_g3_controller
+constexpr uint8_t kProfileOther = 255;
+
+inline uint8_t ProfileIdFromName(const char* name) {
+  if (name == nullptr || name[0] == '\0') {
+    return kProfileNone;
+  }
+  // 最終節の比較で十分である（suggest 表の顔ぶれは最終節が重複しない）。
+  // 将来 profile を足して最終節が衝突したら、ここを完全一致に戻すこと。
+  const char* tail = name;
+  for (const char* p = name; *p != '\0'; ++p) {
+    if (*p == '/') {
+      tail = p + 1;
+    }
+  }
+  auto eq = [](const char* a, const char* b) {
+    while (*a != '\0' && *a == *b) {
+      ++a;
+      ++b;
+    }
+    return *a == *b;
+  };
+  if (eq(tail, "simple_controller")) {
+    return kProfileSimple;
+  }
+  if (eq(tail, "touch_controller")) {
+    return kProfileOculus;
+  }
+  if (eq(tail, "index_controller")) {
+    return kProfileIndex;
+  }
+  if (eq(tail, "vive_controller")) {
+    return kProfileVive;
+  }
+  if (eq(tail, "motion_controller")) {
+    return kProfileMotion;
+  }
+  if (eq(tail, "pico4_controller")) {
+    return kProfilePico4;
+  }
+  if (eq(tail, "pico_neo3_controller")) {
+    return kProfilePicoNeo3;
+  }
+  if (eq(tail, "pico_ultra_controller_bd")) {
+    return kProfilePicoUltra;
+  }
+  if (eq(tail, "pico_g3_controller")) {
+    return kProfilePicoG3;
+  }
+  return kProfileOther;
+}
+
+// 0〜1 のアナログ値を 0〜255 に丸める。範囲外は端に寄せる。
+inline uint8_t QuantizeUnitFloat(float v) {
+  float t = v * 255.0f;
+  if (t < 0.0f) {
+    return 0;
+  }
+  if (t > 255.0f) {
+    return 255;
+  }
+  return static_cast<uint8_t>(t + 0.5f);
+}
+
+// -1〜1 のスティック値を int8（-127〜127）に丸め、u8 として載せる。範囲外は端に寄せる。
+inline uint8_t QuantizeStick(float v) {
+  float t = v * 127.0f;
+  if (t < -127.0f) {
+    t = -127.0f;
+  }
+  if (t > 127.0f) {
+    t = 127.0f;
+  }
+  const int q = static_cast<int>(t + (t >= 0.0f ? 0.5f : -0.5f));
+  return static_cast<uint8_t>(static_cast<int8_t>(q));
+}
+
+// ボタンの bit 位置（InputState の buttons/active/supported 欄で共通）。
+constexpr uint8_t kBtnStickClick = 1u << 0;
+constexpr uint8_t kBtnPadClick = 1u << 1;
+constexpr uint8_t kBtnPrimary = 1u << 2;
+constexpr uint8_t kBtnSecondary = 1u << 3;
+constexpr uint8_t kBtnMenu = 1u << 4;
+
+// InputState（exe → main）の片手 16B の欄位置（手 0 は 56〜、手 1 は 72〜）。
+// flags: bit0=接続（grip/aim のいずれかが locate 可）、bit1=grip 有効、bit2=aim 有効。
+// active 系は「値が意味を持つ」合図、supported 系は「profile が束縛を持つ」合図である。
+// supported=0 は非対応、supported=1 かつ active=0 は inactive、active=1 は有効値である。
+// 「0」と「未対応」の区別はこの 2 段で行う（単なる 0 埋めと混同しない）。
+constexpr size_t kInputHandStride = 16;
+constexpr size_t kInputHand0 = 56;
+constexpr size_t kInputHandFlags = 0;
+constexpr size_t kInputHandProfile = 1;
+constexpr size_t kInputHandTrigger = 2;
+constexpr size_t kInputHandSqueeze = 3;
+constexpr size_t kInputHandStickX = 4;
+constexpr size_t kInputHandStickY = 5;
+constexpr size_t kInputHandPadX = 6;
+constexpr size_t kInputHandPadY = 7;
+constexpr size_t kInputHandButtons = 8;
+constexpr size_t kInputHandBtnActive = 9;
+constexpr size_t kInputHandFloatActive = 10;  // bit0=trigger、bit1=squeeze。
+constexpr size_t kInputHandVecActive = 11;    // bit0=thumbstick、bit1=trackpad。
+constexpr size_t kInputHandBtnSupported = 12;
+constexpr size_t kInputHandAnalogSupported = 13;  // bit0=trigger、bit1=squeeze、bit2=stick、bit3=pad。
 
 }  // namespace xrift::transfer

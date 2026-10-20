@@ -21,8 +21,10 @@ class Instance {
   XrSystemId systemId() const { return system_; }
   const XrInstanceProperties& instanceProperties() const { return instance_props_; }
   const XrSystemProperties& systemProperties() const { return system_props_; }
-  // XR_EXT_local_floor が利用可か。今回は使わないが将来の参照用に保持する。
+  // XR_EXT_local_floor が利用可か。M4 の参照空間 local-floor 用に有効化する。
   bool hasLocalFloor() const { return has_local_floor_; }
+  // XR_EXT_local_floor を有効化して生成したか。
+  bool localFloorEnabled() const { return local_floor_enabled_; }
 
   // PRIMARY_STEREO の view 構成を返す。session を必要としない。
   std::vector<XrViewConfigurationView> QueryStereoViews() const;
@@ -42,6 +44,7 @@ class Instance {
   XrInstanceProperties instance_props_{XR_TYPE_INSTANCE_PROPERTIES};
   XrSystemProperties system_props_{XR_TYPE_SYSTEM_PROPERTIES};
   bool has_local_floor_ = false;
+  bool local_floor_enabled_ = false;
 
   PFN_xrGetVulkanGraphicsRequirementsKHR pfn_requirements_ = nullptr;
   PFN_xrGetVulkanInstanceExtensionsKHR pfn_instance_extensions_ = nullptr;

@@ -225,3 +225,40 @@ blit 後に各眼の提出画像から 1 画素だけ読み、左眼=マゼン�
   - 終了時に harness が先に終わっても exe は統計を出して終了するはずである。
     `finish(3)` で kill されて exe 統計（XR fps・blit 平均/最大・検証 ok/ng）が欠けたら
     切断検知の退行として扱う。
+
+## M4 ハーネス（入力・haptics・参照空間・再接続。検証用）
+
+M4（DESIGN §10・§11）の検証ハーネス。`-M2` に足して使う。HMD 非装着では
+セッションは SYNCHRONIZED 止まり・入力は inactive のままである
+（構造確認まで。実機の操作・体感・追従は未検証）。
+
+```powershell
+# M4 の煙試験（10 秒・2048x1024。HMD 非装着で可）。
+.\run.ps1 -Seconds 10 -Width 2048 -Height 1024 -M2 -Space stage `
+  -HapticAtMs 5000 -InjectSessionRestartMs 8000
+```
+
+- `-Space <auto|local|stage|local-floor>`（既定 `auto`）… exe の `--space` へ渡す。
+  起動ログの「参照空間の一覧」と「参照空間: …（要求=…）」で選択を確認する。
+- `-HapticAtMs <Ms>`（既定 0=無効）… 起動から Ms 後に HapticCommand を 1 回送る
+  （左手・振幅 0.8・300ms）。exe は `xrApplyHapticFeedback` を呼び、
+  非対応・inactive のときは失敗を統計に残す（例外でループを止めない）。
+  非装着時は inactive として記録される（体感の確認は実機装着時に行う）。
+- `-InjectSessionRestartMs <Ms>`（既定 0=無効）… exe の `--inject-session-restart` へ渡す。
+  指定時刻に意図的にセッション束を破棄・再生成する。`connEpoch` が進み、
+  再生成の成功/試行が exe の `M4統計` に残る。harness 側の `[M4入力]` ログの
+  `conn=` も切り替わる。
+- 入力スナップショットの表示: exe 側の `[M4入力]`（毎秒）と harness 側の `[M4入力]`
+  （毎秒。`harness-run.log` に残る）。`harness-stats.json` の `inputStates` と
+  `lastInput` に受信件数と最終要約が残る。
+
+M4 の既知の制約:
+
+- 実機のコントローラ操作・haptics の体感・追従は未検証。
+  実機装着時の確認項目は `native_new/README.md` のチェックリストを参照。
+- PICO 系（bytedance）の suggest は SteamVR が `XR_ERROR_PATH_UNSUPPORTED` で拒否する。
+  仕様には存在するため suggest 表に含め、失敗は記録して他を続行する。
+  実機装着時に選ばれる profile は別途記録する。
+- すべての参照空間（local-floor/stage/local）が利用可の環境では、
+  明示指定の後退経路は通らない（後退の確認は利用不可の環境で行う）。
+- producer 同期の未解決（DESIGN §8）、色（DESIGN §9）は触らない。
