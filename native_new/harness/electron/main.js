@@ -1,0 +1,560 @@
+// M1 検証ハーネスの main プロセス。検証用であり本番 TS ではない。
+// 役割: パイプサーバ + 借用台帳 + release 専任。提出には関与しない。
+//  - BrowserWindow（show:false、offscreen useSharedTexture）で paint を受ける
+//  - 借用は「処理中 1 枚 + 保留 1 枚」まで。超過した古い保留は即 release する
+//  - Done を受けたらその借用だけ release する（二重 release しない）
+//  - exe の終了・切断時は、未 offer の保留だけ release する。offer 済み未 ACK は
+//    GPU 完了の証拠が無いため release せず隔離し（DESIGN §6②）、Electron 終了で回収する
+'use strict';
+const { app, BrowserWindow } = require('electron');
+const { spawn } = require('node:child_process');
+const net = require('node:net');
+const path = require('node:path');
+const fs = require('node:fs');
+
+function arg(name, def) {
+  const p = `--${name}=`;
+  for (const a of process.argv.slice(2)) {
+    if (a.startsWith(p)) return a.slice(p.length);
+  }
+  return def;
+}
+const EXE_PATH = arg('exe', path.join(__dirname, '..', '..', 'build', 'windows', 'Release', 'xrift_new.exe'));
+const SECONDS = Math.max(1, parseInt(arg('seconds', '60'), 10) || 60);
+const WIN_W = parseInt(arg('width', '4096'), 10) || 4096;
+const WIN_H = parseInt(arg('height', '2048'), 10) || 2048;
+// 検証 5 用: exe へ --fail-after=N を渡し、人為的に非ゼロ終了させる（既定 0=無効）。
+const FAIL_AFTER = Math.max(0, parseInt(arg('fail-after', '0'), 10) || 0);
+
+// プロトコル（native_new/src/transfer/protocol.h と同じ配置。64 バイト LE）。
+const MSG_LEN = 64;
+const MAGIC = 0x54465258;
+const VERSION = 1;
+const TYPE_OFFER = 1;
+const TYPE_DONE = 2;
+const FORMAT_BGRA = 0;
+const STATUS_OK = 0;
+
+const outDir = __dirname;
+const logPath = path.join(outDir, 'harness-run.log');
+const statsPath = path.join(outDir, 'harness-stats.json');
+const logLines = [];
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  logLines.push(line);
+  try {
+    console.log(line);
+  } catch {
+    // 親パイプ切断時（EPIPE）はファイル側の記録を優先し、落とさない
+  }
+}
+function flushLog() {
+  try {
+    fs.writeFileSync(logPath, logLines.join('\n') + '\n');
+  } catch { /* 終了時は無視 */ }
+}
+process.on('uncaughtException', (e) => {
+  if (e && e.code === 'EPIPE') return;
+  log('FATAL uncaughtException: ' + (e && e.stack || e));
+  flushLog();
+  app.exit(1);
+});
+
+let addon = null;
+try {
+  addon = require(path.join(__dirname, '..', '..', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node'));
+  log('addon loaded: xrift_transfer_addon.node');
+} catch (e) {
+  log('addon load FAILED: ' + (e && e.message));
+  flushLog();
+  process.exitCode = 1;
+  app.whenReady().then(() => app.exit(1));
+  return;
+}
+
+// 借用台帳。release() は main プロセスだけが呼び、1 借用 1 回に限る。
+let nextBorrowId = 1;
+const held = new Map(); // borrowId -> texture（release 前に保持）
+const quarantined = new Map(); // borrowId -> texture（release 失敗・完了未確認。触らない）
+const quarantinedPreBorrow = []; // 借用登録前に release 失敗した texture 参照の退避先
+let releaseFailed = false; // release() 自体が失敗したら世代終了扱い（非ゼロ終了）
+let inFlight = null;    // offer 済み・ACK 待ちの borrowId（最大 1）
+let pending = null;     // 保留（最大 1）。offer 前なら即 release 可
+const MAX_HELD = 2;     // 同時保持の上限（処理中 1 + 保留 1）
+let stopping = false;   // 計測終了後。新規 paint は即 release する
+let finished = false;
+const stats = {
+  offers: 0, dones: 0, drops: 0, offerFailures: 0, staleDones: 0,
+  quarantined: 0, releasedPending: 0, maxHeld: 0,
+  statusOk: 0, statusCopyFailed: 0, statusVerifyFailed: 0,
+  noTexture: 0, formatMismatch: 0, missingHandle: 0,
+  distinctHandles: 0, firstCodedSize: null,
+};
+const handleCounts = new Map();
+const paintTimes = [];
+let exeProc = null;
+let socket = null;
+let stopTimer = null;
+let graceTimer = null;
+// 終了コード確定の状態。パイプ close で finish(0) を確定し、後の exe 非ゼロを
+// 無視する競合をなくすため、close → exe 終了待ち（タイムアウト付き）→ 確定の順にする。
+let exeCode = null; // exe の終了コード（signal 死は非ゼロ扱い）。未終了は null。
+let pipeClosed = false;
+let exeWaitTimer = null;
+const EXE_WAIT_MS = 5000; // パイプ close 後の exe 終了待ち上限。
+function exeBaseCode() { return exeCode === 0 ? 0 : 2; }
+
+function releaseOnce(borrowId, why) {
+  const tex = held.get(borrowId);
+  if (tex === undefined) return false;
+  try {
+    tex.release();
+  } catch (e) {
+    // 台帳から先に消さない。参照を quarantined に残し、世代終了扱いにする。
+    held.delete(borrowId);
+    quarantined.set(borrowId, tex);
+    stats.quarantined++;
+    releaseFailed = true;
+    stopping = true;
+    log(`release FAILED borrow=${borrowId} why=${why}: ${e && e.message}（隔離。世代終了扱い）`);
+    return false;
+  }
+  held.delete(borrowId);
+  return true;
+}
+
+// 借用登録前（台帳に載る前）の texture を返す共通処理。release() 自体が失敗したら
+// 参照を保持して隔離し、世代終了扱いにする（握り潰さない）。戻り値は返却の成否。
+function releaseUnregistered(texture, why) {
+  try {
+    texture.release();
+  } catch (e) {
+    quarantinedPreBorrow.push(texture);
+    stats.quarantined++;
+    releaseFailed = true;
+    stopping = true;
+    log(`release(登録前) FAILED why=${why}: ${e && e.message}（隔離。世代終了扱い）`);
+    return false;
+  }
+  return true;
+}
+
+// paint ハンドラの外側 catch 用。onPaint が登録・返却のどちらも済ませずに投げた
+// 借用があれば、共通処理で返却する。台帳管理下（held/quarantined）のものは触らない。
+function releaseOrphanFromPaint(details, where) {
+  const tex = details && details.texture;
+  if (!tex) return;
+  for (const v of held.values()) if (v === tex) return;
+  for (const v of quarantined.values()) if (v === tex) return;
+  if (quarantinedPreBorrow.includes(tex)) return;
+  log(`paint 外側 catch から未登録借用を返却 (${where})`);
+  releaseUnregistered(tex, where);
+}
+
+function noteHeld() {
+  if (held.size > stats.maxHeld) stats.maxHeld = held.size;
+}
+
+function makeOffer(borrowId, width, height, ntHandle) {
+  // 複製して送る。失敗したらその借用だけ release して失敗扱いにする。
+  let dup;
+  try {
+    dup = addon.duplicateHandle(Buffer.from(ntHandle), exeProc.pid);
+  } catch (e) {
+    stats.offerFailures++;
+    log(`duplicateHandle THROW borrow=${borrowId}: ${e && e.message}`);
+    releaseOnce(borrowId, 'dup-throw');
+    return false;
+  }
+  if (!dup || dup.ok !== true || typeof dup.handle !== 'bigint') {
+    stats.offerFailures++;
+    log(`duplicateHandle FAILED borrow=${borrowId}: ${JSON.stringify(dup)}`);
+    releaseOnce(borrowId, 'dup-failed');
+    return false;
+  }
+  const buf = Buffer.alloc(MSG_LEN);
+  buf.writeUInt32LE(MAGIC, 0);
+  buf.writeUInt16LE(VERSION, 4);
+  buf.writeUInt16LE(TYPE_OFFER, 6);
+  buf.writeBigUInt64LE(BigInt(borrowId), 8);
+  buf.writeUInt32LE(width, 16);
+  buf.writeUInt32LE(height, 20);
+  buf.writeUInt32LE(FORMAT_BGRA, 24);
+  buf.writeBigUInt64LE(dup.handle, 28);
+  buf.writeUInt32LE(0, 36);
+  try {
+    socket.write(buf);
+  } catch (e) {
+    stats.offerFailures++;
+    log(`offer send FAILED borrow=${borrowId}: ${e && e.message}`);
+    releaseOnce(borrowId, 'send-failed');
+    return false;
+  }
+  stats.offers++;
+  return true;
+}
+
+// inFlight が空いていれば保留を繰り上げる。複製失敗時はその借用を捨てて次を試す。
+// 停止中は登録・pump・submit をすべて止めるため何もしない。
+function pumpQueue(meta) {
+  if (stopping) return;
+  while (inFlight === null && pending !== null && socket !== null && !socket.destroyed) {
+    const b = pending;
+    pending = null;
+    const m = meta.get(b);
+    meta.delete(b);
+    if (m === undefined) continue;
+    if (makeOffer(b, m.width, m.height, m.ntHandle)) {
+      inFlight = b;
+    }
+  }
+}
+
+function onPaint(details) {
+  paintTimes.push(Date.now());
+  const texture = details && details.texture;
+  if (!texture) {
+    stats.noTexture++;
+    return;
+  }
+  let ti = null;
+  try {
+    ti = texture.textureInfo;
+  } catch (e) {
+    // textureInfo 取得に失敗したらその借用を共通処理で返却してから return する。
+    log(`textureInfo取得失敗: ${e && e.message}`);
+    releaseUnregistered(texture, 'textureInfo-throw');
+    return;
+  }
+  // release 取得の可否は返却時にまとめて扱う（共通処理が失敗を隔離する）。
+  const nt = ti && ti.handle && ti.handle.ntHandle;
+  const coded = (ti && ti.codedSize) || {};
+  if (stopping) {
+    // 計測終了後。借用として登録せず共通処理で返す（握り潰さない）。
+    stats.drops++;
+    releaseUnregistered(texture, 'stopping');
+    return;
+  }
+  if (!ti || ti.pixelFormat !== 'bgra' || !Buffer.isBuffer(nt) || nt.length !== 8) {
+    if (!ti || ti.pixelFormat !== 'bgra') stats.formatMismatch++;
+    else stats.missingHandle++;
+    releaseUnregistered(texture, 'format-mismatch');
+    return;
+  }
+  if (stats.firstCodedSize === null) {
+    stats.firstCodedSize = { ...coded };
+    log(`first codedSize=${coded.width}x${coded.height} pixelFormat=${ti.pixelFormat}`);
+  }
+  const hex = nt.toString('hex');
+  handleCounts.set(hex, (handleCounts.get(hex) || 0) + 1);
+
+  // 新規借用を登録する前に古い保留の release を済ませ、maxHeld が上限を超えない
+  // ようにする（登録後に追い出すと瞬間的に 3 枚になり maxHeld が汚れる）。
+  const meta = onPaint.meta || (onPaint.meta = new Map());
+  if (inFlight !== null && pending !== null) {
+    const old = pending;
+    pending = null;
+    meta.delete(old);
+    stats.drops++;
+    releaseOnce(old, 'superseded');
+  }
+
+  // 借用登録（release の所有権を台帳が持つ）。
+  const borrowId = nextBorrowId++;
+  held.set(borrowId, texture);
+  noteHeld();
+  meta.set(borrowId, { width: coded.width, height: coded.height, ntHandle: Buffer.from(nt) });
+
+  if (socket === null || socket.destroyed) {
+    // exe 未接続。保留に積まず即返す（転送前 drop）。
+    meta.delete(borrowId);
+    stats.drops++;
+    releaseOnce(borrowId, 'not-connected');
+    return;
+  }
+  if (inFlight === null) {
+    const m = meta.get(borrowId);
+    meta.delete(borrowId);
+    if (makeOffer(borrowId, m.width, m.height, m.ntHandle)) {
+      inFlight = borrowId;
+    }
+    return;
+  }
+  if (pending === null) {
+    pending = borrowId;
+    return;
+  }
+  // ここには来ないはず（登録前に古い保留を追い出している）。来たら異常として記録する。
+  log(`異常: 保留が二重になった borrow=${borrowId} old=${pending}`);
+  meta.delete(pending);
+  stats.drops++;
+  releaseOnce(pending, 'superseded-unexpected');
+  pending = borrowId;
+}
+
+function onDone(borrowId, status) {
+  if (borrowId === inFlight) {
+    inFlight = null;
+    stats.dones++;
+    if (status === STATUS_OK) stats.statusOk++;
+    else if (status === 2) stats.statusVerifyFailed++;
+    else stats.statusCopyFailed++;
+    releaseOnce(borrowId, 'done');
+    // 停止中は pump しない（異常停止時は登録・pump・submit をすべて止める）。
+    if (!stopping) pumpQueue(onPaint.meta || new Map());
+    maybeFinish();
+  } else {
+    // 重複・遅延 ACK は無視する（台帳の直列化）。
+    stats.staleDones++;
+    log(`stale Done を無視 borrow=${borrowId} status=${status}`);
+  }
+}
+
+function maybeFinish() {
+  if (!stopping || finished) return;
+  if (inFlight === null && pending === null) {
+    log('全借用の ACK が揃ったためソケットを閉じる');
+    try { socket.end(); } catch { /* 無視 */ }
+  }
+}
+
+function finish(code) {
+  if (finished) return;
+  finished = true;
+  // 終了確定。以後の新規 paint・pump・submit を止める。
+  stopping = true;
+  if (stopTimer) clearTimeout(stopTimer);
+  if (graceTimer) clearTimeout(graceTimer);
+  if (exeWaitTimer) clearTimeout(exeWaitTimer);
+  // 未 offer の保留だけ release する。offer 済み未 ACK は参照を held から外さず
+  // quarantined へ移して隔離する（release しない。参照を捨てない）。
+  if (pending !== null) {
+    if (onPaint.meta) onPaint.meta.delete(pending);
+    if (releaseOnce(pending, 'shutdown-pending')) stats.releasedPending++;
+    pending = null;
+  }
+  if (inFlight !== null) {
+    const tex = held.get(inFlight);
+    held.delete(inFlight);
+    if (tex !== undefined) quarantined.set(inFlight, tex);
+    stats.quarantined++;
+    log(`QUARANTINE borrow=${inFlight}（offer 済み未 ACK のため release しない。Electron 終了で回収）`);
+    inFlight = null;
+  }
+  const intervals = [];
+  for (let i = 1; i < paintTimes.length; i++) intervals.push(paintTimes[i] - paintTimes[i - 1]);
+  const sorted = [...intervals].sort((a, b) => a - b);
+  const q = (p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : 0;
+  const total = paintTimes.length > 1 ? paintTimes[paintTimes.length - 1] - paintTimes[0] : 0;
+  stats.distinctHandles = handleCounts.size;
+  const summary = {
+    exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
+    paints: paintTimes.length,
+    fps: total > 0 ? (intervals.length / (total / 1000)) : 0,
+    paintIntervalMs: { min: q(0), p50: q(0.5), p95: q(0.95), max: q(1) },
+    distinctHandles: handleCounts.size,
+    ...stats,
+  };
+  try {
+    fs.writeFileSync(statsPath, JSON.stringify(summary, null, 2));
+  } catch (e) {
+    log('stats write FAILED: ' + (e && e.message));
+  }
+  // 終了コードの決定。verify/copy 失敗・隔離・未返却・maxHeld 超過・offer 失敗・
+  // release 失敗が 1 件でもあれば非ゼロ終了にする。
+  let finalCode = code;
+  const unreturned = stats.offers - stats.dones;
+  const failures = [];
+  if (stats.statusCopyFailed > 0) failures.push(`copyFail=${stats.statusCopyFailed}`);
+  if (stats.statusVerifyFailed > 0) failures.push(`verifyFail=${stats.statusVerifyFailed}`);
+  if (stats.quarantined > 0) failures.push(`quarantine=${stats.quarantined}`);
+  if (unreturned !== 0) failures.push(`unreturned=${unreturned}`);
+  if (stats.maxHeld > MAX_HELD) failures.push(`maxHeld=${stats.maxHeld}>${MAX_HELD}`);
+  if (stats.offerFailures > 0) failures.push(`offerFailures=${stats.offerFailures}`);
+  if (releaseFailed) failures.push('releaseFailed');
+  if (failures.length > 0) {
+    if (finalCode === 0) finalCode = 2;
+    log(`終了コードを非ゼロ化 (${failures.join(' ')})`);
+    summary.failures = failures;
+    summary.exitEscalated = true;
+    try {
+      fs.writeFileSync(statsPath, JSON.stringify(summary, null, 2));
+    } catch { /* 無視 */ }
+  }
+  flushLog();
+  log(`harness 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
+      `ok=${stats.statusOk} copyFail=${stats.statusCopyFailed} verifyFail=${stats.statusVerifyFailed} ` +
+      `maxHeld=${stats.maxHeld} quarantine=${stats.quarantined}`);
+  flushLog();
+  // exe 側の最終統計の出力を待つため、正常終了を最大 3 秒待ってから kill する。
+  // 既に終了していれば即座に抜ける。切断検知の直後に kill すると exe の統計が欠ける。
+  const waitExe = new Promise((resolve) => {
+    if (!exeProc || exeProc.exitCode !== null || exeProc.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const t = setTimeout(resolve, 3000);
+    exeProc.once('exit', () => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
+  waitExe.then(() => {
+    try {
+      if (exeProc && !exeProc.killed && exeProc.exitCode === null) exeProc.kill();
+    } catch { /* 無視 */ }
+    flushLog();
+    app.exit(finalCode);
+  });
+}
+
+async function createWindow() {
+  const win = new BrowserWindow({
+    width: WIN_W,
+    height: WIN_H,
+    show: false,
+    frame: false,
+    // 画面作業領域（実測 2560x1392）への収め直しを防ぐ。M1 は 4096x2048 を要求する。
+    enableLargerThanScreen: true,
+    webPreferences: {
+      offscreen: { useSharedTexture: true },
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  // 生成直後の境界は画面作業領域に収め直される（実測 2560x1392）。
+  // setContentSize で強制すると 4096x2048 が通る。観測済みの手順である。
+  win.setContentSize(WIN_W, WIN_H);
+  win.webContents.setFrameRate(90);
+  log(`window created: ${WIN_W}x${WIN_H} offscreen.useSharedTexture=true frameRate=90 target=${SECONDS}s`);
+
+  win.webContents.on('console-message', (_e, _level, message) => {
+    log('renderer-console: ' + message);
+  });
+  win.webContents.on('paint', (details) => {
+    try {
+      onPaint(details);
+    } catch (e) {
+      log('paint handler error: ' + (e && e.stack || e));
+      // 未登録の借用が残っていれば共通処理で返却する（握り潰さない）。
+      releaseOrphanFromPaint(details, 'paint-outer-catch');
+    }
+  });
+
+  await win.loadFile(path.join(__dirname, 'index.html'));
+  log('index.html loaded');
+
+  stopTimer = setTimeout(() => {
+    log(`${SECONDS}s 経過。新規 paint の受付を止める`);
+    stopping = true;
+    maybeFinish();
+    // inFlight が残れば猶予後に隔離して終了する（timeout を返却許可にしない）。
+    graceTimer = setTimeout(() => {
+      log('grace 期限切れ。未 ACK を隔離して終了する');
+      finish(3);
+    }, 8000);
+  }, SECONDS * 1000);
+}
+
+function start() {
+  // パイプ名は electron 側の pid で作る。exe の pid を起動引数に使うことは
+  // Node の spawn ではできない（引数確定より pid 取得が後になる）ため、
+  // 一意性という目的を electron pid で満たす。詳細は README の既知の制約を参照。
+  const pipePath = `\\\\.\\pipe\\xrift_m1_${process.pid}`;
+  const exeArgs = ['--transfer', `--pipe=${pipePath}`, '--verify', `--seconds=${SECONDS + 30}`];
+  if (FAIL_AFTER > 0) {
+    exeArgs.push(`--fail-after=${FAIL_AFTER}`);
+    log(`検証フック有効: exe に --fail-after=${FAIL_AFTER} を渡す`);
+  }
+  exeProc = spawn(EXE_PATH, exeArgs, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  log(`exe spawned: pid=${exeProc.pid} pipe=${pipePath}`);
+  exeProc.on('error', (e) => {
+    log(`exe spawn error: ${e && e.message}`);
+    finish(1);
+  });
+  exeProc.on('exit', (code, signal) => {
+    exeCode = (typeof code === 'number') ? code : 2;
+    log(`exe exit: code=${code} signal=${signal}`);
+    if (exeWaitTimer) {
+      clearTimeout(exeWaitTimer);
+      exeWaitTimer = null;
+    }
+    // パイプが既に無い（未接続死・close 済み）場合はコード確定。接続中は close 側の
+    // 終了待ちに確定を委ねる（close→finish(0) 確定の競合をなくす）。
+    if (socket === null || pipeClosed) {
+      finish(exeBaseCode());
+    }
+  });
+
+  const server = net.createServer((s) => {
+    if (socket !== null) {
+      log('2 本目の接続を拒否');
+      s.destroy();
+      return;
+    }
+    socket = s;
+    log('exe がパイプに接続');
+    let acc = Buffer.alloc(0);
+    s.on('data', (chunk) => {
+      acc = Buffer.concat([acc, chunk]);
+      while (acc.length >= MSG_LEN) {
+        const m = acc.subarray(0, MSG_LEN);
+        acc = acc.subarray(MSG_LEN);
+        if (m.readUInt32LE(0) !== MAGIC || m.readUInt16LE(4) !== VERSION ||
+            m.readUInt16LE(6) !== TYPE_DONE) {
+          log('不正な Done を破棄');
+          continue;
+        }
+        const borrowId = Number(m.readBigUInt64LE(8));
+        const status = m.readUInt32LE(36);
+        onDone(borrowId, status);
+      }
+    });
+    s.on('close', () => {
+      log('パイプ切断を検知');
+      socket = null;
+      pipeClosed = true;
+      if (exeCode !== null) {
+        // exe は既に終了している。exe のコードで確定する。
+        finish(exeBaseCode());
+      } else {
+        // exe の終了を待ってから確定する（タイムアウト付き）。close 時点で
+        // finish(0) を確定し、後の exe 非ゼロを無視する競合をなくす。
+        log('exe の終了待ちを開始（上限 5 秒）');
+        exeWaitTimer = setTimeout(() => {
+          exeWaitTimer = null;
+          log('exe 終了待ちがタイムアウト。非ゼロ扱いで終了する');
+          finish(2);
+        }, EXE_WAIT_MS);
+      }
+    });
+    s.on('error', (e) => {
+      log(`パイプエラー: ${e && e.message}`);
+    });
+  });
+  server.on('error', (e) => {
+    log(`パイプサーバ失敗: ${e && e.message}`);
+    finish(1);
+  });
+  server.listen(pipePath, () => {
+    log(`pipe server listening: ${pipePath}`);
+  });
+
+  createWindow().catch((e) => {
+    log('createWindow FAILED: ' + (e && e.stack || e));
+    finish(1);
+  });
+}
+
+app.whenReady().then(() => {
+  log(`electron=${process.versions.electron} chrome=${process.versions.chrome} node=${process.versions.node}`);
+  // 終了保険（計測 + 猶予 + 余裕）。EPIPE 同様、保険発火も finish 経由で台帳を守る。
+  setTimeout(() => {
+    log(`HARD TIMEOUT 発火`);
+    finish(2);
+  }, (SECONDS + 60) * 1000);
+  start();
+});
+app.on('window-all-closed', () => { /* 何もしない（paint 収集中は閉じない） */ });

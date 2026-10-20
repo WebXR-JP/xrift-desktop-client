@@ -19,6 +19,9 @@ add_executable(xrift_new
   src/gfx/vulkan_context.cpp
   src/gfx/swapchains.cpp
   src/gfx/clear_pass.cpp
+  src/transfer/pipe_client.cpp
+  src/transfer/shared_texture.cpp
+  src/transfer/transfer_app.cpp
 )
 
 target_include_directories(xrift_new PRIVATE src)
@@ -30,7 +33,9 @@ target_compile_definitions(xrift_new PRIVATE
 )
 
 if(WIN32)
-  target_compile_definitions(xrift_new PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_definitions(xrift_new PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX VK_USE_PLATFORM_WIN32_KHR)
+  # 転送の D3D11 照合（OpenSharedResource1）に使う。Vulkan 本体は動的読み込みのまま。
+  target_link_libraries(xrift_new PRIVATE d3d11 dxgi dxguid)
 endif()
 
 if(MSVC)

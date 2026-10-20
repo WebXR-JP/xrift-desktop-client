@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "common/xr_vulkan.h"
 #include "xr/instance.h"
@@ -14,7 +15,11 @@ namespace xrift::gfx {
 
 class VulkanContext {
  public:
-  explicit VulkanContext(const xr::Instance& xr);
+  // extraDeviceExtensions はランタイム要求に足す分だけを指定する。
+  // 空なら従来どおりランタイム要求（+ 不足時の swapchain）のみで作る。
+  // 既存の呼び出しは引数なしのまま動きが変わらない。
+  explicit VulkanContext(const xr::Instance& xr,
+                         const std::vector<std::string>& extraDeviceExtensions = {});
   ~VulkanContext();
 
   VulkanContext(const VulkanContext&) = delete;

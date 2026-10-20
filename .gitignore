@@ -18,3 +18,7 @@ test/*.png
 /dist/
 native_new/build/
 native_new/out/
+native_new/transfer-addon/build/
+native_new/harness/electron/run-out.txt
+native_new/harness/electron/run-err.txt
+native_new/harness/electron/harness-stats.json

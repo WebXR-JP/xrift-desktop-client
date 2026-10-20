@@ -78,7 +78,8 @@ void LogVersion(const char* label, XrVersion version) {
 
 }  // namespace
 
-VulkanContext::VulkanContext(const xr::Instance& xr) {
+VulkanContext::VulkanContext(const xr::Instance& xr,
+                             const std::vector<std::string>& extraDeviceExtensions) {
   // 1. vk::raii::Context の生成時に読み込みが行われる (vulkan-1.dll の動的読み込みを含む)。
   //    明示の初期化呼び出しは不要である。
 
@@ -141,6 +142,47 @@ VulkanContext::VulkanContext(const xr::Instance& xr) {
   if (!has_swapchain) {
     Warn("ランタイムが %s を返さなかったため追加する", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     device_ext_names.emplace_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  }
+  // 呼び出し側の追加分（例: 転送用の外部メモリ系）を重複なく足す。
+  // 有無の検査は呼び出し側で行う。ここでは有効化だけを担う。
+  for (const std::string& extra : extraDeviceExtensions) {
+    bool known = false;
+    for (const std::string& name : device_ext_names) {
+      if (name == extra) {
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      device_ext_names.push_back(extra);
+    }
+  }
+  // 追加分が物理デバイスに実在することを vkCreateDevice の前に確認する。
+  // 存在しない名前を渡すと ErrorExtensionNotPresent になるだけであり、
+  // どれが無いのか分からなくなるため、ここで名指しして落とす。
+  if (!extraDeviceExtensions.empty()) {
+    const std::vector<vk::ExtensionProperties> available =
+        physical_device_.enumerateDeviceExtensionProperties();
+    Info("デバイス拡張の列挙: %u 件", static_cast<unsigned>(available.size()));
+    std::string missing;
+    for (const std::string& extra : extraDeviceExtensions) {
+      bool found = false;
+      for (const vk::ExtensionProperties& prop : available) {
+        if (std::string(prop.extensionName.data()) == extra) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        if (!missing.empty()) {
+          missing += ", ";
+        }
+        missing += extra;
+      }
+    }
+    if (!missing.empty()) {
+      throw std::runtime_error("要求されたデバイス拡張が物理デバイスにありません: " + missing);
+    }
   }
   std::vector<const char*> device_exts;
   for (const std::string& name : device_ext_names) {
