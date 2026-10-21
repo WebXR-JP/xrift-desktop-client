@@ -1,0 +1,14 @@
+{
+  "name": "xrift-m5-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "XRift 新アプリ M5（exe 主導・OSR・WebXR シム）の骨格",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node ../node_modules/typescript/bin/tsc -p .",
+    "start": "node ../node_modules/electron/cli.js .",
+    "test": "node ../node_modules/typescript/bin/tsc -p . && node test/m2codec.test.cjs && node test/protocol.test.cjs && node test/shim-pose.test.cjs && node test/mirror-map.test.cjs && node test/mirror-input.test.cjs",
+    "register": "node scripts/register-steamvr.cjs",
+    "package": "node scripts/package.cjs"
+  }
+}
