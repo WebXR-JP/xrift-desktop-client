@@ -19,6 +19,7 @@
 #include "common/log.h"
 #include "common/xr_result.h"
 #include "gfx/swapchains.h"
+#include "transfer/mem_log.h"
 #include "transfer/input_state.h"
 #include "transfer/m2_blocks.h"
 #include "transfer/pipe_client.h"
@@ -302,6 +303,239 @@ class M2BlockReader {
   vk::raii::Fence fence_{nullptr};
   vk::raii::Buffer stage_{nullptr};
   vk::raii::DeviceMemory stageMem_{nullptr};
+};
+
+// 最後に受理したアトラスの exe 所有の複製。新規受理が無いフレームでも同じ画像を
+// 出し直すために保つ（黒フレーム防止）。CPU へは戻さない。
+// 自前イメージは次の Offer で上書き・棄却画像で汚染されるため、受理確定時に
+// GPU コピーで複製する。再提出はこの複製から swapchain へ blit し、
+// pose/FOV は受理レコードのものをそのまま使う（付け替えはしない）。
+// 寸法変化時は作り直す。世代進行（接続・空間）では呼び出し側が Invalidate する。
+class HoldImage {
+ public:
+  explicit HoldImage(const gfx::VulkanContext& vk)
+      : device_(&vk.device()),
+        physical_(&vk.physicalDevice()),
+        queue_(&vk.queue()),
+        qfi_(vk.queueFamilyIndex()) {
+    vk::CommandPoolCreateInfo pool_info{};
+    pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
+    pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+    pool_info.queueFamilyIndex = qfi_;
+    InvokeVk("vkCreateCommandPool(hold)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+    vk::CommandBufferAllocateInfo alloc{};
+    alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
+    alloc.commandPool = *pool_;
+    alloc.level = vk::CommandBufferLevel::ePrimary;
+    alloc.commandBufferCount = 1;
+    InvokeVk("vkAllocateCommandBuffers(hold)", [&] {
+      vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
+      cmd_ = std::move(bufs[0]);
+    });
+    vk::FenceCreateInfo fence_info{};
+    fence_info.sType = vk::StructureType::eFenceCreateInfo;
+    InvokeVk("vkCreateFence(hold)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
+  }
+
+  ~HoldImage() {
+    if (imageBytes_ > 0) {
+      TrackVkImageDestroy(imageBytes_);
+      imageBytes_ = 0;
+    }
+    if (memoryBytes_ > 0) {
+      TrackVkMemoryFree(memoryBytes_);
+      memoryBytes_ = 0;
+    }
+  }
+
+  HoldImage(const HoldImage&) = delete;
+  HoldImage& operator=(const HoldImage&) = delete;
+
+  bool Valid() const {
+    return valid_ && static_cast<VkImage>(*image_) != VK_NULL_HANDLE && width_ > 0 &&
+           height_ > 0;
+  }
+  void Invalidate() { valid_ = false; }
+  uint32_t width() const { return width_; }
+  uint32_t height() const { return height_; }
+  vk::Image image() const { return *image_; }
+
+  // 自前イメージ（GENERAL 駐め）全体を複製する。両方とも GENERAL で返す。
+  // 自前イメージの不変条件（GENERAL 駐め）を壊さないことが呼び出し条件である。
+  // 失敗時は例外にし、valid は偽にする（半端な複製の再提出はしない）。
+  void SaveFrom(vk::Image own, uint32_t w, uint32_t h) {
+    if (static_cast<VkImage>(own) == VK_NULL_HANDLE || w == 0 || h == 0) {
+      throw std::runtime_error("hold 複製の元画像・寸法が無効です");
+    }
+    Ensure(w, h);
+    InvokeVk("vkResetFences(hold)", [&] { device_->resetFences(*fence_); });
+    InvokeVk("vkResetCommandBuffer(hold)", [&] { cmd_.reset(); });
+    vk::CommandBufferBeginInfo begin{};
+    begin.sType = vk::StructureType::eCommandBufferBeginInfo;
+    begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+    InvokeVk("vkBeginCommandBuffer(hold)", [&] { cmd_.begin(begin); });
+
+    vk::ImageSubresourceRange range{};
+    range.aspectMask = vk::ImageAspectFlagBits::eColor;
+    range.levelCount = 1;
+    range.layerCount = 1;
+    vk::ImageMemoryBarrier own_to{};
+    own_to.sType = vk::StructureType::eImageMemoryBarrier;
+    own_to.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    own_to.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    own_to.oldLayout = vk::ImageLayout::eGeneral;
+    own_to.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+    own_to.image = own;
+    own_to.subresourceRange = range;
+    vk::ImageMemoryBarrier hold_to{};
+    hold_to.sType = vk::StructureType::eImageMemoryBarrier;
+    hold_to.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+    hold_to.oldLayout =
+        defined_ ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
+    hold_to.newLayout = vk::ImageLayout::eTransferDstOptimal;
+    hold_to.image = *image_;
+    hold_to.subresourceRange = range;
+    if (defined_) {
+      hold_to.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      std::array<vk::ImageMemoryBarrier, 2> to_copy{own_to, hold_to};
+      cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                           vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_copy);
+    } else {
+      cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                           vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, own_to);
+      cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                           vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, hold_to);
+    }
+
+    vk::ImageCopy region{};
+    region.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    region.dstSubresource.layerCount = 1;
+    region.extent = vk::Extent3D{w, h, 1};
+    cmd_.copyImage(own, vk::ImageLayout::eTransferSrcOptimal, *image_,
+                   vk::ImageLayout::eTransferDstOptimal, region);
+
+    vk::ImageMemoryBarrier own_park = own_to;
+    own_park.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+    own_park.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+    own_park.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+    own_park.newLayout = vk::ImageLayout::eGeneral;
+    vk::ImageMemoryBarrier hold_park = hold_to;
+    hold_park.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    hold_park.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    hold_park.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+    hold_park.newLayout = vk::ImageLayout::eGeneral;
+    std::array<vk::ImageMemoryBarrier, 2> parks{own_park, hold_park};
+    cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                         vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, parks);
+
+    InvokeVk("vkEndCommandBuffer(hold)", [&] { cmd_.end(); });
+    vk::CommandBuffer raw = *cmd_;
+    vk::SubmitInfo submit{};
+    submit.sType = vk::StructureType::eSubmitInfo;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &raw;
+    try {
+      queue_->submit(submit, *fence_);
+    } catch (const vk::SystemError& e) {
+      valid_ = false;
+      const vk::Result result = static_cast<vk::Result>(e.code().value());
+      throw std::runtime_error(std::string("vkQueueSubmit(hold) に失敗 (VkResult=") +
+                               vk::to_string(result) + ")");
+    }
+    const vk::Result fence_result = device_->waitForFences(*fence_, vk::True, 2000000000u);
+    if (fence_result != vk::Result::eSuccess) {
+      valid_ = false;
+      throw std::runtime_error("hold 複製の完了待ちが 2 秒でタイムアウト");
+    }
+    defined_ = true;
+    valid_ = true;
+  }
+
+ private:
+  void Ensure(uint32_t w, uint32_t h) {
+    if (defined_ && w == width_ && h == height_) {
+      return;
+    }
+    if (imageBytes_ > 0) {
+      TrackVkImageDestroy(imageBytes_);
+      imageBytes_ = 0;
+    }
+    if (memoryBytes_ > 0) {
+      TrackVkMemoryFree(memoryBytes_);
+      memoryBytes_ = 0;
+    }
+    memory_.clear();
+    image_.clear();
+    defined_ = false;
+    valid_ = false;
+
+    vk::ImageCreateInfo info{};
+    info.sType = vk::StructureType::eImageCreateInfo;
+    info.imageType = vk::ImageType::e2D;
+    info.format = vk::Format::eB8G8R8A8Unorm;
+    info.extent = vk::Extent3D{w, h, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+    info.sharingMode = vk::SharingMode::eExclusive;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    InvokeVk("vkCreateImage(hold)", [&] { image_ = vk::raii::Image(*device_, info); });
+    const vk::MemoryRequirements req = image_.getMemoryRequirements();
+    imageBytes_ = req.size;
+    TrackVkImageCreate(req.size);
+    // メモリ種別の選択は自前イメージと同じ基準（deviceLocal 優先）である。
+    const vk::PhysicalDeviceMemoryProperties props = physical_->getMemoryProperties();
+    int32_t index = -1;
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+      if ((req.memoryTypeBits & (1u << i)) != 0u &&
+          (props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) ==
+              vk::MemoryPropertyFlagBits::eDeviceLocal) {
+        index = static_cast<int32_t>(i);
+        break;
+      }
+    }
+    if (index < 0) {
+      for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) != 0u) {
+          index = static_cast<int32_t>(i);
+          break;
+        }
+      }
+    }
+    if (index < 0) {
+      throw std::runtime_error("hold イメージのメモリタイプが無い");
+    }
+    vk::MemoryAllocateInfo alloc{};
+    alloc.sType = vk::StructureType::eMemoryAllocateInfo;
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = static_cast<uint32_t>(index);
+    InvokeVk("vkAllocateMemory(hold)", [&] { memory_ = vk::raii::DeviceMemory(*device_, alloc); });
+    memoryBytes_ = alloc.allocationSize;
+    TrackVkMemoryAlloc(alloc.allocationSize);
+    InvokeVk("vkBindImageMemory(hold)", [&] { image_.bindMemory(*memory_, 0); });
+    width_ = w;
+    height_ = h;
+  }
+
+  const vk::raii::Device* device_;
+  const vk::raii::PhysicalDevice* physical_;
+  const vk::raii::Queue* queue_;
+  uint32_t qfi_ = 0;
+  vk::raii::CommandPool pool_{nullptr};
+  vk::raii::CommandBuffer cmd_{nullptr};
+  vk::raii::Fence fence_{nullptr};
+  vk::raii::Image image_{nullptr};
+  vk::raii::DeviceMemory memory_{nullptr};
+  uint64_t imageBytes_ = 0;
+  uint64_t memoryBytes_ = 0;
+  uint32_t width_ = 0;
+  uint32_t height_ = 0;
+  bool defined_ = false;
+  bool valid_ = false;
 };
 
 // 受理画像の提出パス。acquire → blit → マーカー確認 → release を 1 眼単位で行う。
@@ -667,6 +901,7 @@ struct XrStats {
   uint64_t blitUsMax = 0;
   uint64_t submitLayers = 0;
   uint64_t emptyFrames = 0;
+  uint64_t resubmits = 0;  // 新規受理が無いフレームで hold から出し直した提出数。
   uint64_t pacedWaits = 0;  // --pace-records で未処理待ちのため発行を見送ったフレーム数。
   uint64_t verifyOk = 0;
   uint64_t verifyNg = 0;
@@ -700,11 +935,12 @@ struct XrStats {
          static_cast<unsigned long long>(ledger.spaceMismatch),
          static_cast<unsigned long long>(ledger.expired));
     const double denom = blits > 0 ? static_cast<double>(blits) : 1.0;
-    Info("XR転送統計: blit=%llu 平均=%lluus 最大=%lluus 層あり=%llu 空=%llu",
+    Info("XR転送統計: blit=%llu 平均=%lluus 最大=%lluus 層あり=%llu 再提出=%llu 空=%llu",
          static_cast<unsigned long long>(blits),
          static_cast<unsigned long long>(blitUsTotal / denom),
          static_cast<unsigned long long>(blitUsMax),
          static_cast<unsigned long long>(submitLayers),
+         static_cast<unsigned long long>(resubmits),
          static_cast<unsigned long long>(emptyFrames));
     Info("XR転送統計: 左右分離検証 ok=%llu ng=%llu",
          static_cast<unsigned long long>(verifyOk), static_cast<unsigned long long>(verifyNg));
@@ -735,6 +971,16 @@ int RunXrTransfer(const XrTransferOptions& options) {
        static_cast<unsigned long long>(options.recordTtlMs),
        options.submitVerify ? "on" : "off", options.space.c_str(),
        options.paceRecords ? "on" : "off");
+  if (options.resubmit) {
+    if (options.resubmitMaxAgeMs == 0) {
+      Info("再提出 on（新規受理が無いフレームは最終受理を同じ pose/FOV で出す。年齢無制限）");
+    } else {
+      Info("再提出 on（新規受理が無いフレームは最終受理を同じ pose/FOV で出す。上限 %llums）",
+           static_cast<unsigned long long>(options.resubmitMaxAgeMs));
+    }
+  } else {
+    Info("再提出 off（--no-resubmit。旧挙動の空フレーム比較用）");
+  }
   // ADR: Offer 途絶の終了判定は実行値で決める。0 は app 経由の通常運用（静止ページで
   // paint が止まっても終了しない）のため無効とし、既定 5000 はハーネス向けに保つ。
   const uint64_t idleTimeoutUs = options.producerIdleTimeoutMs <= 0
@@ -831,6 +1077,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
   blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
   M2BlockReader reader(transfer.Vulkan());
+  HoldImage hold(transfer.Vulkan());
   PipeClient pipe(options.pipeName);
   Info("パイプ接続: main プロセスと接続した");
 
@@ -844,13 +1091,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
   layer.views = proj_views;
   std::vector<XrView> views(2, {XR_TYPE_VIEW});
 
-  // 受理済みの最新画像。自前イメージが上書きされていない間のみ再利用できる。
-  // 新規 Offer の到着で自前イメージは変わるため、その時点で無効化する。
-  // 提出した画像は消費済みとし、古い画像の無限再利用は行わない。
+  // 受理済みの最新画像。受理確定時に hold へ GPU 複製し、以後は hold から出し直す。
+  // 自前イメージは次の Offer で上書き・棄却画像で汚染されるため、提出の複製元には使わない。
+  // 再提出は同じ record の pose/FOV のまま行い、最新 pose への付け替えはしない。
   bool hasFresh = false;
   RenderRecord freshRecord{};
   uint32_t freshW = 0;
   uint32_t freshH = 0;
+  // 再提出用の保持。hold イメージと、その画像に対応する受理レコードの複写である。
+  // 台帳の掃除・TTL 失効では消さない（黒より古い絵を優先する）。世代進行では消す。
+  RenderRecord holdRecord{};
+  bool holdHasRecord = false;
+  // pose 不一致診断の出力済み件数。先頭 5 件だけ詳報し、以後は集計のみにする。
+  uint64_t mismatchLogCount = 0;
+  // 再提出ログの前回出力時刻。毎フレーム出すと膨大になるため 1 秒に抑える。
+  uint64_t lastResubmitLogUs = 0;
   // 検証用の提出画像ダンプの状態。N 回目の提出（両眼 blit 成功で 1）に 1 回だけ保存する。
   // セッション再生成で blit が作り直されても提出回数は保つ（回数は提出基準である）。
   uint64_t submits = 0;
@@ -919,6 +1174,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
     session.reset();
     session_running = false;
     hasFresh = false;
+    hold.Invalidate();
+    holdHasRecord = false;
     ++conn_epoch;
     ledger.AdvanceConnEpoch(conn_epoch);
     stats.connEpoch = conn_epoch;
@@ -961,6 +1218,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
     if (session->RecreateSpaceForPendingChange(last_display_time)) {
       ledger.AdvanceSpaceEpoch(ledger.spaceEpoch() + 1);
       hasFresh = false;
+      hold.Invalidate();
+      holdHasRecord = false;
       ++stats.spaceChanges;
       if (pending_space_injected) {
         Info("模擬 space 変更を適用（実イベントではない。--inject-space-change。"
@@ -1018,6 +1277,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
               session.reset();
               session_running = false;
               hasFresh = false;
+              hold.Invalidate();
+              holdHasRecord = false;
               needs_rebuild = true;
               rebuild_attempts_left = kRebuildMaxAttempts;
               last_rebuild_try_us = 0;
@@ -1178,6 +1439,30 @@ int RunXrTransfer(const XrTransferOptions& options) {
     const RenderRecord* hit = nullptr;
     const RejectReason reason = ledger.Accept(id16, tag, ledger.spaceEpoch(), NowUs(), &hit);
     if (reason != RejectReason::Accepted || hit == nullptr) {
+      // pose 不一致の切り分け用に先頭 5 件だけ詳報する。復号値と、同じ id16 を持つ
+      // 台帳レコードの期待値を並べ、shim 側の付番・pipe 経由の取り違え・画像破損を区別する。
+      // 毎回は出さない（72Hz でのログ肥大の防止）。
+      if (mismatchLogCount < 5 &&
+          (reason == RejectReason::PoseMismatch || reason == RejectReason::UnknownId)) {
+        const RenderRecord* cand = nullptr;
+        uint16_t want = 0;
+        if (ledger.LookupById16(id16, &cand, &want) && cand != nullptr) {
+          Info("M2 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳 renderId=%llu"
+               " wantTag=0x%04x conn=%u space=%u（台帳現世代 conn=%u space=%u）/ ledger最新=%llu",
+               static_cast<unsigned long long>(mismatchLogCount),
+               RejectReasonName(reason), id16, tag,
+               static_cast<unsigned long long>(cand->renderId), want, cand->connEpoch,
+               cand->spaceEpoch, ledger.connEpoch(), ledger.spaceEpoch(),
+               static_cast<unsigned long long>(ledger.latestRenderId()));
+        } else {
+          Info("M2 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳にid16一致なし"
+               "（現世代 conn=%u space=%u）/ ledger最新=%llu",
+               static_cast<unsigned long long>(mismatchLogCount),
+               RejectReasonName(reason), id16, tag, ledger.connEpoch(), ledger.spaceEpoch(),
+               static_cast<unsigned long long>(ledger.latestRenderId()));
+        }
+        ++mismatchLogCount;
+      }
       Info("M2 棄却: %s（id16=0x%04x tag=0x%04x）", RejectReasonName(reason), id16, tag);
       return;
     }
@@ -1411,67 +1696,91 @@ int RunXrTransfer(const XrTransferOptions& options) {
       }
     }
     // 提出は受理画像のレコードの pose/FOV で行う。最新 pose への付け替えはしない。
-    // 新規受理が無ければ layerCount=0 で終える（対応不明の画像の再投影頼みは禁止。
-    // DESIGN §7）。受理から record-ttl 超のレコードは失効として棄却する。
+    // 新規受理が無いフレームでも hold の複製を同じ pose/FOV で出し直す（黒防止）。
+    // 最初の 1 枚が来る前だけ空フレームにする。受理から record-ttl 超の新規受理は
+    // 失効として棄却するが、hold の再提出は別枠（既定では無制限）で行う。
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
     end_info.displayTime = frame_state.predictedDisplayTime;
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     const XrCompositionLayerBaseHeader* layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     bool submit_layer = false;
+    bool is_resubmit = false;
+    // src 画像（GENERAL 駐めのアトラス）の左右半分を各眼へ blit し、
+    // record の pose/FOV を提出層に載せる。新規受理と再提出で共用する。
+    // 失敗時は例外にする（呼び出し側は空フレームで終える）。
+    auto submit_image = [&](vk::Image src, uint32_t srcW, uint32_t srcH,
+                            const RenderRecord& rec, bool allow_dump) {
+      // 検証用の提出画像ダンプ。N 回目の提出時に blit 後・release 前の両眼を写す。
+      // 1 回だけ。提出の正しさは変えない（ダンプ後に COLOR_ATTACHMENT に戻す）。
+      // 再提出では保存しない（回数は新規受理の提出基準に保つ）。
+      const bool do_dump = allow_dump && !options.dumpSubmitDir.empty() && !dumpDone && blit &&
+                           blit->dumpEnabled() &&
+                           submits + 1 == static_cast<uint64_t>(options.dumpFrame);
+      const BlitPass::Result r0 =
+          blit->Blit(0, src, srcW, srcH, 0, options.submitVerify, do_dump);
+      const BlitPass::Result r1 =
+          blit->Blit(1, src, srcW, srcH, 1, options.submitVerify, do_dump);
+      if (do_dump) {
+        dumpDone = true;
+        Info("dump-submit: %llu 回目の提出を保存した", static_cast<unsigned long long>(submits + 1));
+      }
+      const uint64_t blit_us = r0.blitUs + r1.blitUs;
+      ++stats.blits;
+      stats.blitUsTotal += blit_us;
+      if (blit_us > stats.blitUsMax) {
+        stats.blitUsMax = blit_us;
+      }
+      if (options.submitVerify) {
+        if (r0.markerOk && r1.markerOk) {
+          ++stats.verifyOk;
+        } else {
+          ++stats.verifyNg;
+        }
+      }
+      for (uint32_t eye = 0; eye < 2; ++eye) {
+        const EyePose& p = (eye == 0) ? rec.left : rec.right;
+        const EyeFov& f = (eye == 0) ? rec.leftFov : rec.rightFov;
+        proj_views[eye].pose.position.x = p.position[0];
+        proj_views[eye].pose.position.y = p.position[1];
+        proj_views[eye].pose.position.z = p.position[2];
+        proj_views[eye].pose.orientation.x = p.orientation[0];
+        proj_views[eye].pose.orientation.y = p.orientation[1];
+        proj_views[eye].pose.orientation.z = p.orientation[2];
+        proj_views[eye].pose.orientation.w = p.orientation[3];
+        proj_views[eye].fov.angleLeft = f.left;
+        proj_views[eye].fov.angleRight = f.right;
+        proj_views[eye].fov.angleUp = f.up;
+        proj_views[eye].fov.angleDown = f.down;
+        proj_views[eye].subImage.swapchain = swapchains->handle(eye);
+        proj_views[eye].subImage.imageRect.offset = {0, 0};
+        proj_views[eye].subImage.imageRect.extent.width =
+            static_cast<int32_t>(swapchains->extent(eye).width);
+        proj_views[eye].subImage.imageRect.extent.height =
+            static_cast<int32_t>(swapchains->extent(eye).height);
+        proj_views[eye].subImage.imageArrayIndex = 0;
+      }
+    };
+    // 新規受理があれば hold へ GPU 複製してから提出する。TTL 超の受理でも複製は残す
+    // （再提出は黒より古い絵を優先するため。上限は --resubmit-max-age-ms で別に付ける）。
+    // --no-resubmit では複製自体を行わない（比較用の旧挙動に余計な GPU 負荷を載せない）。
+    if (hasFresh && options.resubmit) {
+      try {
+        hold.SaveFrom(transfer.OwnImage(), freshW, freshH);
+        holdRecord = freshRecord;
+        holdHasRecord = true;
+      } catch (const std::exception& e) {
+        Warn("hold 複製に失敗したため再提出はできない: %s", e.what());
+        hold.Invalidate();
+        holdHasRecord = false;
+      }
+    }
+    bool fresh_failed = false;
     if (rendered && hasFresh) {
       const uint64_t age = NowUs() - freshRecord.issuedUs;
       if (age <= ledger.maxAgeUs()) {
         try {
-          const vk::Image own = transfer.OwnImage();
-          // 検証用の提出画像ダンプ。N 回目の提出時に blit 後・release 前の両眼を写す。
-          // 1 回だけ。提出の正しさは変えない（ダンプ後に COLOR_ATTACHMENT に戻す）。
-          const bool do_dump = !options.dumpSubmitDir.empty() && !dumpDone && blit &&
-                               blit->dumpEnabled() &&
-                               submits + 1 == static_cast<uint64_t>(options.dumpFrame);
-          const BlitPass::Result r0 =
-              blit->Blit(0, own, freshW, freshH, 0, options.submitVerify, do_dump);
-          const BlitPass::Result r1 =
-              blit->Blit(1, own, freshW, freshH, 1, options.submitVerify, do_dump);
-          if (do_dump) {
-            dumpDone = true;
-            Info("dump-submit: %llu 回目の提出を保存した", static_cast<unsigned long long>(submits + 1));
-          }
-          const uint64_t blit_us = r0.blitUs + r1.blitUs;
-          ++stats.blits;
-          stats.blitUsTotal += blit_us;
-          if (blit_us > stats.blitUsMax) {
-            stats.blitUsMax = blit_us;
-          }
-          if (options.submitVerify) {
-            if (r0.markerOk && r1.markerOk) {
-              ++stats.verifyOk;
-            } else {
-              ++stats.verifyNg;
-            }
-          }
-          for (uint32_t eye = 0; eye < 2; ++eye) {
-            const EyePose& p = (eye == 0) ? freshRecord.left : freshRecord.right;
-            const EyeFov& f = (eye == 0) ? freshRecord.leftFov : freshRecord.rightFov;
-            proj_views[eye].pose.position.x = p.position[0];
-            proj_views[eye].pose.position.y = p.position[1];
-            proj_views[eye].pose.position.z = p.position[2];
-            proj_views[eye].pose.orientation.x = p.orientation[0];
-            proj_views[eye].pose.orientation.y = p.orientation[1];
-            proj_views[eye].pose.orientation.z = p.orientation[2];
-            proj_views[eye].pose.orientation.w = p.orientation[3];
-            proj_views[eye].fov.angleLeft = f.left;
-            proj_views[eye].fov.angleRight = f.right;
-            proj_views[eye].fov.angleUp = f.up;
-            proj_views[eye].fov.angleDown = f.down;
-            proj_views[eye].subImage.swapchain = swapchains->handle(eye);
-            proj_views[eye].subImage.imageRect.offset = {0, 0};
-            proj_views[eye].subImage.imageRect.extent.width =
-                static_cast<int32_t>(swapchains->extent(eye).width);
-            proj_views[eye].subImage.imageRect.extent.height =
-                static_cast<int32_t>(swapchains->extent(eye).height);
-            proj_views[eye].subImage.imageArrayIndex = 0;
-          }
+          submit_image(transfer.OwnImage(), freshW, freshH, freshRecord, true);
           Info("M2 提出: renderId=%llu 年齢=%lluus（画像対応レコードの pose/FOV）",
                static_cast<unsigned long long>(freshRecord.renderId),
                static_cast<unsigned long long>(age));
@@ -1480,16 +1789,45 @@ int RunXrTransfer(const XrTransferOptions& options) {
           hasFresh = false;
         } catch (const std::exception& e) {
           Warn("blit に失敗したため空フレームで終える: %s", e.what());
+          fresh_failed = true;
         }
       } else {
         hasFresh = false;
+      }
+    }
+    // 再提出。新規受理が無い・使えないフレームでも最後の受理を同じ pose/FOV で出し直す。
+    // 新規 blit の失敗直後は出さない（同じ原因で落ちる重複を避ける）。
+    // shouldRender が偽のフレームでも層を出す。最初の 1 枚が来る前だけ空にする。
+    if (!submit_layer && !fresh_failed && options.resubmit && blit && hold.Valid() &&
+        holdHasRecord) {
+      const uint64_t age = NowUs() - holdRecord.issuedUs;
+      const bool too_old =
+          options.resubmitMaxAgeMs > 0 && age > options.resubmitMaxAgeMs * 1000u;
+      if (!too_old) {
+        try {
+          submit_image(hold.image(), hold.width(), hold.height(), holdRecord, false);
+          ++stats.resubmits;
+          const uint64_t now = NowUs();
+          if (stats.resubmits <= 3 || now - lastResubmitLogUs >= 1000000u) {
+            lastResubmitLogUs = now;
+            Info("M2 再提出: renderId=%llu 年齢=%lluus（最終受理の pose/FOV のまま）",
+                 static_cast<unsigned long long>(holdRecord.renderId),
+                 static_cast<unsigned long long>(age));
+          }
+          submit_layer = true;
+          is_resubmit = true;
+        } catch (const std::exception& e) {
+          Warn("再提出の blit に失敗したため空フレームで終える: %s", e.what());
+        }
       }
     }
     if (submit_layer) {
       end_info.layerCount = 1;
       end_info.layers = layers;
       ++stats.rendered;
-      ++stats.submitLayers;
+      if (!is_resubmit) {
+        ++stats.submitLayers;
+      }
     } else {
       end_info.layerCount = 0;
       ++stats.emptyFrames;
@@ -1500,7 +1838,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   stats.Print(ledger.stats(), input.stats());
   Info("M2 中間破棄: %llu（最新優先のため Done のみ返した件数）",
        static_cast<unsigned long long>(droppedIntermediate));
-  if (stats.submitLayers == 0) {
+  if (stats.submitLayers == 0 && stats.resubmits == 0) {
     Warn("提出層 0 のまま終了した（受理画像が無い。harness 側の描画を確認すること）");
   }
   if (!options.dumpSubmitDir.empty() && !dumpDone) {

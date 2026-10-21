@@ -7,7 +7,7 @@
 #   [-FailAfter N] [-InjectUnconfirmed N] [-DelayMs N] [-DropDoneAt N]
 #   [-InjectReleaseFail N] [-InjectRendererCrashMs Ms] [-InjectGpuKillMs Ms]
 #   [-Mode vulkan|d3d-open-only|no-gpu] [-MemLog <接頭辞>]
-#   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify]
+#   [-M2] [-InjectStaleRecord N] [-RenderScale <0.25〜1.0>] [-NoSubmitVerify] [-NoResubmit] [-ResubmitMaxAgeMs Ms]
 #   [-DumpSubmit <dir>] [-DumpFrame N]
 #   [-Space auto|local|stage|local-floor] [-HapticAtMs Ms[,Ms...]] [-HapticRepeat N]
 #   [-InjectSessionRestartMs Ms] [-InjectSpaceChangeMs Ms]
@@ -49,6 +49,8 @@ param(
   [int]$InjectStaleRecord = 0,
   [string]$RenderScale = '0.5',
   [switch]$NoSubmitVerify,
+  [switch]$NoResubmit,
+  [int]$ResubmitMaxAgeMs = 0,
   [string]$DumpSubmit = '',
   [int]$DumpFrame = 60,
   [ValidateSet('auto', 'local', 'stage', 'local-floor')]
@@ -131,6 +133,8 @@ if ($M2) {
   if ($InjectSessionRestartMs -gt 0) { $electronArgs += "--inject-session-restart=$InjectSessionRestartMs" }
   if ($InjectSpaceChangeMs -gt 0) { $electronArgs += "--inject-space-change=$InjectSpaceChangeMs" }
   if ($NoSubmitVerify) { $electronArgs += '--no-submit-verify' }
+  if ($NoResubmit) { $electronArgs += '--no-resubmit' }
+  if ($ResubmitMaxAgeMs -gt 0) { $electronArgs += "--resubmit-max-age-ms=$ResubmitMaxAgeMs" }
   if ($DumpSubmit -ne '') {
     $dumpDir = [IO.Path]::GetFullPath($DumpSubmit)
     $electronArgs += "--dump-submit=$dumpDir"

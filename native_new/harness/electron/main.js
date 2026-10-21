@@ -108,6 +108,10 @@ const M2 = process.argv.includes('--m2');
 const INJECT_STALE_RECORD = Math.max(0, parseInt(arg('inject-stale-record', '0'), 10) || 0);
 const RENDER_SCALE = arg('render-scale', '0.5');
 const NO_SUBMIT_VERIFY = process.argv.includes('--no-submit-verify');
+// 再提出の無効化（exe の --no-resubmit へ渡す。既定は再提出 on。旧挙動の比較用）。
+const NO_RESUBMIT = process.argv.includes('--no-resubmit');
+// 再提出の年齢上限（exe の --resubmit-max-age-ms へ渡す。既定 0=無制限。診断用）。
+const RESUBMIT_MAX_AGE_MS = Math.max(0, parseInt(arg('resubmit-max-age-ms', '0'), 10) || 0);
 // 検証用の提出画像ダンプ（exe の --dump-submit/--dump-frame へ渡す。既定 ''=無効）。
 const DUMP_SUBMIT = arg('dump-submit', '');
 const DUMP_FRAME = Math.max(1, parseInt(arg('dump-frame', '60'), 10) || 60);
@@ -262,6 +266,8 @@ const handleCounts = new Map();
 const handleFirstSeen = new Map();
 const paintTimes = [];
 let exeProc = null;
+// exe の標準出力の行分割の残り。finish 時に未出力分があれば吐き出す。
+let exeOutTail = '';
 let socket = null;
 let doneSeq = 0; // 受信した Done の通番（--drop-done-at 用。既定 0=無効）。
 let winRef = null; // M2 のレコード転送先（createWindow が設定する）。
@@ -983,13 +989,15 @@ function finish(code) {
   flushLog();
   // exe 側の最終統計の出力を待つため、正常終了を最大 3 秒待ってから kill する。
   // 既に終了していれば即座に抜ける。切断検知の直後に kill すると exe の統計が欠ける。
+  // exe の終了は stdio の EOF（close）で待つ。exit だけではパイプ中の
+  // 最終統計を取りこぼすため、close を優先し、3 秒で打ち切る。
   const waitExe = new Promise((resolve) => {
     if (!exeProc || exeProc.exitCode !== null || exeProc.signalCode !== null) {
       resolve();
       return;
     }
     const t = setTimeout(resolve, 3000);
-    exeProc.once('exit', () => {
+    exeProc.once('close', () => {
       clearTimeout(t);
       resolve();
     });
@@ -998,6 +1006,11 @@ function finish(code) {
     try {
       if (exeProc && !exeProc.killed && exeProc.exitCode === null) exeProc.kill();
     } catch { /* 無視 */ }
+    // 終了待ちの間に届いた exe の最終統計（切断検知後の出力）を取りこぼさない。
+    if (exeOutTail !== '') {
+      log(`exe: ${exeOutTail.replace(/\r$/, '')}`);
+      exeOutTail = '';
+    }
     flushLog();
     app.exit(finalCode);
   });
@@ -1122,6 +1135,15 @@ function start() {
       exeArgs.push('--no-submit-verify');
       log('左右分離検証を無効化 (--no-submit-verify)');
     }
+    if (NO_RESUBMIT) {
+      exeArgs.push('--no-resubmit');
+      log('再提出を無効化 (--no-resubmit。旧挙動の空フレーム比較用)');
+    }
+    if (RESUBMIT_MAX_AGE_MS > 0) {
+      exeArgs.push(`--resubmit-max-age-ms=${RESUBMIT_MAX_AGE_MS}`);
+      log(`検証用: exe に --resubmit-max-age-ms=${RESUBMIT_MAX_AGE_MS} を渡す ` +
+          `（再提出の年齢上限。診断用）`);
+    }
     if (DUMP_SUBMIT !== '') {
       exeArgs.push(`--dump-submit=${DUMP_SUBMIT}`);
       exeArgs.push(`--dump-frame=${DUMP_FRAME}`);
@@ -1165,10 +1187,21 @@ function start() {
   scheduleGpuKill();
   // M4 の haptics 指令（--haptic-at/--haptic-repeat。M2 モード以外では送り先が無いため M2 限定）。
   if (M2) scheduleHaptics();
+  // exe の stdout/stderr はパイプで受けて harness のログへ回す（統計行の採取用）。
+  // 従来の inherit では exe を kill した際に最終統計が欠けたため、行単位で log() する。
+  // console 経由で run-out.txt にも残る。終了時の未出力分は finish 側で吐き出す。
   exeProc = spawn(EXE_PATH, exeArgs, {
-    stdio: ['ignore', 'inherit', 'inherit'],
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
   log(`exe spawned: pid=${exeProc.pid} pipe=${pipePath}`);
+  const forwardExe = (prefix) => (chunk) => {
+    exeOutTail += String(chunk);
+    const parts = exeOutTail.split('\n');
+    exeOutTail = parts.pop();
+    for (const line of parts) log(`exe${prefix}: ${line.replace(/\r$/, '')}`);
+  };
+  if (exeProc.stdout) exeProc.stdout.on('data', forwardExe(''));
+  if (exeProc.stderr) exeProc.stderr.on('data', forwardExe('(err)'));
   exeProc.on('error', (e) => {
     log(`exe spawn error: ${e && e.message}`);
     finish(1);

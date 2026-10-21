@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 
@@ -30,17 +31,21 @@ constexpr float kPosQuantMax = 4.0f;
 constexpr float kOriQuantMin = -1.0f;
 constexpr float kOriQuantMax = 1.0f;
 
-// 0〜255 に丸める。両側（C++ と JS）が同じ式を通すことが一致の条件である。
-// JS 側: Math.round(Math.min(255, Math.max(0, (v - min) / (max - min) * 255)))。
+// 0〜255 に丸める。JS 側（m2-codec.js・m2codec.ts・shim.ts・test.html）と同じ式を
+// 倍精度で計算することが一致の条件である。単精度で計算すると .5 境界で 1 ずれる
+// 値があり、静止 pose のシミュレータでは毎フレーム不一致になり受理 0 になる
+// （実測: wantTag と復号 tag が割れ、倍精度の再計算 wantDbl と復号 tag が一致）。
+// 入力は float32 由来の正確な double のため、有限値では JS と bit 一致する。
 inline uint8_t QuantizeByte(float v, float lo, float hi) {
-  float t = (v - lo) / (hi - lo) * 255.0f;
-  if (t < 0.0f) {
+  const double t = (static_cast<double>(v) - static_cast<double>(lo)) /
+                   (static_cast<double>(hi) - static_cast<double>(lo)) * 255.0;
+  if (!(t >= 0.0)) {
     return 0;
   }
-  if (t > 255.0f) {
+  if (!(t <= 255.0)) {
     return 255;
   }
-  return static_cast<uint8_t>(t + 0.5f);
+  return static_cast<uint8_t>(std::floor(t + 0.5));
 }
 
 inline uint8_t QuantizePos(float v) { return QuantizeByte(v, kPosQuantMin, kPosQuantMax); }
@@ -232,6 +237,32 @@ class RenderLedger {
 
   size_t size() const { return records_.size(); }
   const Stats& stats() const { return stats_; }
+
+  // pose 不一致の診断用に、下位 16bit が一致する最新のレコードを探す。
+  // 見つかれば真を返し、out に該当レコード（次に台帳へ触れるまで有効）、
+  // wantTag に再計算した期待タグを出す。見つからなければ偽（out・wantTag は触らない）。
+  // Accept と違い年齢・世代の判定は行わない（不一致の原因切り分け用である）。
+  bool LookupById16(uint16_t renderId16, const RenderRecord** out,
+                    uint16_t* wantTag) const {
+    for (auto it = records_.rbegin(); it != records_.rend(); ++it) {
+      if (static_cast<uint16_t>(it->renderId & 0xFFFFu) != renderId16) {
+        continue;
+      }
+      if (wantTag != nullptr) {
+        *wantTag = PoseTag(it->renderId, it->connEpoch, it->spaceEpoch, it->left, it->right);
+      }
+      if (out != nullptr) {
+        auto fwd = it.base();
+        --fwd;
+        *out = &(*fwd);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 診断用に、保持中の最新 renderId を返す。空なら 0 である。
+  uint64_t latestRenderId() const { return records_.empty() ? 0 : records_.back().renderId; }
 
  private:
   uint32_t connEpoch_;

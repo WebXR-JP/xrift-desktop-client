@@ -31,7 +31,7 @@ void PrintHelp(const char* argv0) {
       "            検証フック（既定 0=無効。Done を送らず終了 2。import 資源は破棄しない）\n"
       "            --delay-ms=N は 1 フレームの処理前に N ミリ秒待つ検証フック（既定 0=無効）\n"
       "  --xr-transfer --pipe=\\\\.\\pipe\\<名前> [--render-scale=<0.2〜1.0>]\n"
-      "            [--record-ttl-ms=<ms>] [--seconds=N] [--inject-stale-record=N] [--no-submit-verify] [--dump-submit=<dir>] [--dump-frame=N]\n"
+      "            [--record-ttl-ms=<ms>] [--seconds=N] [--inject-stale-record=N] [--no-submit-verify] [--dump-submit=<dir>] [--dump-frame=N] [--no-resubmit] [--resubmit-max-age-ms=<ms>]\n"
       "            [--producer-idle-timeout-ms=<ms>] [--pace-records]\n"
       "            M2 の XR 提出モード。XR セッションを開始し、pose/FOV の描画レコードを\n"
       "            発行して RenderRequest を送り、受理画像だけを左右 swapchain へ blit する。\n"
@@ -63,6 +63,8 @@ void PrintHelp(const char* argv0) {
       "            入力は毎秒サマリ（[M4入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
       "            状態変化のフレームで [M4エッジ] を出す。haptics 受信は XrResult を\n"
       "            ログに残す\n"
+      "            --resubmit-max-age-ms=<ms> は再提出を許す画像年齢の上限\n"
+      "            （既定 0=無制限。正なら年齢超過の再提出は行わず空フレームにする。診断用）\n"
       "  --m2-selftest  M2 の値層（配置・pose タグ・受理/棄却）を HMD 無しに検証する\n"
       "  --help    この表示\n",
       argv0);
@@ -229,6 +231,19 @@ int main(int argc, char** argv) {
         }
       } else if (std::strcmp(argv[i], "--pace-records") == 0) {
         opts.paceRecords = true;
+      } else if (std::strcmp(argv[i], "--no-resubmit") == 0) {
+        opts.resubmit = false;
+      } else if (StartsWith(argv[i], "--resubmit-max-age-ms=")) {
+        // 再提出の年齢上限（ms）。0 は無制限（既定）。負は受け付けない。
+        const int resubmit_max_age =
+            std::atoi(argv[i] + std::strlen("--resubmit-max-age-ms="));
+        if (resubmit_max_age < 0) {
+          xrift::Error("--resubmit-max-age-ms は 0 以上の整数であること（指定=%s）",
+                       argv[i] + std::strlen("--resubmit-max-age-ms="));
+          PrintHelp(argv[0]);
+          return 1;
+        }
+        opts.resubmitMaxAgeMs = static_cast<uint64_t>(resubmit_max_age);
       } else {
         xrift::Error("不明な引数: %s", argv[i]);
         PrintHelp(argv[0]);

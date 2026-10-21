@@ -161,6 +161,8 @@ main プロセスは paint に renderId を推測付与しない。
   （`src/transfer/render_record.h` の `PoseTag`。JS 側は `m2-codec-test.js` と
   `index-m2.html` が同じ式を持つ）。
   - 位置は ±4m を 8bit に、姿勢成分は ±1 を 8bit に量子化する。範囲外は端に寄せる。
+  - 量子化の丸めは倍精度で行うこと。C++ 側も倍精度であり、単精度で計算すると
+    .5 境界で 1 ずれる値がある（実測: 静止 pose のシミュレータで毎フレーム不一致）。
   - バイト列（30B）: renderId LE 8B、connEpoch LE 4B、spaceEpoch LE 4B、
     左 pos 3B、左 ori 4B、右 pos 3B、右 ori 4B。
   - タグは FOV を含まない。FOV の束縛は「同じレコードが提出時の pose/FOV を供給する」
@@ -178,7 +180,12 @@ spaceEpoch が一致し、発行から 500ms 以内であること。1 つでも
 理由別（不明 ID・pose 不一致・世代不一致・失効）に数える。
 受理した画像の左右半分を各眼 swapchain へ `vkCmdBlitImage`（線形フィルタ）で
 拡大コピーし、そのレコードの pose/FOV で `xrEndFrame` する。
-最新 pose への付け替えはしない。新規受理が無ければ `layerCount=0` で終える。
+最新 pose への付け替えはしない。受理時に exe 所有の hold イメージへ GPU 複製し、
+新規受理が無いフレームでも同じ record の pose/FOV のまま出し直す（再提出）。
+最初の 1 枚が来る前だけ `layerCount=0` で終える。再提出は record-ttl を超えても
+行う（黒より古い絵が良い）。`--no-resubmit` で旧挙動（比較用）、
+`--resubmit-max-age-ms=<ms>` で再提出の年齢上限（既定 0=無制限。診断用）。
+統計は `層あり`（新規受理）と `再提出` を分けて数える。
 blit 後に各眼の提出画像から 1 画素だけ読み、左眼=マゼンタ・右眼=シアンを確認する
 （`--no-submit-verify` で無効化可）。画像全体は読まない。
 
@@ -223,8 +230,9 @@ blit 後に各眼の提出画像から 1 画素だけ読み、左眼=マゼン�
     左右分離（マゼンタ/シアン）と pose 対応の有無は見られるが、追従遅延の評価にはならない。
   - 色の最終確認は未決のまま（sRGB のみの場合あり）。左右分離と pose 対応を優先する。
   - 終了時に harness が先に終わっても exe は統計を出して終了するはずである。
-    `finish(3)` で kill されて exe 統計（XR fps・blit 平均/最大・検証 ok/ng）が欠けたら
-    切断検知の退行として扱う。
+    exe の stdout/stderr は harness のログ（`harness-run.log`・`run-out.txt`）へ
+    `exe:` 付きで回し、終了は stdio の EOF（`close`）で最大 3 秒待つ。
+    統計行（`XR転送統計`）が欠けたら切断検知の退行として扱う。
 
 ## M4 ハーネス（入力・haptics・参照空間・再接続。検証用）
 

@@ -31,7 +31,14 @@ struct XrTransferOptions {
                                 // 既定 0=無効）。
   int producerIdleTimeoutMs = 5000;  // Offer 途絶で producer 終了とみなす無受信の上限（ミリ秒）。
                                      // 0 は無効（パイプ切断でのみ終了）。既定 5000 はハーネス向け。
-  bool paceRecords = false;  // 実パイプラインに合わせたレコード発行のフロー制御（既定 off）。
+  bool paceRecords = false;
+  // 新規受理が無いフレームでも最後の受理画像を同じ pose/FOV で出し直すか（既定 on）。
+  // off は旧挙動（layerCount=0 の空フレーム。比較用）。付け替えは行わない。
+  bool resubmit = true;
+  // 再提出を許す画像年齢の上限（ms）。既定 0=無制限。
+  // 正なら受理起点で年齢を超えた再提出は行わず空フレームにする（診断用）。
+  // 新規受理の record-ttl とは別枠であり、黒より古い絵を優先するため既定では制限しない。
+  uint64_t resubmitMaxAgeMs = 0;  // 実パイプラインに合わせたレコード発行のフロー制御（既定 off）。
                              // on のとき未処理の画像がある間は新しいレコードを発行せず、
                              // Offer 処理後に次のフレームで発行する。応答停滞時は
                              // 新しいレコードで詰まりを解く（DESIGN §7）。
