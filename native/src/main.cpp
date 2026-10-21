@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
           return 1;
         }
       } else {
-        // 撤去済みの実験フラグ（--transfer・--pace-records・--inject-* 等）もここで落とす。
+        // 撤去済みの実験フラグ（旧転送・ペース・注入系等）もここで落とす。
         // 黙って無視せず usage を出して非ゼロ終了する。
         xrift::Error("不明な引数: %s", argv[i]);
         PrintHelp(argv[0]);

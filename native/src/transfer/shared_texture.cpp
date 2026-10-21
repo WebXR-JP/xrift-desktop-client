@@ -355,7 +355,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     // acquire: 外部（D3D11 側）から自デバイス queue family への所有権移転と
     // GENERAL → TRANSFER_SRC_OPTIMAL の遷移を兼ねる。外部 producer の書き込み完了は
     // このバリアでは保証されない（自プロセス内の順序だけを律し、producer 完了の証拠には
-    // ならない。DESIGN §8 の未解決リスク）。source access は 0 にする。
+    // ならない。docs/architecture.md「同期の保証範囲」の未解決リスク）。source access は 0 にする。
     vk::ImageMemoryBarrier acquire{};
     acquire.sType = vk::StructureType::eImageMemoryBarrier;
     acquire.srcAccessMask = vk::AccessFlags{};

@@ -40,7 +40,7 @@ EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float o
 }  // namespace
 
 int RunTransferSelfTest() {
-  // 1. 配置の実行時確認（static_assert の相手側。JS との一致は protocol-test.js で行う）。
+  // 1. 配置の実行時確認（static_assert の相手側。JS との一致は tools/test/client/protocol.test.cjs で行う）。
   Check(sizeof(TransferMessage) == 256, "メッセージ 256B");
   Check(offsetof(TransferMessage, renderId) == 40, "renderId オフセット 40");
   Check(offsetof(TransferMessage, spaceEpoch) == 52, "spaceEpoch オフセット 52");
@@ -159,7 +159,7 @@ int RunTransferSelfTest() {
     Check(!IsValidHapticCommand(bad_dur), "持続 0 の指令は無効");
   }
 
-  // 10. profile 識別子と量子化（JS 側 protocol-test.js と同じ表・同じ式）。
+  // 10. profile 識別子と量子化（JS 側 tools/test/client/protocol.test.cjs と同じ表・同じ式）。
   Check(ProfileIdFromName("") == 0, "空 profile は未取得");
   Check(ProfileIdFromName("/interaction_profiles/bytedance/pico4_controller") == 6,
         "PICO 4 の識別子");
@@ -272,7 +272,7 @@ int RunTransferSelfTest() {
           "TTL 2s 超の画像は棄却");
   }
   // 13. InputState のコントローラ pose（左右の grip/aim）の往復。
-  // 配置は protocol.h の kInput*（C++ と JS の一致は protocol-test.js で行う）。
+  // 配置は protocol.h の kInput*（C++ と JS の一致は tools/test/client/protocol.test.cjs で行う）。
   // 有効性は手 flags が表し、無効時の値は 0 のままである。
   {
     xr::InputSnapshot s{};

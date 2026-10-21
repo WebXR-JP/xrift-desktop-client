@@ -140,7 +140,7 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
 
 // 制御ブロックの readback。自前イメージからブロック A/B（各 32x32）だけを読み、
 // renderId 下位 16bit と pose タグを復号する。画像全体は読まない
-// （DESIGN §1 の制御メタデータの例外。XR ループを readback 待ちで止めないよう最小限）。
+// （docs/architecture.md「経路」の制御メタデータの例外。XR ループを readback 待ちで止めないよう最小限）。
 class ControlBlockReader {
  public:
   explicit ControlBlockReader(const gfx::VulkanContext& vk)
@@ -504,7 +504,7 @@ class BlitPass {
 
   // 受理画像の片半分を各眼へ blit する。srcHalf: 0=左半分、1=右半分。
   // 色の扱い: 同一形式間の blit は複写・拡大であり、色空間の変換は行わない。
-  // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（DESIGN §9 の未決事項。
+  // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（docs/architecture.md「既知の挙動」の未決事項。
   // 左右分離と pose 対応を優先し、色の最終確認は持ち越す）。
   // blit 後に提出画像からマーカー 1 画素だけを読む（画像全体は読まない）。
   // 失敗時は例外にする（呼び出し側は layerCount=0 で終える）。
@@ -790,7 +790,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // セッション束（セッション・参照空間・swapchain・blit・入力空間）。
   // LOSS_PENDING ではこの束だけを破棄・再生成する。
   // TransferSession（instance・Vulkan device）・ControlBlockReader・PipeClient は保つ。
-  // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（DESIGN §6・§10）。
+  // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（docs/architecture.md「借用の所有権と release 遅延」「space とセッション復帰」）。
   std::unique_ptr<xr::Session> session;
   std::unique_ptr<gfx::Swapchains> swapchains;
   std::unique_ptr<BlitPass> blit;
@@ -831,7 +831,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     return 1;
   }
   if (swapchains->format() != vk::Format::eB8G8R8A8Unorm) {
-    Warn("swapchain が %s（受理画像と不一致。二重符号化の疑いが残る。DESIGN §9 の未決）",
+    Warn("swapchain が %s（受理画像と不一致。二重符号化の疑いが残る。docs/architecture.md「既知の挙動」の未決）",
          gfx::SwapchainFormatName(swapchains->format()));
   } else {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
@@ -900,7 +900,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   bool have_prev_snapshot = false;
   uint8_t input_latch[2] = {0, 0};
   // パイプの生死と終了コード。切断（hard close）は新規受付の停止と統計付き終了の合図
-  // であり（DESIGN §6③）、未完了の借用へ Done は送らない。プロトコルに終了合図が無い
+  // であり（docs/architecture.md「借用の所有権と release 遅延」）、未完了の借用へ Done は送らない。プロトコルに終了合図が無い
   // ため、少なくともハングせず統計を残すことを優先し、正常な切断は 0、異常は非ゼロで返す。
   bool pipeAlive = true;
   int exitCode = 0;
@@ -987,7 +987,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   };
 
   // REFERENCE_SPACE_CHANGE_PENDING の適用。新しい原点で locate できることを確認してから
-  // spaceEpoch を進め、旧世代のレコードを失効させる（DESIGN §10）。
+  // spaceEpoch を進め、旧世代のレコードを失効させる（docs/architecture.md「space とセッション復帰」）。
   auto apply_pending_space = [&]() {
     if (!pending_space_change || !session) {
       return;
@@ -1107,7 +1107,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       if (!received) {
         // 空振り（期限切れ）は正常であり、borrow 資源の返却許可にはならない。
         // 切断時は新規受付を止め、現在の処理を安全に終わらせて統計を出して終了する。
-        // 未完了の借用へ Done は送らない（隔離。DESIGN §6③）。
+        // 未完了の借用へ Done は送らない（隔離。docs/architecture.md「借用の所有権と release 遅延」）。
         if (!timed_out) {
           Info("パイプ切断を検知したため新規受付を止めて終了する");
           pipeAlive = false;
@@ -1183,7 +1183,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       return;
     }
     // 最新 Offer の自前イメージから制御メタだけを読み、台帳と照合する。
-    // 画像全体は読まない（DESIGN §1 の例外）。
+    // 画像全体は読まない（docs/architecture.md「経路」の制御メタデータの例外）。
     hasFresh = false;
     const vk::Image own = transfer.OwnImage();
     if (static_cast<VkImage>(own) == VK_NULL_HANDLE) {

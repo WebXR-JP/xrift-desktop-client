@@ -97,7 +97,7 @@ Session::Session(const Instance& xr, const gfx::VulkanContext& vk, SpacePreferen
       }
       return false;
     };
-    // 後退順は local-floor→stage→local である（DESIGN §10）。
+    // 後退順は local-floor→stage→local である（docs/architecture.md「space とセッション復帰」）。
     const XrReferenceSpaceType kFallback[] = {
         XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR,
         XR_REFERENCE_SPACE_TYPE_STAGE,

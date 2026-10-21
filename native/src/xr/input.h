@@ -5,7 +5,7 @@
 
 #include "common/xr_vulkan.h"
 
-// 入力アクション（DESIGN §10）。アクションセット `xrift` を作り、
+// 入力アクション（docs/architecture.md「入力と haptics」）。アクションセット `xrift` を作り、
 // 左右のサブアクションパスで pose/float/vector2/bool/haptic を持つ。
 // suggest 表は native/src/addon.cpp と同じ顔ぶれに PICO 系（bytedance）を足す。
 // 取得・無効化・haptics 停止はここに残し、意味付け・UI・デッドゾーンは TS 側の責務である。

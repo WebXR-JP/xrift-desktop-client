@@ -2,14 +2,11 @@ node_modules/
 native/build/
 native/out/
 native/transfer-addon/build/
-native/harness/electron/run-out.txt
-native/harness/electron/run-err.txt
-native/harness/electron/harness-stats.json
-native/harness/electron/logs/
-native/harness/electron/fault-matrix-results.*
 client/dist/
 client/logs/
 client/dist-package/
+client/xrift.vrmanifest
+client/xrift-packaged.vrmanifest
 *.vrmanifest
 # ログ・ダンプ・ローカル設定（個人の環境情報を含むので公開しない）
 *.log

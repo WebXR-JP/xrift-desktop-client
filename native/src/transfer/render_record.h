@@ -9,7 +9,7 @@
 
 // 描画レコード（exe が発行・保持する変更不能な要求台帳）。
 // xrLocateViews の左右 pose/FOV・予測時刻・世代を renderId と結び付けて保持し、
-// 画像から復号した ID/pose 要約と照合する（DESIGN §7）。
+// 画像から復号した ID/pose 要約と照合する（docs/architecture.md「経路」）。
 // XR/Vulkan に依存しない値層であり、--selftest で HMD 無しに検証できる。
 
 namespace xrift::transfer {
@@ -144,7 +144,7 @@ class RenderLedger {
   uint64_t maxAgeUs() const { return maxAgeUs_; }
 
   // REFERENCE_SPACE_CHANGE_PENDING の適用時刻に従い世代を進める。
-  // 旧世代のレコードは即座に失効させる（DESIGN §10。照合で弾く）。
+  // 旧世代のレコードは即座に失効させる（docs/architecture.md「space とセッション復帰」。照合で弾く）。
   void AdvanceSpaceEpoch(uint32_t next) {
     if (next == spaceEpoch_) {
       return;
@@ -154,7 +154,7 @@ class RenderLedger {
   }
 
   // セッション再生成に伴い接続世代を進める。旧世代のレコードは失効させる
-  // （DESIGN §6・§10。旧 ACK・旧画像を受け付けないことと連動する）。
+  // （docs/architecture.md「借用の所有権と release 遅延」「space とセッション復帰」。旧 ACK・旧画像を受け付けないことと連動する）。
   void AdvanceConnEpoch(uint32_t next) {
     if (next == connEpoch_) {
       return;

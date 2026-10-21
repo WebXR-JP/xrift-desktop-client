@@ -3,11 +3,14 @@
 Electron main が OSR `paint` で受けた共有テクスチャの NT ハンドルを、
 別 exe（`xrift_native.exe --xr-transfer`）のプロセスへ複製する薄い層。
 `DuplicateHandle` の呼び出しだけを担い、GPU 操作はしない。
+SteamVR のマニフェスト登録・確認・解除（`steamvrManifest`）も担う。
 
 ## 公開関数
 
 - `duplicateHandle(ntHandleBuffer, targetPid)` → `{ok:true, handle: BigInt}`。
   `handle` は複製先プロセスで有効なハンドル値。
+- `steamvrManifest(op, dllPath, manifestPath|appKey)` → 登録・確認・解除の結果。
+  `client/scripts/register-steamvr.cjs` から使う。
 - 失敗時は例外ではなく `{ok:false, error, hresult}` を返す。
   `hresult` は `OpenProcess` / `DuplicateHandle` の失敗時のみ付く。
 

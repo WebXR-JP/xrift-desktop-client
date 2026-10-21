@@ -16,7 +16,7 @@ std::vector<vk::Format> PreferredSwapchainFormats();
 // XR 提出モード用の候補。受理画像の自前イメージ（B8G8R8A8_UNORM）と一致する
 // 形式を優先する。blit は同一形式間の複写・拡大であり、色空間の変換は行わない。
 // sRGB 形式しか無いランタイムでは二重符号化の疑いが残るため、確定時はログに残す
-// （DESIGN §9・§13 の未決事項。色の最終確認は持ち越し）。
+// （docs/architecture.md「既知の挙動」の未決事項。色の最終確認は持ち越し）。
 std::vector<vk::Format> XrPreferredSwapchainFormats();
 // フォーマット値の表示名。未知の値は "不明なフォーマット" を返す。
 // vk::to_string(Format) は存在するが "R8G8B8A8Srgb" 式の表記になるため、

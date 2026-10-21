@@ -5,7 +5,7 @@
 
 // XR 提出モード。XR セッションを開始し、フレームループで描画レコードを
 // 発行して RenderRequest を送り、受理した画像だけを左右 swapchain へ blit して
-// そのレコードの pose/FOV で xrEndFrame する（DESIGN §4・§7・§9・§11）。
+// そのレコードの pose/FOV で xrEndFrame する（docs/architecture.md「経路」「再提出」）。
 
 namespace xrift::transfer {
 

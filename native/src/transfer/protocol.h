@@ -37,7 +37,7 @@ constexpr uint32_t kStatusVerifyFailed = 2;
 
 // GPU 完了を確認できない失敗（フェンス待ち失敗・device lost・waitIdle 失敗）の
 // 内部合図。線路上には出さない。timeout は返却許可ではないため、Done を送らず
-// main は該当借用を release しない（DESIGN §5〜§6 の quarantined 経路）。
+// main は該当借用を release しない（docs/architecture.md「借用の所有権と release 遅延」の quarantined 経路）。
 // 値は status 域と衝突しない番兵である。
 constexpr uint32_t kStatusNoAck = 0xFFFFFFFFu;
 
@@ -172,7 +172,7 @@ inline TransferMessage MakeRenderRequest(uint64_t renderId, uint32_t connEpoch,
 // どちらも 256B 固定の TransferMessage に載せる。192B→256B 化したため
 // 版を上げる（kVersion=3。枠が合わない 192B の相手とは混用しない）。
 // 未知の種別を読む側は無視するため、既存経路の挙動は変えない。
-// レイアウトを変えたら C++ 側・JS 側（main.js と protocol-test.js）を同時に更新する。
+// レイアウトを変えたら C++ 側・JS 側（client/src/protocol.ts と tools/test/client/protocol.test.cjs）を同時に更新する。
 
 // HapticCommand（main → exe）の配置。hand 以外は 0 で送らない。
 // hand: u32（renderId の下位 32bit。0=左、1=右。上位 32bit は 0）、

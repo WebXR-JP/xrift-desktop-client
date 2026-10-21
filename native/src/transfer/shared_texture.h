@@ -28,7 +28,7 @@ class TransferSession {
   // 戻り値は protocol.h の kStatus*（kStatusOk / kStatusCopyFailed / kStatusVerifyFailed）
   // または内部番兵 kStatusNoAck。kStatusNoAck は「GPU 完了を確認できない」合図であり、
   // 呼び出し側は Done を送らず、新規受付を止めて接続を閉じ、非ゼロ終了すること。
-  // timeout・切断・終了通知は返却許可にならない（DESIGN §5〜§6・§8）。
+  // timeout・切断・終了通知は返却許可にならない（docs/architecture.md「借用の所有権と release 遅延」「同期の保証範囲」）。
   // 受信ループは kStatusNoAck 以外では止めない。呼び出し側が Done として返す。
   uint32_t ProcessOffer(uint64_t remoteHandle, uint32_t width, uint32_t height);
 
