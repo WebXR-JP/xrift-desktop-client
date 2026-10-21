@@ -1,10 +1,10 @@
-// レターボックス往復の試験（素の node で実行可。前提: pages/mirror-map.js が正本）。
+// レターボックス往復の試験（素の node で実行可。前提: client/pages/mirror-map.js が正本）。
 // コントロール canvas と OSR content の座標対応が崩れると入力転送の位置がずれるため、
 // 境界（黒帯・アスペクト差・縮退入力）をここで押さえる。
-// 使い方: node test/mirror-map.test.cjs
+// 使い方: node tools/test/client/mirror-map.test.cjs
 'use strict';
 const assert = require('node:assert');
-const map = require('../pages/mirror-map.js');
+const map = require('../../../client/pages/mirror-map.js');
 
 // 同一アスペクトでは全面に広がり、黒帯が出ない。
 {

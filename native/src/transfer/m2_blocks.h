@@ -4,9 +4,10 @@
 #include <cstdint>
 
 // M2 制御ブロック（32x32・4x4 セル・16bit 値）の符号化・復号。
-// 画像配置は harness/electron/README.md の「M2 画像配置」が正典である。
-// BGRA バイト順・白黒二値・中心画素判定。JS 側（m2-codec-test.js の
-// encodeBlock16/decodeBlock16、index-m2.html の drawBlock16）と一致させること。
+// 画像配置は tools/pages/xr-smoke.html の刻み（ブロック A=(64,64)、B=(128,64)、
+// マーカーは左 (160,8)・右（右半分起点+160,8）、各 32x32）が正典である。
+// BGRA バイト順・白黒二値・中心画素判定。JS 側（client/src/m2codec.ts の
+// encodeBlock16/decodeBlock16、tools/pages/xr-smoke.html の刻み）と一致させること。
 
 namespace xrift::transfer {
 

@@ -1,10 +1,9 @@
 // InputState の配置試験（素の node で実行可。前提: `npm run build` で dist が最新）。
-// C++ 側（protocol.h の kInput* 配置・--m2-selftest・harness の protocol-test.js）と
-// 同じオフセットで一致を確かめる。配置を変えたら両側を同時に更新すること。
-// 使い方: node test/protocol.test.cjs
+// C++ 側（protocol.h の kInput* 配置・--m2-selftest）と同じオフセットで一致を確かめる。
+// 使い方: node tools/test/client/protocol.test.cjs
 'use strict';
 const assert = require('node:assert');
-const protocol = require('../dist/protocol.js');
+const protocol = require('../../../client/dist/protocol.js');
 const { MSG_LEN, MAGIC, VERSION, TYPE_INPUT_STATE, decodeInput } = protocol;
 
 // 固定長と版。C++ の kMessageSize・kVersion と一致すること。

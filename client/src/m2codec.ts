@@ -1,11 +1,11 @@
 /**
- * M2 制御ブロックのコーデック（`native/harness/electron/m2-codec.js` の移植）。
+ * M2 制御ブロックのコーデック。
  *
  * 正典は C++ 側（`native/src/transfer/render_record.h` の量子化・`PoseTag`、
  * `native/src/transfer/m2_blocks.h` のブロック符号化）であり、このモジュールは
  * その写しである。計算結果を変えたら exe が受理しないため、式を変えるときは
- * C++・harness・ここ・`./shim.ts` 内の同等品を同時に更新し、
- * `../test/m2codec.test.cjs` のベクトルで一致を確認する。
+ * C++・ここ・`./shim.ts` 内の同等品を同時に更新し、
+ * `tools/test/client/m2codec.test.cjs` のベクトルで一致を確認する。
  *
  * @packageDocumentation
  */

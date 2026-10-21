@@ -1,4 +1,4 @@
-#include "transfer/m2_selftest.h"
+#include "transfer_selftest.h"
 
 #include <cstdint>
 #include <cstdio>

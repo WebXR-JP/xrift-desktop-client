@@ -9,7 +9,7 @@
 // 64〜191B に M2 の RenderRequest 領域を足し、M5 で 192〜255B に拡張する。
 // InputState のコントローラ pose は 88〜143B（InputState では未使用の
 // RenderRequest 欄の再利用。種別で区別する）と 160〜215B に載る（下の kInput* 配置）。
-// Node 側（app/src/protocol.ts と harness/electron/main.js と protocol-test.js）は
+// Node 側（client/src/protocol.ts と tools/test/client/protocol.test.cjs）は
 // 同じオフセットで Buffer を読み書きする。
 // レイアウトを変えたら両側と static_assert を同時に更新する。
 

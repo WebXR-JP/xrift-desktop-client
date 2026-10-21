@@ -16,7 +16,7 @@ pnpm electron:install   # Electron 本体の取得（pnpm では取得されな�
 pnpm build              # client のビルド（tsc）
 pnpm build:native       # native/xrift_new.exe のビルド（cmake preset）
 pnpm build:addon        # transfer-addon のビルド
-pnpm start -- --url=pages/test.html --seconds=15  # client を起動
+pnpm start -- --url=<絶対パス>/tools/pages/xr-smoke.html --seconds=15  # client を起動
 pnpm test               # client の単体試験
 pnpm verify             # build + test
 pnpm register           # SteamVR のライブラリに登録（SteamVR を起動しておく）
@@ -30,4 +30,4 @@ pnpm package            # 配布物（client/dist-package/）を作る
 - Windows のみ検証。Linux 対応は将来対応。
 - HMD 非装着では XR セッションが FOCUSED に届かず、提出（blit）の検証はできない。
 - 色の最終確認は未決（`native/docs/DESIGN.md` §9）。手の pose（grip/targetRay）は未対応。
-- `client` と `native` のハーネス（`native/harness/`）は検証器具であり製品経路ではない。
+- `client` と `native` の検証器具（`tools/`）は製品経路ではない。

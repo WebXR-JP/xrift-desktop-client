@@ -4,6 +4,7 @@
 //
 // root の node_modules の @electron/packager を使う（client 自体に依存は無い）。
 // 同梱物: client/dist、client/pages、client/package.json（本体）、
+//   tools/pages（検証ページ。self-test が resources/tools/pages から読む）、
 //   xrift_new.exe + xrift_transfer_addon.node（extraResource → resources/ 直下）、
 //   three.module.js + three.core.js（→ resources/node_modules/three/build/。pages の importmap 解決用）。
 // main は packagedResource() で resources/ 直下から解決する（開発時は従来パス）。
@@ -75,9 +76,9 @@ async function main() {
     ignore: (p) => p !== '' && !keep.some((r) => r.test(p.replace(/\\/g, '/'))),
   });
   console.log(`[package] 出力: ${appOut}`);
-  // テストページ（pages/*.html）の importmap は client 相対で
+  // テストページ（tools/pages/*.html）の importmap は tools/pages 相対で
   // `../../node_modules/three/build/three.module.js` を指す。
-  // 配布物では resources/app/pages/... になるため、解決先は
+  // 配布物では resources/tools/pages/... になるため、解決先は
   // resources/node_modules/... である。開発時のみ存在するパスなので、
   // 配布物にも同梱する（相対パスを変えずに済ませる）。
   // three.module.js は ./three.core.js を import するため両方をコピーする
@@ -96,6 +97,21 @@ async function main() {
     copyFileSync(join(threeSrcDir, f), join(threeDstDir, f));
     const kb = (statSync(join(threeDstDir, f)).size / 1024).toFixed(0);
     console.log(`[package] three 同梱: node_modules/three/build/${f} (${kb}KB)`);
+  }
+  // 検証ページ（tools/pages）の同梱。packager の dir は client 配下のため
+  // ignore 保持では含められず、ここで resources/tools/pages へ写す。
+  // self-test が mirror-input.html を resources 解決で読む（開発時は repo 直下）。
+  const toolsPagesSrc = join(repoRoot, 'tools', 'pages');
+  const toolsPagesDst = join(resources, 'tools', 'pages');
+  if (!existsSync(toolsPagesSrc)) {
+    fail(`検証ページがありません: ${toolsPagesSrc}`);
+  }
+  mkdirSync(toolsPagesDst, { recursive: true });
+  for (const e of readdirSync(toolsPagesSrc)) {
+    const src = join(toolsPagesSrc, e);
+    if (!statSync(src).isFile()) continue;
+    copyFileSync(src, join(toolsPagesDst, e));
+    console.log(`[package] 検証ページ同梱: tools/pages/${e}`);
   }
   // 生成物の一覧（exe・addon・dist・pages の確認用）。
   const top = readdirSync(appOut);

@@ -1,10 +1,10 @@
 // 入力転送の境界試験（素の node で実行可。前提: `npm run build` で dist が最新）。
 // renderer からの IPC 値（unknown）を OSR の sendInputEvent 形へ直す変換が、
 // マウス・ホイール・キーの全種別で崩れないことと、不正値を捨てることを確かめる。
-// 使い方: node test/mirror-input.test.cjs
+// 使い方: node tools/test/client/mirror-input.test.cjs
 'use strict';
 const assert = require('node:assert');
-const { toOsrInputEvent } = require('../dist/mirror-input.js');
+const { toOsrInputEvent } = require('../../../client/dist/mirror-input.js');
 
 const W = 1280, H = 800;
 

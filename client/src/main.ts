@@ -1,6 +1,5 @@
 /**
- * M5 新アプリの main プロセス。検証用ハーネス（`native/harness/electron/main.js`）の
- * 借用台帳・パイプサーバ・終了経路を TypeScript に整理して流用したものである。
+ * M5 新アプリの main プロセス。
  *
  * 役割: パイプサーバ + 借用台帳 + `release()` 専任。提出には関与しない。
  *  - OSR ウィンドウ（show:false、offscreen useSharedTexture）で paint を受ける
@@ -73,19 +72,18 @@ const SECONDS = Math.max(0, parseInt(arg('seconds', '0'), 10) || 0);
 const WIN_W = parseInt(arg('width', '1280'), 10) || 1280;
 const WIN_H = parseInt(arg('height', '800'), 10) || 800;
 const SPACE = arg('space', 'auto');
-const PAGE_ARG = arg('page', '');
 const URL_ARG = arg('url', '');
 /**
- * 開く対象を決める。`--url` が正典であり、`--page` は互換のために残す。
+ * 開く対象を決める。`--url` が正典である。
  *
  * - `https?://`・`file://` で始まればそのまま URL として開く
- * - それ以外の空でない文字（`pages/test.html`・`test.html` 等）は pages 配下の
- *   ファイルとして開く（`--url=pages/test.html` の検証命令に対応するため）
+ * - それ以外の空でない文字（`xr-smoke.html` 等）は検証ページとして開く
+ *   （`--url=xr-smoke.html` の検証命令に対応するため）
  * - どちらも空なら既定の本番 URL（`https://app.xrift.net/`）を開く。
- *   開発・検証では `--url=pages/test.html` を明示すること
+ *   開発・検証では `--url=<絶対パス>/tools/pages/xr-smoke.html` を明示すること
  */
 function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: string } {
-  const raw = URL_ARG !== '' ? URL_ARG : PAGE_ARG !== '' ? PAGE_ARG : 'https://app.xrift.net/';
+  const raw = URL_ARG !== '' ? URL_ARG : 'https://app.xrift.net/';
   if (/^https?:\/\//i.test(raw) || /^file:\/\//i.test(raw)) {
     return { kind: 'url', url: raw };
   }
@@ -93,9 +91,12 @@ function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: s
     return { kind: 'file', file: raw };
   }
   const pagesBase = path.join(__dirname, '..', 'pages');
+  const toolsPagesBase = path.join(__dirname, '..', '..', 'tools', 'pages');
   const candidates = [
     path.join(pagesBase, path.basename(raw)),
     path.join(pagesBase, raw),
+    path.join(toolsPagesBase, path.basename(raw)),
+    path.join(toolsPagesBase, raw),
     path.join(__dirname, '..', raw),
   ];
   for (const c of candidates) {
@@ -108,6 +109,17 @@ function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: s
   return { kind: 'file', file: candidates[0] };
 }
 const ADDON_PATH = arg('addon', packagedResource('xrift_transfer_addon.node') ?? DEV_ADDON_PATH);
+// tools/pages 配下の検証ページの解決。開発時は repo 直下の tools/、
+// 配布時は extraResource（resources/tools/）から読む。
+// ADR: self-test が読む mirror-input.html は製品ページではないため client/pages には置かず、
+// package.cjs が配布物へ同梱する（開発時と配布時で基準が違うため存在確認で切り替える）。
+function toolPagePath(name: string): string {
+  try {
+    const candidate = path.join(process.resourcesPath, 'tools', 'pages', name);
+    if (fs.existsSync(candidate)) return candidate;
+  } catch { /* 開発実行では resourcesPath が無い場合がある */ }
+  return path.join(__dirname, '..', '..', 'tools', 'pages', name);
+}
 // exe の stdout/stderr の保存先（受理/不明 ID の内訳用）。相対パスは logs/ 基準。
 // `--exe-log=`（空）で従来の inherit（保存しない）に戻す。
 const EXE_LOG = arg('exe-log', 'm5-exe.log');
@@ -116,32 +128,27 @@ if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
   process.exitCode = 1;
   app.whenReady().then(() => app.exit(1));
 }
-// 検証専用の画面 capture（--capture-at=Ms,path。複数は ; 区切り）。
-// 指定時刻に webContents.capturePage() で PNG を保存する。描画経路には入れない。
-const CAPTURE_AT_LIST: { ms: number; file: string }[] = (() => {
-  const raw = arg('capture-at', '');
-  if (raw === '') return [];
-  const out: { ms: number; file: string }[] = [];
-  for (const s of raw.split(';')) {
-    const t = s.trim();
-    if (t === '') continue;
-    const i = t.indexOf(',');
-    if (i <= 0) continue;
-    const ms = Math.max(0, parseInt(t.slice(0, i).trim(), 10) || 0);
-    const file = t.slice(i + 1).trim();
-    if (!(ms > 0) || file === '') continue;
-    out.push({ ms, file });
+// 削除済みフラグ（--page・--no-pace-records・--capture-at・--control-capture-at・
+// --no-exe 等）は黙って無視せずエラー終了する。未知の --* も同様である。
+const KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  'exe', 'addon', 'pipe', 'render-scale', 'record-ttl-ms', 'seconds', 'space', 'url',
+  'width', 'height', 'exe-log', 'mirror-fps', 'mirror-vr-fps', 'control-width',
+  'control-height', 'self-test',
+]);
+for (const a of ARGV) {
+  if (a === '--' || !a.startsWith('--')) continue;
+  const name = a.slice(2).split('=', 1)[0] ?? '';
+  if (!KNOWN_FLAGS.has(name)) {
+    console.error(`unknown ${a}（削除済みか未知の引数）`);
+    process.exitCode = 1;
+    app.whenReady().then(() => app.exit(1));
+    break;
   }
-  return out;
-})();
-// C 案（OSR のミラー + 入力転送）の設定。exe 無しでもミラー検証ができるよう
-// `--no-exe` では exe の spawn・パイプサーバを飛ばす。`--self-test` は
+}
+// C 案（OSR のミラー + 入力転送）の設定。`--self-test` は
 // ミラー・入力転送・VR リサイズの自動検証を行い、結果で終了する（HMD 不要）。
-// 検証専用の pace 無効化（`--no-pace-records`）。exe への `--pace-records` を
-// 渡さず、従来どおり毎フレーム発行させる。遅いページでの受理率の on/off 比較用。
-// 通常運用では付けない（既定は pace on）。
-const NO_PACE = ARGV.includes('--no-pace-records');
-const NO_EXE = ARGV.includes('--no-exe');
+// self-test は exe 無しで回すため、exe の spawn・パイプサーバを飛ばす
+// （self-test 内部専用であり、通常起動のフラグではない）。
 const SELF_TEST = ARGV.includes('--self-test');
 const MIRROR_FPS = Math.min(30, Math.max(1, parseInt(arg('mirror-fps', '10'), 10) || 10));
 // ADR: VR 中のミラーは既定で停止する（0=停止）。ブラウジング中は 10fps のまま。
@@ -154,23 +161,6 @@ const MIRROR_VR_FPS = (() => {
 })();
 const CTL_W = parseInt(arg('control-width', '960'), 10) || 960;
 const CTL_H = parseInt(arg('control-height', '600'), 10) || 600;
-// 検証専用のコントロール窓 capture（--control-capture-at=Ms,path。複数は ; 区切り）。
-const CONTROL_CAPTURE_AT_LIST: { ms: number; file: string }[] = (() => {
-  const raw = arg('control-capture-at', '');
-  if (raw === '') return [];
-  const out: { ms: number; file: string }[] = [];
-  for (const s of raw.split(';')) {
-    const t = s.trim();
-    if (t === '') continue;
-    const i = t.indexOf(',');
-    if (i <= 0) continue;
-    const ms = Math.max(0, parseInt(t.slice(0, i).trim(), 10) || 0);
-    const file = t.slice(i + 1).trim();
-    if (!(ms > 0) || file === '') continue;
-    out.push({ ms, file });
-  }
-  return out;
-})();
 
 // ---- ログ（stdout とファイルの両方。ランチャー経由だとコンソールが無いため）
 const logDir = path.join(__dirname, '..', 'logs');
@@ -271,8 +261,7 @@ const stats = {
   inputStates: 0, // exe から受けた InputState の件数。
   lastInput: null as InputSnapshot | null, // 最後に受けた InputState の要約（統計用）。
   hapticSent: 0, // exe へ送った HapticCommand の件数。
-  captures: 0, // 検証専用の --capture-at で保存した PNG の枚数（描画経路に影響しない）。
-  controlCaptures: 0, // --control-capture-at・self-test で保存したコントロール窓 PNG の枚数。
+  controlCaptures: 0, // self-test で保存したコントロール窓 PNG の枚数。
   mirrorFrames: 0, // コントロール窓へ送ったミラーの枚数。
   mirrorErrors: 0, // ミラー capture・送信の失敗回数。
   mirrorCaptureAvgMs: 0, // capturePage の平均所要（終了時に確定）。
@@ -300,8 +289,6 @@ let shutdownStarted = false;
 let exeLineBuf = '';
 // exe の終了統計（XR転送統計）を app ログに残したか。終了時の必須証拠である。
 let exeStatsLogged = false;
-const captureTimers: NodeJS.Timeout[] = [];
-const controlCaptureTimers: NodeJS.Timeout[] = [];
 // ---- C 案のミラー状態。OSR（不可視）の capturePage をタイマーで拾い、
 // 可視のコントロール窓へ送る。VR 中は停止（既定）または節約間隔で VR の負荷を優先する。
 let controlRef: BrowserWindow | null = null; // ミラー表示・入力受付先（createControlWindow が設定する）。
@@ -614,7 +601,7 @@ function onPaint(details: unknown): void {
   // フロー制御: 未処理の Offer（inFlight）がある間の paint は古いため、
   // duplicate/offer せず texture を即 release して捨てる。未処理の record に
   // 対応しない paint であり、既存の drops と区別して droppedStale に数える。
-  // --pace-records の exe と対になり、発行と消費を 1:1 に保つ。
+  // exe 側の発行フロー制御と対になり、発行と消費を 1:1 に保つ。
   if (inFlight !== null) {
     stats.droppedStale++;
     releaseUnregistered(texture, 'stale-superseded');
@@ -810,8 +797,8 @@ function setXrActive(active: boolean): void {
       vrFirstStampTimer = null;
     }
     // 動作は変えない。新規レコードが 1 秒待っても来ない場合だけ警告する。
-    // exe 無し動作（--no-exe・--self-test）では記録が来ないため予約しない。
-    if (!NO_EXE && !SELF_TEST) {
+    // self-test では記録が来ないため予約しない。
+    if (!SELF_TEST) {
       vrNoRecordWarnTimer = setTimeout(() => {
         vrNoRecordWarnTimer = null;
         if (xrActive && vrFirstRecordAt === null) {
@@ -889,33 +876,6 @@ function sendHaptic(hand: number, amplitude: number, durationMs: number): void {
     log(`haptics 指令を送信（${hand === 0 ? '左' : '右'}・振幅 ${amplitude}・${durationMs}ms。inactive・失敗は exe 側の統計に残る）`);
   } catch (e) {
     log(`haptics 送信に失敗: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
-// 検証専用の画面 capture（--capture-at=Ms,path）。指定時刻に
-// webContents.capturePage() で PNG を保存する。描画経路には入れない。
-function scheduleCapture(win: BrowserWindow): void {
-  for (const c of CAPTURE_AT_LIST) {
-    log(`検証フック有効: --capture-at=${c.ms},${c.file}（起動からその ms 後に capturePage で PNG 保存）`);
-    captureTimers.push(setTimeout(() => {
-      void (async (): Promise<void> => {
-        try {
-          if (win.isDestroyed()) {
-            log(`capture スキップ（window 破棄済み）: ${c.file}`);
-            return;
-          }
-          const img = await win.webContents.capturePage();
-          const out = path.isAbsolute(c.file) ? c.file : path.join(logDir, c.file);
-          const dir = path.dirname(out);
-          if (dir !== '' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(out, img.toPNG());
-          stats.captures++;
-          log(`capture 保存: ${out}（${c.ms}ms 時点）`);
-        } catch (e) {
-          log(`capture 失敗 ${c.file}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      })();
-    }, c.ms));
   }
 }
 
@@ -1146,44 +1106,18 @@ async function createControlWindow(): Promise<BrowserWindow> {
   return win;
 }
 
-// 検証専用のコントロール窓 capture（--control-capture-at=Ms,path）。
-function scheduleControlCapture(win: BrowserWindow): void {
-  for (const c of CONTROL_CAPTURE_AT_LIST) {
-    log(`検証フック有効: --control-capture-at=${c.ms},${c.file}`);
-    controlCaptureTimers.push(setTimeout(() => {
-      void (async (): Promise<void> => {
-        try {
-          if (win.isDestroyed()) {
-            log(`control capture スキップ（window 破棄済み）: ${c.file}`);
-            return;
-          }
-          const img = await win.webContents.capturePage();
-          const out = path.isAbsolute(c.file) ? c.file : path.join(logDir, c.file);
-          const dir = path.dirname(out);
-          if (dir !== '' && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(out, img.toPNG());
-          stats.controlCaptures++;
-          log(`control capture 保存: ${out}（${c.ms}ms 時点）`);
-        } catch (e) {
-          log(`control capture 失敗 ${c.file}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      })();
-    }, c.ms));
-  }
-}
-
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // self-test（HMD 不要）。ミラー・入力転送・VR リサイズ・停止を本番経路で確かめる。
-// OSR には pages/mirror-test.html を開き、ボタン押下と文字入力を handleMirrorInput
+// OSR には tools/pages/mirror-input.html を開き、ボタン押下と文字入力を handleMirrorInput
 // 経由（= コントロール窓と同じ入口）で送り、DOM の変化と PNG で確認する。
 async function runSelfTest(osr: BrowserWindow, control: BrowserWindow): Promise<void> {
   const failures: string[] = [];
   const pass = (m: string): void => { log(`[SELFTEST] PASS ${m}`); };
   const fail = (m: string): void => { log(`[SELFTEST] FAIL ${m}`); failures.push(m); };
-  log('[SELFTEST] 開始（mirror-test.html で検証する）');
+  log('[SELFTEST] 開始（tools/pages/mirror-input.html で検証する）');
   try {
     await sleepMs(1500);
     if (osr.isDestroyed() || control.isDestroyed()) {
@@ -1359,7 +1293,7 @@ function beginShutdown(drainedCode: number): void {
   // 作り直されて終了が延びるため、2 回目以降は何もしない。
   if (shutdownStarted) return;
   shutdownStarted = true;
-  if (NO_EXE || SELF_TEST || socket === null || socket.destroyed) {
+  if (SELF_TEST || socket === null || socket.destroyed) {
     finish(drainedCode);
     return;
   }
@@ -1383,10 +1317,6 @@ function finish(code: number): void {
   finished = true;
   // 終了確定。以後の新規 paint・pump を止める。
   stopping = true;
-  for (const t of captureTimers) clearTimeout(t);
-  captureTimers.length = 0;
-  for (const t of controlCaptureTimers) clearTimeout(t);
-  controlCaptureTimers.length = 0;
   // ミラー停止（タイマー解除）。送り済みフレームの後始末は要らない。
   stopMirror();
   stopVrMeter();
@@ -1434,7 +1364,6 @@ function finish(code: number): void {
   const summary = {
     exe: EXE_PATH, seconds: SECONDS, window: `${WIN_W}x${WIN_H}`,
     space: SPACE, renderScale: RENDER_SCALE, recordTtlMs: RECORD_TTL_MS,
-    captureAt: CAPTURE_AT_LIST,
     gpuPid: currentGpuPid(),
     paints: paintTimes.length,
     fps: total > 0 ? intervals.length / (total / 1000) : 0,
@@ -1492,7 +1421,7 @@ function finish(code: number): void {
   // exe 側の最終統計の出力を待つため、正常終了を最大 3 秒待ってから kill する。
   // 既に終了していれば即座に抜ける。切断検知の直後に kill すると exe の統計が欠ける。
   // ADR: 終了は stdio の EOF（close）で待つ。exit だけではパイプ中の最終統計を
-  // 取りこぼす（ハーネスと同一の待ち方）。
+  // 取りこぼす。
   const waitExe = new Promise<void>((resolve) => {
     if (!exeProc || exeProc.exitCode !== null || exeProc.signalCode !== null) {
       resolve();
@@ -1607,7 +1536,7 @@ async function createWindow(): Promise<BrowserWindow> {
     }
   });
   // ADR: paint の details 形状は版で違うため unknown 境界で受け、型ガードで絞る。
-  // なお Electron の paint は第 1 引数に texture 担体が来る（ハーネスと同一の受け方）。
+  // なお Electron の paint は第 1 引数に texture 担体が来る。
   win.webContents.on('paint', (...args: unknown[]) => {
     try {
       onPaint(args[0]);
@@ -1665,7 +1594,7 @@ async function createWindow(): Promise<BrowserWindow> {
 
   // self-test では検証ページ（ボタン・入力欄つき）を強制する（引数の指定より優先）。
   const target = SELF_TEST
-    ? { kind: 'file', file: path.join(__dirname, '..', 'pages', 'mirror-test.html') } as const
+    ? { kind: 'file', file: toolPagePath('mirror-input.html') } as const
     : resolveTarget();
   if (target.kind === 'url') {
     await win.loadURL(target.url);
@@ -1674,7 +1603,6 @@ async function createWindow(): Promise<BrowserWindow> {
     await win.loadFile(target.file);
     log(`loaded page=${target.file}`);
   }
-  scheduleCapture(win);
 
   if (SECONDS > 0) {
     stopTimer = setTimeout(() => {
@@ -1691,8 +1619,8 @@ async function createWindow(): Promise<BrowserWindow> {
 }
 
 function start(): void {
-  // self-test は HMD・exe 無しで回すため、exe 不要扱いにする。
-  const noExeMode = NO_EXE || SELF_TEST;
+  // self-test は HMD・exe 無しで回すため、exe 不要扱いにする（self-test 内部専用）。
+  const noExeMode = SELF_TEST;
   // render-scale の範囲確認（0.2〜1.0。既定 0.5）。範囲外は exe が拒否するため先に落とす。
   const scaleNum = Number(RENDER_SCALE);
   if (!Number.isFinite(scaleNum) || scaleNum < 0.2 || scaleNum > 1.0) {
@@ -1714,13 +1642,6 @@ function start(): void {
     `--record-ttl-ms=${RECORD_TTL_MS}`,
     `--space=${SPACE}`,
     `--seconds=${SECONDS > 0 ? SECONDS + 30 : 3600}`,
-    // ADR: 静止ページで paint が止まっても Offer 途絶で終了しないよう無効化する。
-    // 終了はパイプ切断（finish 時の socket.destroy）で知らせる。
-    '--producer-idle-timeout-ms=0',
-    // フロー制御: 実パイプラインに合わせてレコード発行を抑える（exe 側は既定 off）。
-    // 未処理画像がある間は発行せず、Offer 処理後に次を発行する。ハーネスには渡さない。
-    // --no-pace-records（検証専用）のときは渡さず従来どおり毎フレーム発行させる。
-    ...(NO_PACE ? [] : ['--pace-records' as const]),
   ];
   log(`exe: ${EXE_PATH} ${exeArgs.join(' ')}`);
   // exe の出力をファイルへ保存する（受理/不明 ID の内訳用）。端末にもそのまま出す。
@@ -1847,7 +1768,7 @@ function start(): void {
     log(`pipe server listening: ${PIPE_PATH}`);
   });
   } else {
-    log('exe 無し動作のため spawn・パイプサーバを飛ばす（ミラー・入力転送のみ）');
+    log('self-test のため spawn・パイプサーバを飛ばす（ミラー・入力転送のみ）');
   }
 
   // renderer からの haptics 要求を exe へ中継する。境界で数値を検証する。
@@ -1907,7 +1828,6 @@ function start(): void {
     // OSR の後にコントロール窓を作り、ミラー・状態配信を開始する。
     // self-test はここから自動検証に入り、結果で終了する。
     createControlWindow().then((control) => {
-      scheduleControlCapture(control);
       startMirror();
       startStatusBroadcast();
       startVrMeter();

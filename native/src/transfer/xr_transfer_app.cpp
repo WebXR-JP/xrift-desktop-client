@@ -9,8 +9,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -20,7 +18,6 @@
 #include "common/log.h"
 #include "common/xr_result.h"
 #include "gfx/swapchains.h"
-#include "transfer/mem_log.h"
 #include "transfer/input_state.h"
 #include "transfer/m2_blocks.h"
 #include "transfer/pipe_client.h"
@@ -33,7 +30,7 @@
 namespace xrift::transfer {
 namespace {
 
-// M2 画像配置（harness/electron/README.md の「M2 画像配置」と一致させること）。
+// M2 画像配置（tools/pages/xr-smoke.html の刻みと一致させること）。
 // アトラスは左右横並び（左半分=左眼、右半分=右眼）。来た値を正とするため、
 // 半分の境界は自前イメージの実寸 (ownW/2) で決める。奇数幅では左を floor に寄せる。
 constexpr uint32_t kBlockCell = 4;      // 1 セルの一辺。
@@ -45,9 +42,6 @@ constexpr uint32_t kMarkerSize = 32;    // 眼マーカーの一辺。
 constexpr uint32_t kMarkerLeftX = 160;  // 左マーカー（マゼンタ）の左上 x（アトラス座標）。
 constexpr uint32_t kMarkerRightDx = 160;  // 右マーカー（シアン）の左上 x（右半分起点から）。
 constexpr uint32_t kMarkerY = 8;          // 両マーカーの左上 y（予約ブロックと重ねない）。
-// RenderRequest の予約先頭バイトに載せる旧 pose 混入の合図。
-// harness 側フック用であり、通常の要求では 0 である。
-constexpr uint8_t kStaleMarker = 0x5Au;
 // Offer 受信ポーリングの待ち上限（1ms は意図的な値であり、仮置きではない）。
 // XR ループを止めないよう 1 フレームの待ちが 1ms 程度に収まることを保証する。
 // ReceiveWithDeadline の期限切れは「その回の受信を打ち切る」意味であり、
@@ -55,18 +49,12 @@ constexpr uint8_t kStaleMarker = 0x5Au;
 // なお deadlineUs=0 は無期限待ちの意味であるため、ノンブロッキングのつもりで
 // 現在時刻や 0 をそのまま期限に渡さないこと。
 constexpr uint64_t kOfferPollWaitUs = 1000u;
-// --pace-records の応答停滞の上限（500ms は意図的な値であり、仮置きではない）。
+// 発行フロー制御の応答停滞の上限（500ms は意図的な値であり、仮置きではない）。
 // 未処理の画像がある間は新しいレコードを発行せず待ち、500ms 応答が無ければ
 // 同じレコードの再送ではなく新しいレコードを発行して詰まりを解く。
 // 古いレコードは TTL と掃除で失効させる。500ms は OSR の実測遅延（350〜500ms）の
 // 上端に合わせ、通常の paint 間隔（約 11ms・低速時約 135ms）より十分長い。
 constexpr uint64_t kPaceStallTimeoutUs = 500000u;
-// Offer 途絶で producer 終了とみなす無受信の上限の既定（5000ms は意図的な値）。
-// harness は計測終了で Offer を止めてから読取側を開いたままにし（socket.end の半閉鎖）、
-// 8 秒の猶予後に kill する。exe が受信待ちを続けると統計を出す前に殺されるため、
-// 通常時（約 90Hz で Offer が来る）では起きない 5 秒の途絶で新規受付を止めて終了する。
-// 初回 Offer 前は適用しない（起動直後の誤終了を避ける）。
-// 実行値は options.producerIdleTimeoutMs で上書きし、0 は無効（パイプ切断でのみ終了）。
 
 uint64_t NowUs() {
   return static_cast<uint64_t>(
@@ -94,51 +82,6 @@ void InvokeVk(const char* what, F&& f) {
 
 bool IsMagenta(uint8_t b, uint8_t g, uint8_t r) { return r > 200 && b > 200 && g < 80; }
 bool IsCyan(uint8_t b, uint8_t g, uint8_t r) { return g > 200 && b > 200 && r < 80; }
-
-// 検証用の提出画像ダンプ（PPM P6 保存）。blit 後の swapchain 全体を host-visible バッファ
-// から P6（RGB）に変換して保存する。4 バイト画素の並びは swapchain 形式に従う
-// （B8G8R8A8 系は B,G,R,A 順、R8G8B8A8 系は R,G,B,A 順）。提出の正しさには触らない
-// （dump-submit が空なら呼ばない。製品経路の挙動は変えない）。
-bool WriteEyePpm(const std::string& path, const uint8_t* pixels, uint32_t w, uint32_t h,
-                 vk::Format format) {
-  std::error_code ec;
-  const std::filesystem::path out(path);
-  if (out.has_parent_path()) {
-    std::filesystem::create_directories(out.parent_path(), ec);
-  }
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file) {
-    Warn("dump-submit: %s を開けない", path.c_str());
-    return false;
-  }
-  file << "P6\n" << w << " " << h << "\n255\n";
-  if (!file) {
-    Warn("dump-submit: %s のヘッダ書き込みに失敗", path.c_str());
-    return false;
-  }
-  const bool bgr = (format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb);
-  std::string row;
-  row.resize(static_cast<size_t>(w) * 3);
-  for (uint32_t y = 0; y < h; ++y) {
-    const uint8_t* src = pixels + static_cast<size_t>(y) * w * 4;
-    for (uint32_t x = 0; x < w; ++x) {
-      const uint8_t c0 = src[x * 4 + 0];
-      const uint8_t c1 = src[x * 4 + 1];
-      const uint8_t c2 = src[x * 4 + 2];
-      // BGR 系は R=c2、RGB 系は R=c0 である。
-      row[x * 3 + 0] = static_cast<char>(bgr ? c2 : c0);
-      row[x * 3 + 1] = static_cast<char>(c1);
-      row[x * 3 + 2] = static_cast<char>(bgr ? c0 : c2);
-    }
-    file.write(row.data(), static_cast<std::streamsize>(row.size()));
-    if (!file) {
-      Warn("dump-submit: %s の画素書き込みに失敗（行 %u）", path.c_str(), y);
-      return false;
-    }
-  }
-  file.close();
-  return true;
-}
 
 EyePose ToEyePose(const XrPosef& p) {
   EyePose e{};
@@ -338,16 +281,7 @@ class HoldImage {
     InvokeVk("vkCreateFence(hold)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
   }
 
-  ~HoldImage() {
-    if (imageBytes_ > 0) {
-      TrackVkImageDestroy(imageBytes_);
-      imageBytes_ = 0;
-    }
-    if (memoryBytes_ > 0) {
-      TrackVkMemoryFree(memoryBytes_);
-      memoryBytes_ = 0;
-    }
-  }
+  ~HoldImage() {}
 
   HoldImage(const HoldImage&) = delete;
   HoldImage& operator=(const HoldImage&) = delete;
@@ -459,14 +393,6 @@ class HoldImage {
     if (defined_ && w == width_ && h == height_) {
       return;
     }
-    if (imageBytes_ > 0) {
-      TrackVkImageDestroy(imageBytes_);
-      imageBytes_ = 0;
-    }
-    if (memoryBytes_ > 0) {
-      TrackVkMemoryFree(memoryBytes_);
-      memoryBytes_ = 0;
-    }
     memory_.clear();
     image_.clear();
     defined_ = false;
@@ -486,8 +412,6 @@ class HoldImage {
     info.initialLayout = vk::ImageLayout::eUndefined;
     InvokeVk("vkCreateImage(hold)", [&] { image_ = vk::raii::Image(*device_, info); });
     const vk::MemoryRequirements req = image_.getMemoryRequirements();
-    imageBytes_ = req.size;
-    TrackVkImageCreate(req.size);
     // メモリ種別の選択は自前イメージと同じ基準（deviceLocal 優先）である。
     const vk::PhysicalDeviceMemoryProperties props = physical_->getMemoryProperties();
     int32_t index = -1;
@@ -515,8 +439,6 @@ class HoldImage {
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = static_cast<uint32_t>(index);
     InvokeVk("vkAllocateMemory(hold)", [&] { memory_ = vk::raii::DeviceMemory(*device_, alloc); });
-    memoryBytes_ = alloc.allocationSize;
-    TrackVkMemoryAlloc(alloc.allocationSize);
     InvokeVk("vkBindImageMemory(hold)", [&] { image_.bindMemory(*memory_, 0); });
     width_ = w;
     height_ = h;
@@ -542,9 +464,8 @@ class HoldImage {
 // 受理画像の提出パス。acquire → blit → マーカー確認 → release を 1 眼単位で行う。
 class BlitPass {
  public:
-  BlitPass(const gfx::VulkanContext& vk, const gfx::Swapchains& swapchains,
-           const std::string& dumpDir = "")
-      : device_(&vk.device()), queue_(&vk.queue()), dumpDir_(dumpDir) {
+  BlitPass(const gfx::VulkanContext& vk, const gfx::Swapchains& swapchains)
+      : device_(&vk.device()), queue_(&vk.queue()) {
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
@@ -574,43 +495,6 @@ class BlitPass {
       }
       eyes_.push_back(std::move(res));
     }
-    format_ = swapchains.format();
-    // 検証用の提出画像ダンプ（--dump-submit が空なら確保しない。通常経路の挙動は変えない）。
-    // 各眼の実寸ぶんの host-visible バッファを一時確保し、終了時（デストラクタ）に解放する。
-    if (!dumpDir_.empty()) {
-      dumpStage_.reserve(eyes_.size());
-      dumpMem_.reserve(eyes_.size());
-      dumpSize_.assign(eyes_.size(), 0);
-      for (size_t e = 0; e < eyes_.size(); ++e) {
-        const uint64_t pixels = static_cast<uint64_t>(eyes_[e].extent.width) *
-                                static_cast<uint64_t>(eyes_[e].extent.height);
-        const vk::DeviceSize bytes = static_cast<vk::DeviceSize>(pixels * 4);
-        if (bytes == 0) {
-          continue;
-        }
-        try {
-          vk::raii::Buffer buf{nullptr};
-          vk::raii::DeviceMemory mem{nullptr};
-          AllocateHostBuffer(vk, &buf, &mem, bytes);
-          dumpStage_.push_back(std::move(buf));
-          dumpMem_.push_back(std::move(mem));
-          dumpSize_[e] = bytes;
-        } catch (const std::exception& ex) {
-          Warn("dump-submit: 眼 %u の確保に失敗したためダンプを無効化: %s",
-               static_cast<unsigned>(e), ex.what());
-          dumpDir_.clear();
-          break;
-        }
-      }
-      if (!dumpDir_.empty()) {
-        Info("dump-submit: ダンプ先 %s（各眼の実寸ぶんを一時確保した）", dumpDir_.c_str());
-      }
-    }
-  }
-
-  // ダンプが有効か（確保まで成功したか）。確保失敗時は false になる。
-  bool dumpEnabled() const {
-    return !dumpDir_.empty() && dumpStage_.size() == eyes_.size();
   }
 
   struct Result {
@@ -623,11 +507,8 @@ class BlitPass {
   // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（DESIGN §9 の未決事項。
   // M2 では左右分離と pose 対応を優先し、色の最終確認は M5 まで持ち越す）。
   // blit 後に提出画像からマーカー 1 画素だけを読む（画像全体は読まない）。
-  // dump が真のときは release 前に swapchain 全体を host-visible バッファへ写し、
-  // COLOR_ATTACHMENT_OPTIMAL に戻してから PPM 保存する（提出の正しさを壊さない）。
   // 失敗時は例外にする（呼び出し側は layerCount=0 で終える）。
-  Result Blit(uint32_t eye, vk::Image own, uint32_t ownW, uint32_t ownH, uint32_t srcHalf,
-              bool checkMarker, bool dump = false) {
+  Result Blit(uint32_t eye, vk::Image own, uint32_t ownW, uint32_t ownH, uint32_t srcHalf) {
     Result out{};
     const uint64_t t0 = NowUs();
     if (eye >= eyes_.size()) {
@@ -721,7 +602,7 @@ class BlitPass {
     if (sy >= res.extent.height) {
       sy = res.extent.height - 1;
     }
-    if (checkMarker) {
+    {
       // 提出画像から 1 画素だけ読む。コンポジタ渡しのレイアウトに戻してから終える。
       vk::ImageMemoryBarrier to_src = dst_to;
       to_src.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -754,59 +635,6 @@ class BlitPass {
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
                           to_present);
-    } else {
-      // コンポジタ渡し用に COLOR_ATTACHMENT_OPTIMAL で終える（ClearPass と同じ）。
-      vk::ImageMemoryBarrier to_present = dst_to;
-      to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-      to_present.dstAccessMask = {};
-      to_present.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-      to_present.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                          vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
-                          to_present);
-    }
-
-    // 検証用の提出画像ダンプ。blit 後・release 前に swapchain 全体を写し、
-    // 提出前に COLOR_ATTACHMENT_OPTIMAL へ戻す（提出の正しさを壊さない）。
-    // dump-submit が空の通常経路では記録しない。
-    const bool do_dump =
-        dump && dumpEnabled() && eye < dumpStage_.size() && dumpSize_[eye] != 0 &&
-        static_cast<VkBuffer>(*dumpStage_[eye]) != VK_NULL_HANDLE;
-    if (do_dump) {
-      vk::ImageMemoryBarrier to_dump_src{};
-      to_dump_src.sType = vk::StructureType::eImageMemoryBarrier;
-      to_dump_src.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-      to_dump_src.oldLayout = vk::ImageLayout::eColorAttachmentOptimal;
-      to_dump_src.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-      to_dump_src.image = dst;
-      to_dump_src.subresourceRange = range;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                          vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_dump_src);
-      vk::BufferImageCopy full{};
-      full.bufferOffset = 0;
-      full.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-      full.imageSubresource.layerCount = 1;
-      full.imageOffset = vk::Offset3D{0, 0, 0};
-      full.imageExtent =
-          vk::Extent3D{res.extent.width, res.extent.height, 1};
-      cmd.copyImageToBuffer(dst, vk::ImageLayout::eTransferSrcOptimal, *dumpStage_[eye], full);
-      vk::BufferMemoryBarrier dump_host{};
-      dump_host.sType = vk::StructureType::eBufferMemoryBarrier;
-      dump_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-      dump_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
-      dump_host.buffer = *dumpStage_[eye];
-      dump_host.offset = 0;
-      dump_host.size = dumpSize_[eye];
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                          {}, nullptr, dump_host, nullptr);
-      vk::ImageMemoryBarrier back = to_dump_src;
-      back.srcAccessMask = vk::AccessFlagBits::eTransferRead;
-      back.dstAccessMask = {};
-      back.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
-      back.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                          vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
-                          back);
     }
 
     InvokeVk("vkEndCommandBuffer(blit)", [&] { cmd.end(); });
@@ -818,7 +646,7 @@ class BlitPass {
     InvokeVk("vkQueueSubmit(blit)", [&] { queue_->submit(submit, *fence_); });
     CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(blit 完了)");
 
-    if (checkMarker) {
+    {
       void* mapped = nullptr;
       InvokeVk("vkMapMemory(blit)", [&] { mapped = stageMem_.mapMemory(0, kStageSize); });
       const uint8_t* p = static_cast<const uint8_t*>(mapped);
@@ -828,33 +656,6 @@ class BlitPass {
         Warn("左右分離検証: 眼 %u のマーカー不一致 (B=%u G=%u R=%u)", eye, p[0], p[1], p[2]);
       }
       stageMem_.unmapMemory();
-    } else {
-      out.markerOk = true;
-    }
-
-    if (do_dump) {
-      // release 前に写した全体を PPM 保存する。失敗しても提出は続ける。
-      void* dmapped = nullptr;
-      bool mapped = false;
-      try {
-        InvokeVk("vkMapMemory(blit-dump)", [&] {
-          dmapped = dumpMem_[eye].mapMemory(0, dumpSize_[eye]);
-        });
-        mapped = true;
-        const std::string name = (eye == 0) ? "eye0.ppm" : "eye1.ppm";
-        const std::string path = (std::filesystem::path(dumpDir_) / name).string();
-        const uint8_t* dpixels = static_cast<const uint8_t*>(dmapped);
-        if (WriteEyePpm(path, dpixels, res.extent.width, res.extent.height, format_)) {
-          Info("dump-submit: 眼 %u を %s に保存（%ux%u）", eye, path.c_str(),
-               static_cast<unsigned>(res.extent.width),
-               static_cast<unsigned>(res.extent.height));
-        }
-      } catch (const std::exception& ex) {
-        Warn("dump-submit: 眼 %u の保存に失敗: %s", eye, ex.what());
-      }
-      if (mapped) {
-        dumpMem_[eye].unmapMemory();
-      }
     }
 
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -862,8 +663,6 @@ class BlitPass {
     out.blitUs = NowUs() - t0;
     return out;
   }
-
-  vk::Format format() const { return format_; }
 
  private:
   struct EyeRes {
@@ -882,13 +681,6 @@ class BlitPass {
   vk::raii::Buffer stage_{nullptr};
   vk::raii::DeviceMemory stageMem_{nullptr};
   std::vector<EyeRes> eyes_;
-  vk::Format format_ = vk::Format::eUndefined;
-  // 検証用の提出画像ダンプ先と各眼の host-visible バッファ（空なら無効）。
-  // blit と同じ submit 内で写し、release 前に PPM 保存する。終了時に解放する。
-  std::string dumpDir_;
-  std::vector<vk::raii::Buffer> dumpStage_;
-  std::vector<vk::raii::DeviceMemory> dumpMem_;
-  std::vector<vk::DeviceSize> dumpSize_;
 };
 
 struct XrStats {
@@ -903,7 +695,7 @@ struct XrStats {
   uint64_t submitLayers = 0;
   uint64_t emptyFrames = 0;
   uint64_t resubmits = 0;  // 新規受理が無いフレームで hold から出し直した提出数。
-  uint64_t pacedWaits = 0;  // --pace-records で未処理待ちのため発行を見送ったフレーム数。
+  uint64_t pacedWaits = 0;  // フロー制御で未処理待ちのため発行を見送ったフレーム数。
   uint64_t verifyOk = 0;
   uint64_t verifyNg = 0;
   uint64_t firstUs = 0;
@@ -967,74 +759,18 @@ struct XrStats {
 }  // namespace
 
 int RunXrTransfer(const XrTransferOptions& options) {
-  Info("XR転送開始: pipe=%s render-scale=%.2f record-ttl=%llums submit-verify=%s space=%s pace=%s",
+  Info("XR転送開始: pipe=%s render-scale=%.2f record-ttl=%llums space=%s",
        options.pipeName.c_str(), options.renderScale,
-       static_cast<unsigned long long>(options.recordTtlMs),
-       options.submitVerify ? "on" : "off", options.space.c_str(),
-       options.paceRecords ? "on" : "off");
-  if (options.resubmit) {
-    if (options.resubmitMaxAgeMs == 0) {
-      Info("再提出 on（新規受理が無いフレームは最終受理を同じ pose/FOV で出す。年齢無制限）");
-    } else {
-      Info("再提出 on（新規受理が無いフレームは最終受理を同じ pose/FOV で出す。上限 %llums）",
-           static_cast<unsigned long long>(options.resubmitMaxAgeMs));
-    }
-  } else {
-    Info("再提出 off（--no-resubmit。旧挙動の空フレーム比較用）");
-  }
-  // ADR: Offer 途絶の終了判定は実行値で決める。0 は app 経由の通常運用（静止ページで
-  // paint が止まっても終了しない）のため無効とし、既定 5000 はハーネス向けに保つ。
-  const uint64_t idleTimeoutUs = options.producerIdleTimeoutMs <= 0
-                                     ? 0u
-                                     : static_cast<uint64_t>(options.producerIdleTimeoutMs) * 1000u;
-  if (idleTimeoutUs == 0u) {
-    Info("producer idle タイムアウト無効（--producer-idle-timeout-ms=0。パイプ切断でのみ終了）");
-  } else {
-    Info("producer idle タイムアウト %dms（途絶で producer 終了とみなす）",
-         options.producerIdleTimeoutMs);
-  }
-  if (options.injectStaleRecord > 0) {
-    Info("検証フック有効: --inject-stale-record=%d（そのフレームの要求に旧 pose 混入の合図）",
-         options.injectStaleRecord);
-  }
-  if (options.injectSessionRestartMs > 0) {
-    Info("検証フック有効: --inject-session-restart=%d（起動からその ms 後に意図的にセッションを"
-         "破棄・再生成する）",
-         options.injectSessionRestartMs);
-  }
-  if (options.injectSpaceChangeMs > 0) {
-    Info("検証フック有効: --inject-space-change=%d（起動からその ms 後に模擬の space 変更を"
-         "1 回適用する。実イベントではない）",
-         options.injectSpaceChangeMs);
-  }
-  if (!options.dumpSubmitDir.empty()) {
-    Info("検証フック有効: --dump-submit=%s --dump-frame=%d（その回目の提出時に両眼を PPM 保存）",
-         options.dumpSubmitDir.c_str(), options.dumpFrame);
-  }
-  // 終了段階ログ（--dump-exit-stage / XRIFT_EXIT_STAGE）。破棄順の切り分け用。
-  // 既定 off。通常経路の出力は変えない。Info は行ごとに flush するため、
-  // 異常終了時も最後に出た段階まで残る。
-  // 環境変数の有無は GetEnvironmentVariableA で見る（getenv の警告を避ける）。
-  bool stage_log = options.dumpExitStage;
-  if (!stage_log) {
-    stage_log = ::GetEnvironmentVariableA("XRIFT_EXIT_STAGE", nullptr, 0) != 0;
-  }
-  auto stage = [&](const char* what) {
-    if (stage_log) {
-      Info("終了段階: %s", what);
-    }
-  };
-  if (stage_log) {
-    Info("終了段階ログ有効（--dump-exit-stage / XRIFT_EXIT_STAGE）");
-  }
+       static_cast<unsigned long long>(options.recordTtlMs), options.space.c_str());
+  Info("再提出 on（新規受理が無いフレームは最終受理を同じ pose/FOV で出す。年齢無制限）");
+  Info("レコード発行はフロー制御つき（未処理がある間は発行を待ち、500ms 停滞で新しい分を発行）");
   // ADR: 終了時の非決定的クラッシュ（実測: 統計出力後の残り破棄で 0xC0000005・
   // 0xC0000409）は、明示 teardown 後に残る RAII・静的デストラクタのいずれかで
   // 起きる。必要な後始末（セッション終了・パイプ・統計 flush）は統計出力時点で
-  // 済んでいるため、以後は破棄を走らせず即時終了する（既定 on）。
+  // 済んでいるため、以後は破棄を走らせず即時終了する。
   // Info/Error は行ごとに flush するが、_Exit 前に念のため両方を flush する。
-  // --no-quick-exit では従来の RAII 破棄を残す（切り分け用）。
   auto quick_exit = [&](int code) {
-    Info("終了: 残りの破棄を省略して終了する（--no-quick-exit で旧経路）");
+    Info("終了: 残りの破棄を省略して終了する");
     std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(code);
@@ -1043,10 +779,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 転送セッションを先に作る。同一 VkDevice を XR セッションと共有し、
   // 自前イメージから swapchain への blit を同一デバイス内で行う。
   // 別デバイスにするとデバイス間コピーが要るため、この順序を変えないこと。
-  TransferSession::Options transfer_opts{};
-  transfer_opts.verify = false;    // M1 の部分検証は行わない。M2 の照合で行う。
-  transfer_opts.gpuCheck = false;  // M1b の全画面検査は行わない。制御メタのみ読む。
-  TransferSession transfer(transfer_opts);
+  TransferSession transfer;
   xr::SpacePreference space_pref = xr::SpacePreference::Auto;
   try {
     space_pref = xr::ParseSpacePreference(options.space);
@@ -1054,17 +787,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
     Error("%s", e.what());
     return 1;
   }
-  if (options.injectSessionRestartMs < 0) {
-    Error("--inject-session-restart は 0 以上であること");
-    return 1;
-  }
-  if (options.injectSpaceChangeMs < 0) {
-    Error("--inject-space-change は 0 以上であること");
-    return 1;
-  }
-
   // セッション束（セッション・参照空間・swapchain・blit・入力空間）。
-  // LOSS_PENDING や --inject-session-restart ではこの束だけを破棄・再生成する。
+  // LOSS_PENDING ではこの束だけを破棄・再生成する。
   // TransferSession（instance・Vulkan device）・M2BlockReader・PipeClient は保つ。
   // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（DESIGN §6・§10）。
   std::unique_ptr<xr::Session> session;
@@ -1080,11 +804,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } catch (const std::exception& e) {
     Error("XR セッションの生成に失敗: %s", e.what());
     // 生成失敗時も統計（空）とメッセージは残す。以後の RAII 破棄は
-    // quick-exit で飛ばす（終了時クラッシュの回避。正常経路と同一の出口）。
+    // 飛ばす（終了時クラッシュの回避。正常経路と同一の出口）。
     stats.Print(ledger.stats(), input.stats());
-    if (options.quickExit) {
-      quick_exit(1);
-    }
+    quick_exit(1);
     return 1;
   }
   try {
@@ -1092,9 +814,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } catch (const std::exception& e) {
     Error("入力アクションの生成に失敗: %s", e.what());
     stats.Print(ledger.stats(), input.stats());
-    if (options.quickExit) {
-      quick_exit(1);
-    }
+    quick_exit(1);
     return 1;
   }
   if (!input.AttachSpaces(session->handle())) {
@@ -1107,9 +827,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } catch (const std::exception& e) {
     Error("swapchain の生成に失敗: %s", e.what());
     stats.Print(ledger.stats(), input.stats());
-    if (options.quickExit) {
-      quick_exit(1);
-    }
+    quick_exit(1);
     return 1;
   }
   if (swapchains->format() != vk::Format::eB8G8R8A8Unorm) {
@@ -1118,7 +836,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } else {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
-  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
+  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
   M2BlockReader reader(transfer.Vulkan());
   HoldImage hold(transfer.Vulkan());
   // 接続失敗は例外で返る。統計とメッセージを残してから投げ直す
@@ -1160,11 +878,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
   uint64_t mismatchLogCount = 0;
   // 再提出ログの前回出力時刻。毎フレーム出すと膨大になるため 1 秒に抑える。
   uint64_t lastResubmitLogUs = 0;
-  // 検証用の提出画像ダンプの状態。N 回目の提出（両眼 blit 成功で 1）に 1 回だけ保存する。
-  // セッション再生成で blit が作り直されても提出回数は保つ（回数は提出基準である）。
-  uint64_t submits = 0;
-  bool dumpDone = false;
-
   bool session_running = false;
   bool quit = false;
   // M4: セッション再生成の状態。LOSS_PENDING で束を破棄し、1 秒周期で再生成を試みる。
@@ -1175,18 +888,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
   uint64_t last_rebuild_try_us = 0;
   // REFERENCE_SPACE_CHANGE_PENDING の受付。適用はフレーム側で行う。
   bool pending_space_change = false;
-  // --inject-space-change の発火済み合図（1 回だけ送る）と模擬の区別。
-  // 模擬もランタイム由来と同じ適用経路（空間作り直し・spaceEpoch 更新・旧レコード失効）を
-  // 通すが、実イベントではないことをログに明記し、統計の space変更には計上する。
-  bool space_change_injected = false;
-  bool pending_space_injected = false;
   // locate 確認に使う予測表示時刻（直近の xrWaitFrame の値）。
   // 時刻 0 を渡すと受け付けないランタイムがある（実測: SteamVR は
   // XR_ERROR_TIME_INVALID）ため、running 中のフレーム時刻を使う。
   XrTime last_display_time = 0;
-  // --inject-session-restart の発火済み合図（1 回だけ送る）。
-  bool restart_injected = false;
-  const uint64_t start_us = NowUs();
   // M4 の毎秒入力ログの前回出力時刻。0 は未出力である。
   uint64_t last_input_log_us = 0;
   // M4計測: 押下エッジ用の前フレームと 1 秒ラッチ（左右のボタン bit）。
@@ -1222,20 +927,16 @@ int RunXrTransfer(const XrTransferOptions& options) {
     pipeAlive = false;
     quit = true;
   };
-  // 最後に Offer（有効・無効を問わず何らかの受信）があった時刻。初回受信前は idle 判定を
-  // 行わない（起動直後の誤終了を避ける）。
-  bool haveOfferEver = false;
-  uint64_t lastOfferUs = NowUs();
   uint64_t frame_no = 0;
   uint64_t droppedIntermediate = 0;
-  // --pace-records の未処理レコードの有無と発行時刻。on のとき前回発行分の
-  // Offer 処理が済むまで新規発行を止め、500ms 停滞したら新しい分で解く。
+  // 発行フロー制御の未処理レコードの有無。前回発行分の Offer 処理が済むまで
+  // 新規発行を止め、500ms 停滞したら新しい分で解く。
   bool paceOutstanding = false;
   uint64_t paceIssuedUs = 0;
   const uint64_t deadlineUs =
       options.seconds > 0 ? NowUs() + static_cast<uint64_t>(options.seconds) * 1000000u : 0;
 
-  // セッション束の破棄・再生成。LOSS_PENDING と --inject-session-restart で使う。
+  // セッション束の破棄・再生成。LOSS_PENDING で使う。
   // 成功時は新しい connEpoch で ledger を切り替え、旧世代のレコードを失効させる。
   // 入力空間・swapchain・blit は作り直し、instance・device・reader・pipe は保つ。
   // 失敗時は false を返す（呼び出し側は再試行か安全な終了を選ぶ）。
@@ -1272,7 +973,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
                                                      session->handle(), session->views(),
                                                      gfx::M2PreferredSwapchainFormats());
-      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
+      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
     } catch (const std::exception& e) {
       Warn("再生成後の swapchain 生成に失敗（%s）: %s", why, e.what());
       session.reset();
@@ -1287,7 +988,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
 
   // REFERENCE_SPACE_CHANGE_PENDING の適用。新しい原点で locate できることを確認してから
   // spaceEpoch を進め、旧世代のレコードを失効させる（DESIGN §10）。
-  // --inject-space-change の模擬もこの経路を通す（別経路は作らない）。
   auto apply_pending_space = [&]() {
     if (!pending_space_change || !session) {
       return;
@@ -1298,18 +998,11 @@ int RunXrTransfer(const XrTransferOptions& options) {
       hold.Invalidate();
       holdHasRecord = false;
       ++stats.spaceChanges;
-      if (pending_space_injected) {
-        Info("模擬 space 変更を適用（実イベントではない。--inject-space-change。"
-             "spaceEpoch=%u。旧レコードを失効）",
-             ledger.spaceEpoch());
-      } else {
-        Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
-      }
+      Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
     } else {
       Warn("reference space 変更の適用に失敗したため旧空間・旧世代を保つ");
     }
     pending_space_change = false;
-    pending_space_injected = false;
   };
 
   auto poll_events = [&]() {
@@ -1389,8 +1082,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 中間画像の受理は行わない（最新優先の方針。破棄数は統計に出る）。
   // shouldRender が false のフレーム（SYNCHRONIZED 等）でも毎フレーム呼ぶこと。
   // 受信・ACK は描画可否と無関係に進め、止めるのは提出だけである。
-  // M4: 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにし、
-  // producer 生存の証拠（haveOfferEver）には数えない。
+  // M4: 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにする。
   auto drain_offers = [&]() {
     TransferMessage msg{};
     bool have_last = false;
@@ -1459,17 +1151,12 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         continue;
       }
-      // 何らかの受信があれば producer は生存している（有効・無効を問わない）。
-      haveOfferEver = true;
-      lastOfferUs = NowUs();
       if (!IsValidOffer(msg)) {
         Warn("不正な Offer を破棄（magic/version/type/format の不一致）");
         continue;
       }
       ++stats.offers;
-      TransferSession::Timings timings{};
-      const uint32_t status =
-          transfer.ProcessOffer(msg.handle, msg.width, msg.height, &timings, nullptr);
+      const uint32_t status = transfer.ProcessOffer(msg.handle, msg.width, msg.height);
       if (status == kStatusNoAck) {
         Error("GPU 完了未確認のため受付を停止して終了する（borrow への ACK なし）");
         pipeAlive = false;
@@ -1559,27 +1246,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
     if (quit) {
       break;
     }
-    // M4: --inject-session-restart の発火（1 回だけ。復帰経路の検証用）。
-    // ランタイムが受け付ける範囲で束を破棄・再生成し、成功/失敗を統計に残す。
-    if (!restart_injected && options.injectSessionRestartMs > 0 && session &&
-        NowUs() - start_us >= static_cast<uint64_t>(options.injectSessionRestartMs) * 1000u) {
-      restart_injected = true;
-      if (!rebuild_session("--inject-session-restart")) {
-        needs_rebuild = true;
-        rebuild_attempts_left = kRebuildMaxAttempts;
-        last_rebuild_try_us = NowUs();
-      }
-    }
-    // M4計測: --inject-space-change の発火（1 回だけ。適用は apply_pending_space の
-    // 実イベントと同じ経路を通す。実イベントではないことは受付・適用の両方で明記する）。
-    if (!space_change_injected && options.injectSpaceChangeMs > 0 && session &&
-        NowUs() - start_us >= static_cast<uint64_t>(options.injectSpaceChangeMs) * 1000u) {
-      space_change_injected = true;
-      pending_space_change = true;
-      pending_space_injected = true;
-      Info("検証フック --inject-space-change: 模擬の space 変更要求（実イベントではない。"
-           "次フレームで適用を試みる）");
-    }
     // M4: loss 後の再生成の再試行（1 秒周期）。上限を超えたらランタイム未復帰として
     // 安全に終了する（統計出力。非ゼロにはしない。こちらの破損ではないため）。
     if (needs_rebuild && !session && rebuild_attempts_left > 0 &&
@@ -1599,8 +1265,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
     if (!session_running || !session) {
       // 実行中でない間も Offer の受付・ACK と切断検知は進める。受信した Offer は
       // drain_offers が Done を返すため、消費して返せなくなることはない。
-      // 以前はここで切断を見ず --seconds か kill 待ちでぶら下がったため、
-      // harness 先死で統計を出さずに殺されていた（DESIGN §6③の違反）。
       const uint64_t offersBeforeIdle = stats.offers;
       drain_offers();
       if (stats.offers != offersBeforeIdle) {
@@ -1608,11 +1272,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
       }
       ledger.SweepExpired(NowUs());
       if (quit) {
-        break;
-      }
-      if (haveOfferEver && idleTimeoutUs != 0u && NowUs() - lastOfferUs > idleTimeoutUs) {
-        Info("Offer が %dms 途絶えたため producer 終了とみなして統計を出して終了する",
-             options.producerIdleTimeoutMs);
         break;
       }
       // 実行中でない間は眠らせ、ビジーループにしない。
@@ -1667,15 +1326,14 @@ int RunXrTransfer(const XrTransferOptions& options) {
         const EyePose right = ToEyePose(views[1].pose);
         const EyeFov lf = ToEyeFov(views[0].fov);
         const EyeFov rf = ToEyeFov(views[1].fov);
-        // --pace-records: 未処理の画像がある間は新しいレコードを発行しない
+        // 発行フロー制御: 未処理の画像がある間は新しいレコードを発行しない
         // （RenderRequest を送らない）。Offer 処理後の次のフレームで発行する。
         // 応答が無いまま 500ms 経過したら同じレコードの再送ではなく新しい
         // レコードを発行して詰まらないようにする（古い分は失効させる）。
-        // off のときは従来どおり毎フレーム発行する。
         bool issue_record = true;
-        if (options.paceRecords && paceOutstanding) {
+        if (paceOutstanding) {
           if (NowUs() - paceIssuedUs > kPaceStallTimeoutUs) {
-            Info("pace: 応答が %llums 無いため新しいレコードを発行する（旧分は失効させる）",
+            Info("応答が %llums 無いため新しいレコードを発行する（旧分は失効させる）",
                  static_cast<unsigned long long>(kPaceStallTimeoutUs / 1000u));
             paceOutstanding = false;
           } else {
@@ -1690,10 +1348,6 @@ int RunXrTransfer(const XrTransferOptions& options) {
           TransferMessage req = MakeRenderRequest(rec.renderId, rec.connEpoch, rec.spaceEpoch,
                                                   rec.left, rec.right, rec.leftFov, rec.rightFov,
                                                   req_w, req_h);
-          if (options.injectStaleRecord > 0 &&
-              frame_no == static_cast<uint64_t>(options.injectStaleRecord)) {
-            req.reserved[0] = kStaleMarker;
-          }
           try {
             pipe.Send(req);
             ++stats.requests;
@@ -1701,10 +1355,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
             note_send_failure("RenderRequest", e);
           }
           rendered = true;
-          if (options.paceRecords) {
-            paceOutstanding = true;
-            paceIssuedUs = NowUs();
-          }
+          paceOutstanding = true;
+          paceIssuedUs = NowUs();
         }
       }
     }
@@ -1717,20 +1369,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
     drain_offers();
     if (stats.offers != offersBefore) {
       // Offer を処理（受理/棄却/中間破棄）し終えたため、次のフレームで
-      // 新しいレコードを発行できる（--pace-records の待ちの解除）。
+      // 新しいレコードを発行できる（フロー制御の待ちの解除）。
       paceOutstanding = false;
     }
     ledger.SweepExpired(NowUs());
-    // harness が Offer を止めたまま読取側を開き続けると（半閉鎖）、切断は返らず
-    // 空フレームが続く。一定時間の途絶は producer 終了とみなして統計を出して終了し、
-    // kill による統計消失を避ける。切断検知時と同様、現在のフレームは安全に終える。
-    if (pipeAlive && !quit && haveOfferEver && idleTimeoutUs != 0u &&
-        NowUs() - lastOfferUs > idleTimeoutUs) {
-      Info("Offer が %dms 途絶えたため producer 終了とみなして統計を出して終了する",
-           options.producerIdleTimeoutMs);
-      pipeAlive = false;
-      quit = true;
-    }
     // M4: 入力の取得と main への送信。FOCUSED 時に sync し、それ以外は inactive の
     // スナップショットとして出す（「0」と「未対応」を区別できる形。毎フレーム送信し、
     // ログは毎秒に抑える）。脱着時は focus を失うため提出だけ止め、受信・送信は続ける。
@@ -1782,33 +1424,19 @@ int RunXrTransfer(const XrTransferOptions& options) {
     // record の pose/FOV を提出層に載せる。新規受理と再提出で共用する。
     // 失敗時は例外にする（呼び出し側は空フレームで終える）。
     auto submit_image = [&](vk::Image src, uint32_t srcW, uint32_t srcH,
-                            const RenderRecord& rec, bool allow_dump) {
-      // 検証用の提出画像ダンプ。N 回目の提出時に blit 後・release 前の両眼を写す。
-      // 1 回だけ。提出の正しさは変えない（ダンプ後に COLOR_ATTACHMENT に戻す）。
-      // 再提出では保存しない（回数は新規受理の提出基準に保つ）。
-      const bool do_dump = allow_dump && !options.dumpSubmitDir.empty() && !dumpDone && blit &&
-                           blit->dumpEnabled() &&
-                           submits + 1 == static_cast<uint64_t>(options.dumpFrame);
-      const BlitPass::Result r0 =
-          blit->Blit(0, src, srcW, srcH, 0, options.submitVerify, do_dump);
-      const BlitPass::Result r1 =
-          blit->Blit(1, src, srcW, srcH, 1, options.submitVerify, do_dump);
-      if (do_dump) {
-        dumpDone = true;
-        Info("dump-submit: %llu 回目の提出を保存した", static_cast<unsigned long long>(submits + 1));
-      }
+                            const RenderRecord& rec) {
+      const BlitPass::Result r0 = blit->Blit(0, src, srcW, srcH, 0);
+      const BlitPass::Result r1 = blit->Blit(1, src, srcW, srcH, 1);
       const uint64_t blit_us = r0.blitUs + r1.blitUs;
       ++stats.blits;
       stats.blitUsTotal += blit_us;
       if (blit_us > stats.blitUsMax) {
         stats.blitUsMax = blit_us;
       }
-      if (options.submitVerify) {
-        if (r0.markerOk && r1.markerOk) {
-          ++stats.verifyOk;
-        } else {
-          ++stats.verifyNg;
-        }
+      if (r0.markerOk && r1.markerOk) {
+        ++stats.verifyOk;
+      } else {
+        ++stats.verifyNg;
       }
       for (uint32_t eye = 0; eye < 2; ++eye) {
         const EyePose& p = (eye == 0) ? rec.left : rec.right;
@@ -1834,9 +1462,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
       }
     };
     // 新規受理があれば hold へ GPU 複製してから提出する。TTL 超の受理でも複製は残す
-    // （再提出は黒より古い絵を優先するため。上限は --resubmit-max-age-ms で別に付ける）。
-    // --no-resubmit では複製自体を行わない（比較用の旧挙動に余計な GPU 負荷を載せない）。
-    if (hasFresh && options.resubmit) {
+    // （再提出は黒より古い絵を優先するため、年齢の上限は付けない）。
+    if (hasFresh) {
       try {
         hold.SaveFrom(transfer.OwnImage(), freshW, freshH);
         holdRecord = freshRecord;
@@ -1852,12 +1479,11 @@ int RunXrTransfer(const XrTransferOptions& options) {
       const uint64_t age = NowUs() - freshRecord.issuedUs;
       if (age <= ledger.maxAgeUs()) {
         try {
-          submit_image(transfer.OwnImage(), freshW, freshH, freshRecord, true);
+          submit_image(transfer.OwnImage(), freshW, freshH, freshRecord);
           Info("M2 提出: renderId=%llu 年齢=%lluus（画像対応レコードの pose/FOV）",
                static_cast<unsigned long long>(freshRecord.renderId),
                static_cast<unsigned long long>(age));
           submit_layer = true;
-          ++submits;
           hasFresh = false;
         } catch (const std::exception& e) {
           Warn("blit に失敗したため空フレームで終える: %s", e.what());
@@ -1870,27 +1496,22 @@ int RunXrTransfer(const XrTransferOptions& options) {
     // 再提出。新規受理が無い・使えないフレームでも最後の受理を同じ pose/FOV で出し直す。
     // 新規 blit の失敗直後は出さない（同じ原因で落ちる重複を避ける）。
     // shouldRender が偽のフレームでも層を出す。最初の 1 枚が来る前だけ空にする。
-    if (!submit_layer && !fresh_failed && options.resubmit && blit && hold.Valid() &&
-        holdHasRecord) {
+    if (!submit_layer && !fresh_failed && blit && hold.Valid() && holdHasRecord) {
       const uint64_t age = NowUs() - holdRecord.issuedUs;
-      const bool too_old =
-          options.resubmitMaxAgeMs > 0 && age > options.resubmitMaxAgeMs * 1000u;
-      if (!too_old) {
-        try {
-          submit_image(hold.image(), hold.width(), hold.height(), holdRecord, false);
-          ++stats.resubmits;
-          const uint64_t now = NowUs();
-          if (stats.resubmits <= 3 || now - lastResubmitLogUs >= 1000000u) {
-            lastResubmitLogUs = now;
-            Info("M2 再提出: renderId=%llu 年齢=%lluus（最終受理の pose/FOV のまま）",
-                 static_cast<unsigned long long>(holdRecord.renderId),
-                 static_cast<unsigned long long>(age));
-          }
-          submit_layer = true;
-          is_resubmit = true;
-        } catch (const std::exception& e) {
-          Warn("再提出の blit に失敗したため空フレームで終える: %s", e.what());
+      try {
+        submit_image(hold.image(), hold.width(), hold.height(), holdRecord);
+        ++stats.resubmits;
+        const uint64_t now = NowUs();
+        if (stats.resubmits <= 3 || now - lastResubmitLogUs >= 1000000u) {
+          lastResubmitLogUs = now;
+          Info("M2 再提出: renderId=%llu 年齢=%lluus（最終受理の pose/FOV のまま）",
+               static_cast<unsigned long long>(holdRecord.renderId),
+               static_cast<unsigned long long>(age));
         }
+        submit_layer = true;
+        is_resubmit = true;
+      } catch (const std::exception& e) {
+        Warn("再提出の blit に失敗したため空フレームで終える: %s", e.what());
       }
     }
     if (submit_layer) {
@@ -1916,34 +1537,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
   Info("M2 中間破棄: %llu（最新優先のため Done のみ返した件数）",
        static_cast<unsigned long long>(droppedIntermediate));
   if (stats.submitLayers == 0 && stats.resubmits == 0) {
-    Warn("提出層 0 のまま終了した（受理画像が無い。harness 側の描画を確認すること）");
-  }
-  if (!options.dumpSubmitDir.empty() && !dumpDone) {
-    Warn("dump-submit: %d 回目の提出に届かず保存しなかった（提出 %llu 回）",
-         options.dumpFrame, static_cast<unsigned long long>(submits));
+    Warn("提出層 0 のまま終了した（受理画像が無い。ページ側の描画を確認すること）");
   }
   if (!pipeAlive) {
     Info("パイプ終了に伴う終了（exit=%d）", exitCode);
   }
   // セッション束は明示の順序で破棄する（blit → swapchain → session）。
-  // 宣言順の逆順 RAII でも同じ順序になるが、段階ログと合わせて順序を固定する。
   // なお実行中のまま xrDestroySession しても SteamVR は受け付けることを確認済み
   // （終了時 exit 0）。STOPPING 未満での xrEndSession は NOT_STOPPING で失敗する
   // ため、ここであえて End は呼ばない（イベント経路の End に任せる）。
-  stage("セッション束の破棄を開始する");
-  stage("blit を破棄する");
   blit.reset();
-  stage("swapchain を破棄する");
   swapchains.reset();
-  stage("セッションを破棄する");
   session.reset();
-  stage("セッション束の破棄完了（残りは RAII 破棄）");
   // 残りの RAII（TransferSession・reader・pipe 等）と静的デストラクタは
-  // 走らせずに終了する（既定 on。終了時クラッシュの回避）。
-  // --no-quick-exit では旧来どおり return し、RAII 破棄を行う（切り分け用）。
-  if (options.quickExit) {
-    quick_exit(exitCode);
-  }
+  // 走らせずに終了する（終了時クラッシュの回避）。
+  quick_exit(exitCode);
   return exitCode;
 }
 

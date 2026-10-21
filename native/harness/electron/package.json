@@ -1,7 +1,0 @@
-{
-  "name": "xrift-m1-harness",
-  "version": "0.1.0",
-  "private": true,
-  "description": "M1 検証ハーネス（Electron 側の借用台帳とパイプサーバ）",
-  "main": "main.js"
-}

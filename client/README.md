@@ -2,8 +2,6 @@
 
 M5 の最初のスライス。exe 主導の描画要求（`RenderRequest`）を OSR で描き、
 共有テクスチャで exe へ返す。ページには WebXR シム経由で three.js を動かす。
-検証用ハーネス（`native/harness/electron/main.js`）の借用台帳・パイプサーバ・
-終了経路を TypeScript に整理して流用している。
 
 ## 構成と責務
 
@@ -12,10 +10,9 @@ M5 の最初のスライス。exe 主導の描画要求（`RenderRequest`）を 
 | `src/main.ts` | パイプサーバ + 借用台帳 + `release()` 専任。exe を spawn し、paint を Offer、Done で返却。`RenderRequest`/`InputState` を renderer へ中継し、renderer からの haptics IPC を exe へ送る。提出には関与しない |
 | `src/protocol.ts` | パイプ配置の読み取り専用の写し（正本は `native/src/transfer/protocol.h`）。`RenderRequest`/`InputState` の復号、`Offer`/`HapticCommand` の生成 |
 | `src/preload.ts` | `contextBridge` で `window.__xriftXR`（`onRecord`/`onInput`/`haptic`/`probe`）だけを公開し、`executeInMainWorld` でシムを注入する。Node の機能は渡さない |
-| `src/m2codec.ts` | M2 制御ブロックのコーデック（正本は C++ の `render_record.h`・`m2_blocks.h`。harness の `m2-codec.js` の移植）。量子化・pose タグ・ブロック符号化。`test/m2codec.test.cjs` で C++ との一致を確認する |
+| `src/m2codec.ts` | M2 制御ブロックのコーデック（正本は C++ の `render_record.h`・`m2_blocks.h`）。量子化・pose タグ・ブロック符号化。`tools/test/client/m2codec.test.cjs` で C++ との一致を確認する |
 | `src/shim.ts` | WebXR シム。移植元は `electron/webxr-mainworld.cjs`（API 形状・数学・イベントロジックは同一）。旧ブリッジ `B` を新ブリッジに置換。`present` は無い（OSR の paint が提出を駆動する）。M2 制御ブロック（renderId/pose タグ・左右マーカー）はページの描画コールバックを呼び終えた後に overlay canvas へ描く（painted 画像の内容とタグが同一 record に対応する）。ページが rAF を呼ばなかった record では更新しない |
-| `pages/test.html` | three.js のテストページ（グリッド + 色キューブ + テキスト板 + 左右識別板 + 入力 HUD）。読み込み後に自動で `immersive-vr` セッションを開始する。HUD には `input sources: N`・左右の接続（`__m5input`）・直近の入力イベント（`select L`・`squeeze R` 等）を出し、`select` では `hapticActuators[0].pulse(0.8, 120)` を打つ |
-| `pages/slow.html` | paint 約 7fps 相当の遅いページ（検証専用）。`test.html` と同一シーンだが 1 フレームに約 150ms かけ、本番サイトの重い描画を再現する。`--pace-records` の on/off での受理率比較用 |
+| `tools/pages/xr-smoke.html` | three.js のテストページ（グリッド + 色キューブ + テキスト板 + 左右識別板 + 入力 HUD）。読み込み後に自動で `immersive-vr` セッションを開始する。HUD には `input sources: N`・左右の接続（`__m5input`）・直近の入力イベント（`select L`・`squeeze R` 等）を出し、`select` では `hapticActuators[0].pulse(0.8, 120)` を打つ |
 | `logs/` | 実行証拠（`m5-run.log`、`m5-stats.json`、capture PNG）。生成物でありコミットしない |
 
 ## 前提
@@ -33,7 +30,7 @@ npx tsc -p client             # ビルド（client/dist へ）
 npx electron client           # 起動（既定で https://app.xrift.net/ を開く。Ctrl+C で終了）
 
 # 開発・検証では URL を明示する
-npx electron client --url=pages/test.html --seconds=20 --capture-at=15000,m5-cap.png
+npx electron client --url=<絶対パス>/tools/pages/xr-smoke.html --seconds=20
 
 # 引数（いずれも任意）
 #   --exe=<path>           xrift_new.exe（既定は native のビルド物）
@@ -47,21 +44,15 @@ npx electron client --url=pages/test.html --seconds=20 --capture-at=15000,m5-cap
 #   --space=<auto|local|stage|local-floor>  exe の参照空間の要求（既定 auto）
 #   --seconds=N            N 秒で自動停止（既定 0=手動終了）
 #   --width=W --height=H   OSR ウィンドウ寸法（既定 2048x1024）
-#   --page=<file>          pages/ 以下の HTML（`--url` があればそちらが優先）
 #   --url=<url>            開く対象（正典）。`https://…`/`file://…` は URL として開き、
-#                          それ以外（`pages/test.html`・`test.html` 等）は pages 配下の
-#                          ファイルとして開く。既定は `https://app.xrift.net/`。
-#                          開発・検証では `--url=pages/test.html` を明示すること。
-#                          例: `--url=pages/test.html`、`--url=https://app.xrift.net/`
-#   --capture-at=Ms,path[;Ms,path]  指定時刻に capturePage で PNG 保存（描画経路に入れない）
-#   --control-capture-at=Ms,path[;Ms,path]  同上（コントロール窓の capture。ミラー証拠用）
+#                          それ以外（`xr-smoke.html` 等）は検証ページとして開く。
+#                          既定は `https://app.xrift.net/`。
+#                          開発・検証では `--url=<絶対パス>/tools/pages/xr-smoke.html` を明示すること。
+#                          例: `--url=<絶対パス>/tools/pages/xr-smoke.html`、`--url=https://app.xrift.net/`
 #   --mirror-fps=N       ミラーの目標 fps（既定 10。VR 中は --mirror-vr-fps）
 #   --mirror-vr-fps=N    VR 中のミラー fps（既定 2。VR の負荷を優先）
 #   --control-width=W --control-height=H  コントロール窓の寸法（既定 960x600）
-#   --no-exe             exe の spawn・パイプを飛ばす（ミラー・入力転送のみ。HMD 不要の確認用）
-#   --no-pace-records    検証専用。exe への --pace-records を渡さず従来どおり毎フレーム発行
-#                        （pages/slow.html での受理率の on/off 比較用。通常運用では付けない）
-#   --self-test          mirror-test.html でミラー・入力・VR リサイズ・停止を自動検証し終了
+#   --self-test          tools/pages/mirror-input.html でミラー・入力・VR リサイズ・停止を自動検証し終了
 #   --exe-log=<path>       exe の stdout/stderr の保存先（既定 m5-exe.log。logs/ 基準。空で保存しない）
 ```
 
@@ -86,14 +77,14 @@ root の `package.json` にもある（`pnpm build`、`pnpm start`）。
 転送直前に OSR の `webContents.focus()` を呼ぶ）。
 
 ```powershell
-npx electron client --no-exe --url=pages/mirror-test.html   # 目視確認（ミラー窓から操作可）
+npx electron client --url=<絶対パス>/tools/pages/mirror-input.html --seconds=15   # 目視確認（ミラー窓から操作可）
 npx electron client --self-test                             # 自動検証（HMD 不要。終了 0 が期待値）
 ```
 
-- `pages/mirror-test.html`: 検証用ページ（ボタン押下で回数・背景が変わる＋入力欄＋RGB 板）。
+- `tools/pages/mirror-input.html`: 検証用ページ（ボタン押下で回数・背景が変わる＋入力欄＋RGB 板）。
 - `pages/mirror-map.js`: レターボックス往復の正本（renderer と試験で共有）。
 - `src/mirror-input.ts` / `src/control-preload.ts`: 入力境界・コントロール用ブリッジ。
-- `test/mirror-map.test.cjs` / `test/mirror-input.test.cjs`: 単体試験（`npm test` に組込済み）。
+- `tools/test/client/mirror-map.test.cjs` / `tools/test/client/mirror-input.test.cjs`: 単体試験（`npm test` に組込済み）。
 - 実測（RTX 3090 級・1280x800 級）: `capturePage` 平均 約20ms・最大 約27ms。
   10fps 周期（100ms）に対する余裕は十分。VR 中は 2fps のため 1 枚あたりの
   余裕はさらに大きい。`logs/mirror.png`（通常）・`logs/mirror-vr.png`（VR サイズ時）・
@@ -108,7 +99,7 @@ npx electron client --self-test                             # 自動検証（HMD
    並行実行すると互いの証拠（`logs/m5-run.log`、`logs/m5-stats.json`）を
    上書きし合い、セッションも壊れる）。
 2. SteamVR を起動し、HMD を装着する（PICO Connect 等のストリーミングも可）。
-3. `npx electron client --capture-at=15000,m5-cap.png` で起動する。
+3. `npx electron client --seconds=20` で起動する。
 4. `logs/m5-run.log` に `exe がパイプに接続` と renderer の
    `[XRift M5] session started, layer <W> x <H>` が出ることを確認する。
 5. HMD 内に three.js のシーン（グリッド・色キューブ・`XRift M5 test` の文字・
@@ -138,7 +129,7 @@ npx electron client --self-test                             # 自動検証（HMD
 - 共有テクスチャの向き: 上記の drawing buffer 画素は正しいのに exe の復号が
   `id16=0x0000` だったため、OSR 共有テクスチャは bottom-up のまま渡される
   （compositor が表示時に反転する）と判断。テストページはブロック・
-  マーカーを上下対称に刻む（`pages/test.html` の ADR を参照）。
+  マーカーを上下対称に刻む（`tools/pages/xr-smoke.html` の ADR を参照）。
   この対応後の `受理=1` は未確認（並行実行の干渉で取り直しが必要）。
 - exe の警告（既知・未決）: `swapchain は VK_FORMAT_B8G8R8A8_SRGB` で
   受理画像と不一致の可能性（二重符号化の疑い。DESIGN §9 の色未決）。
@@ -150,7 +141,7 @@ npx electron client --self-test                             # 自動検証（HMD
   close→終了 0.35〜0.59 秒、残存プロセスなし。
 - VRAM（nvidia-smi、MB）: 起動前 5,341 → XR セッション 3 回で 7,650 →
   6 回で 8,541（約 +300MB/起動）。SteamVR 停止で 8,544→4,146、再起動後 5,392。
-- Electron のみ（`--no-exe`）×3 では増加 0（5,341→5,340）。
+- Electron のみ（self-test 相当の exe 無し動作）×3 では増加 0（5,341→5,340）。
   したがって Electron/OSR/ミラーは原因ではない。
 - 約 300MB は 7144×1786×2眼×3バッファ ≒ 306MB（スワップチェーン 1 組）とほぼ一致。
 - 原因候補: SteamVR コンポジタのアプリ別キャッシュ、またはクライアント終了時の解放遅延。
@@ -177,11 +168,11 @@ npx electron client --self-test                             # 自動検証（HMD
   「描画が遅いのか、転送が遅いのか」の切り分け用である。
   受理率（窓 5 秒/累計）と paint あたりの受理、stale paint（未処理 Offer がある間に
   即返却した paint。`droppedStale`）も出す。
-- レコード発行のフロー制御: app は exe に `--pace-records` を渡す。
+- レコード発行のフロー制御: exe は常時フロー制御で発行する。
   未処理の画像がある間は新しいレコードを発行せず、Offer 処理後の次のフレームで
   発行する。500ms 応答停滞したら新しいレコードで詰まりを解く（旧分は失効）。
   app 側は未処理 Offer がある間の paint を stale として即返却する
-  （`droppedStale`。既存の `drops` と区別）。ハーネスには渡さない（既定 off のまま）。
+  （`droppedStale`。既存の `drops` と区別）。
   受理率は exe の stdout（`M2 提出:`・`M2 棄却: <理由>`）を main が数えたものであり、
   形式が変われば `countExeMeterChunk` も更新する。
 - 実測: 本番サイトで 350〜500ms の遅延（受理 7 件の年齢 345〜492ms、TTL 500ms ぎりぎり）。

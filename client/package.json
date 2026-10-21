@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node ../node_modules/typescript/bin/tsc -p .",
     "start": "node ../node_modules/electron/cli.js .",
-    "test": "node ../node_modules/typescript/bin/tsc -p . && node test/m2codec.test.cjs && node test/protocol.test.cjs && node test/shim-pose.test.cjs && node test/mirror-map.test.cjs && node test/mirror-input.test.cjs",
+    "test": "node ../node_modules/typescript/bin/tsc -p . && node ../tools/test/client/m2codec.test.cjs && node ../tools/test/client/protocol.test.cjs && node ../tools/test/client/shim-pose.test.cjs && node ../tools/test/client/mirror-map.test.cjs && node ../tools/test/client/mirror-input.test.cjs",
     "register": "node scripts/register-steamvr.cjs",
     "package": "node scripts/package.cjs"
   }

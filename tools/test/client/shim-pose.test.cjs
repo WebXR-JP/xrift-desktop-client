@@ -3,7 +3,7 @@
 //   - pose 無効時（非装着相当）: `targetRaySpace` / `gripSpace` の `getPose` が
 //     null を返し、例外が出ない
 //   - pose 有効時: `getPose` が position/orientation 由来の行列を返す
-// 使い方: node test/shim-pose.test.cjs
+// 使い方: node tools/test/client/shim-pose.test.cjs
 'use strict';
 const assert = require('node:assert');
 
@@ -78,7 +78,7 @@ async function main() {
   Object.defineProperty(globalThis, 'navigator', { value: {}, configurable: true, writable: true });
   globalThis.document = makeDocument();
 
-  const { installM5XR } = require('../dist/shim.js');
+  const { installM5XR } = require('../../../client/dist/shim.js');
   installM5XR();
   const xr = globalThis.navigator.xr;
   assert.ok(xr, 'navigator.xr が差し替わる');

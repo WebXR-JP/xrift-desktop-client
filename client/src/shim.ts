@@ -74,7 +74,7 @@ export function installM5XR(): void {
   // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに使った
   // record のタグに限る（painted 画像の内容とタグが同一 record に対応する）。
   // ページが rAF を呼ばなかった record では更新しない（描画していないため）。
-  // 計算式は `src/m2codec.ts`（= harness の m2-codec.js = C++ の PoseTag）と同一であり、
+  // 計算式は `src/m2codec.ts`（= C++ の PoseTag）と同一であり、
   // 変えたら両方を同時に更新する。注入関数は自己完結のため import できず同等品を持つ。
   const M2_AX = 64, M2_BX = 128, M2_BY = 64, M2_CELL = 4;
   const M2_MLX = 160, M2_MDX = 160, M2_MY = 8, M2_MS = 32;
@@ -571,7 +571,7 @@ export function installM5XR(): void {
         this._onRecord(latestRecord);
       }
       // window.rAF ポンプを起こす。XR 駆動だけでは hidden OSR の compositor が止まり
-      // paint が来ないため、rAF が BeginFrame を保つ（ハーネスと同一の最新優先方式）。
+      // paint が来ないため、rAF が BeginFrame を保つ（最新優先方式）。
       // record 到着と rAF のどちらでも進め、コールバックの取り合いは clear で直列化する。
       if (!this._pumpOn) {
         this._pumpOn = true;
