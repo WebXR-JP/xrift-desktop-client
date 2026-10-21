@@ -56,6 +56,9 @@ export function installM5XR(): void {
     haptic(hand: number, intensity: number, durationMs: number): void;
     probe(): Promise<{ ok: boolean }>;
     sessionActive(active: boolean): void;
+    // セッション初の制御ブロック描画の通知（main の Offer 開始用。任意）。
+    // 無い橋（旧 preload・試験スタブ）でも描画駆動は変えない。
+    stamped?(renderId: string): void;
   }
   const bridge = (window as unknown as { __xriftXR?: M5Bridge }).__xriftXR;
   if (!bridge || (window as unknown as { __xriftM5Installed?: boolean }).__xriftM5Installed) return;
@@ -514,6 +517,8 @@ export function installM5XR(): void {
     _recordLogs = 0;
     /** 最後にログした record の ID（rAF ポンプの重複を数えないため）。 */
     _lastLoggedId: string | null = null;
+    /** 初回スタンプ通知の済み旗。main の Offer 開始用に 1 セッション 1 回だけ送る。 */
+    _stampNotified = false;
     /** 制御ブロック用の overlay canvas（XR 開始時に WebGL canvas 上へ重ねる）。 */
     _overlay: HTMLCanvasElement | null = null;
     /** overlay の 2D 文脈（`_overlay` と対で持つ）。 */
@@ -709,6 +714,15 @@ export function installM5XR(): void {
         if (cbs.length > 0) {
           try {
             stamp = this._drawM5Blocks(rec, canvas, eyeW, eyeH);
+            // ADR: 初回の描画完了を main へ知らせる。main はこの通知まで Offer せず、
+            // 旧内容（ブロック無し）の paint を送らない（起動時の不明ID棄却の防止）。
+            // 1 セッション 1 回だけ送り、失敗・不在でも XR 駆動は変えない。
+            if (stamp !== null && !this._stampNotified) {
+              this._stampNotified = true;
+              try {
+                if (typeof B.stamped === 'function') B.stamped(rec.renderId);
+              } catch { /* 通知失敗時は無視 */ }
+            }
           } catch (err) {
             console.error('[XRift M5] block overlay failed', err);
           }
@@ -824,13 +838,19 @@ export function installM5XR(): void {
       try { if (typeof B.sessionActive === 'function') B.sessionActive(true); } catch { /* 通知失敗時は無視 */ }
       // exe は main 起動時に既に動いているはずであり、ここでは最初の record を待つ。
       // 非装着でも RenderRequest の 1 件目が来れば解決する（準備後の解決）。
+      // 1 秒経っても来ない場合は警告だけ出し、待ち自体は最大 20 秒続ける（動作は変えない）。
       let rec: M5Record;
+      const warnTimer = setTimeout(() => {
+        log('警告: VR開始から1秒経っても RenderRequest が来ない（exe の pace 停滞を確認）');
+      }, 1000);
       try {
         rec = await nextRecord(20000);
       } catch (e) {
+        clearTimeout(warnTimer);
         try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
         throw e;
       }
+      clearTimeout(warnTimer);
       if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) {
         try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
         throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');

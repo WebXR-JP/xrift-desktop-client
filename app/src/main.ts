@@ -260,6 +260,8 @@ let stopping = false; // 計測終了後。新規 paint は即 release する
 let finished = false;
 const stats = {
   offers: 0, dones: 0, drops: 0, droppedStale: 0, offerFailures: 0, staleDones: 0,
+  // 有効画素前の paint 破棄数（ブラウジング中・ページ初回描画待ちの旧内容）。
+  droppedBrowsing: 0,
   quarantined: 0, releasedPending: 0, maxHeld: 0,
   statusOk: 0, statusCopyFailed: 0, statusVerifyFailed: 0,
   noTexture: 0, formatMismatch: 0, missingHandle: 0,
@@ -320,11 +322,20 @@ let vrMeterTimer: NodeJS.Timeout | null = null;
 // （`M2 提出:`・`M2 棄却: <理由>`）に依存するため、形式が変わればここも更新する。
 function countExeMeterChunk(text: string): void {
   if (!text.includes('M2 ')) return;
+  const prevSubmits = vrMeter.submits;
   // 提出は 1 行 1 件である。
   let i = text.indexOf('M2 提出:');
   while (i >= 0) {
     vrMeter.submits++;
     i = text.indexOf('M2 提出:', i + 1);
+  }
+  // 有効化後の最初の受理までの時間を記録する（VR 開始の立ち上がり観測用）。
+  if (xrActive && !vrFirstAcceptLogged && vrMeter.submits > prevSubmits && xrActiveSince !== null) {
+    vrFirstAcceptLogged = true;
+    const elapsed = Date.now() - xrActiveSince;
+    const m = /M2 提出: renderId=(\d+)/.exec(text);
+    const idNote = m !== null ? `（renderId=${m[1]}）` : '';
+    log(`[M5 VR開始] 最初の受理まで ${elapsed}ms${idNote}`);
   }
   // 棄却は理由名で内訳を数える（render_record.h の RejectReasonName と一致）。
   const reasons: [string, 'unknownId' | 'poseMismatch' | 'spaceMismatch' | 'expired'][] = [
@@ -531,6 +542,22 @@ function onPaint(details: unknown): void {
     releaseUnregistered(texture, 'format-mismatch');
     return;
   }
+  // ADR: xrActive=false（ブラウジング中）の paint は Offer しない。VR 開始前の
+  // プレースホルダ画像を送ると exe 側で不明IDの棄却になり無駄な転送になるため、
+  // texture を即 release して捨て、件数だけ数える（以後の受理率の切り分け用）。
+  if (!xrActive) {
+    stats.droppedBrowsing++;
+    releaseUnregistered(texture, 'browsing-no-offer');
+    return;
+  }
+  // ADR: ページの初回描画までは Offer しない。記録配送直後の paint にはまだ
+  // 旧内容しか載らず、送ると不明IDの棄却になる。シムの初回スタンプ通知
+  // （`xr:stamped`。無い橋・描かないページ用に 2 秒の予備期限つき）で開ける。
+  if (!vrPixelsValid) {
+    stats.droppedBrowsing++;
+    releaseUnregistered(texture, 'waiting-first-stamp');
+    return;
+  }
   if (stats.firstCodedSize === null) {
     stats.firstCodedSize = { width: coded.width, height: coded.height };
     log(`first codedSize=${coded.width}x${coded.height} pixelFormat=${ti.pixelFormat}`);
@@ -634,11 +661,27 @@ function applyVrResize(reqW: number, reqH: number, renderId: string): void {
 }
 let lastReqSize: { w: number; h: number } | null = null;
 let recordLogCount = 0;
-// ADR: xrActive が立つ前に届いた最新 1 件だけ保つ。exe は起動時から送り続けるため、
-// 通知より先に届いた要求を捨てると requestSession が解決できず deadlock する。
-// 有効化直後にこの 1 件を「次の record」として届け、以後は到着順に流す。
-// 終了通知で破棄する（古い要求を次の開始時に持ち越さない）。
+// ADR: xrActive が立つ前に届いた要求は数えるだけであり、保持した最新も
+// VR 開始時に破棄する。古いレコードを転送すると exe 側で TTL 切れ・不明IDに
+// なり、次の新規レコードまで詰まる（実機で約 23 秒の全棄却を確認）。
+// requestSession の解決は有効化後の新規到着で行う。exe は pace の停滞
+// タイムアウト（500ms）で新規発行するため deadlock しない。
+// 終了通知でも破棄する（古い要求を次の開始時に持ち越さない）。
 let bufferedRecord: XrRecord | null = null;
+// VR 開始時刻（Date.now。最初の記録・受理までの時間計測用）。
+let xrActiveSince: number | null = null;
+// 有効化後に最初に配送した時刻。未配送は null。
+let vrFirstRecordAt: number | null = null;
+// ページが初回の制御ブロックを描いたか。立つまで Offer せず旧内容を送らない。
+// シムの `stamped` 通知で立つ（来ない橋・描かないページ用の予備期限つき）。
+let vrPixelsValid = false;
+// 有効化後の最初の受理ログを出したか（セッションごとに立て直す）。
+let vrFirstAcceptLogged = false;
+// 有効化後 1 秒の警告タイマー。新規レコードが来なければ pace 停滞を疑う。
+let vrNoRecordWarnTimer: NodeJS.Timeout | null = null;
+// 初回描画の予備期限（2 秒）。描かないページでも XR を空回りさせない。
+// 通常の描画遅延（実測 350〜500ms）より十分長く、固まり放置より短い仮の値である。
+let vrFirstStampTimer: NodeJS.Timeout | null = null;
 // 復号済みレコードの配送（リサイズ＋転送）。xrActive が真のときだけ呼ぶ。
 function deliverRecord(rec: XrRecord, via: string): void {
   if (rec.reqWidth > 0 && rec.reqHeight > 0 &&
@@ -653,6 +696,14 @@ function deliverRecord(rec: XrRecord, via: string): void {
       log(`[M5記録] #${recordLogCount} renderId=${rec.renderId} req=${rec.reqWidth}x${rec.reqHeight}/眼 window=${nowW}x${nowH} xrActive=true${via}`);
     }
     if (winRef !== null && !winRef.isDestroyed()) winRef.webContents.send('xr:record', rec);
+    if (xrActive && vrFirstRecordAt === null && xrActiveSince !== null) {
+      vrFirstRecordAt = Date.now();
+      if (vrNoRecordWarnTimer !== null) {
+        clearTimeout(vrNoRecordWarnTimer);
+        vrNoRecordWarnTimer = null;
+      }
+      log(`[M5 VR開始] 最初の記録まで ${vrFirstRecordAt - xrActiveSince}ms（renderId=${rec.renderId}）`);
+    }
   } else if (winRef !== null && !winRef.isDestroyed()) {
     winRef.webContents.send('xr:record', rec);
   }
@@ -666,7 +717,7 @@ function forwardRecord(m: Buffer): void {
   stats.renderRequests++;
   // ADR: xrActive が false の間は VR サイズへ広げず renderer へも転送しない。
   // exe は起動時から送り続けるため、サイトを開いただけではブラウジング寸法のまま保つ。
-  // 最新 1 件だけ保ち、有効化直後に届ける（requestSession の解決用）。
+  // 件数は数え、最新 1 件の ID だけ残す（VR 開始時に破棄した旨と合わせて記録するため）。
   if (!xrActive) {
     xrDroppedRecords++;
     bufferedRecord = rec;
@@ -682,11 +733,11 @@ function forwardRecord(m: Buffer): void {
 }
 
 // renderer のセッション開始・終了の通知で xrActive を切り替える。
-// 開始時は保留中の最新 1 件から VR サイズへ広げて転送し、終了時はブラウジングに戻す。
+// 開始時は保留分を破棄して以後の新規レコードから転送し、終了時はブラウジングに戻す。
 function setXrActive(active: boolean): void {
   if (xrActive === active) return;
   xrActive = active;
-  log(`xrActive=${active ? 'true（VR 開始。保留中の最新からリサイズ・転送する）' : 'false（セッション終了。転送を止める）'}`);
+  log(`xrActive=${active ? 'true（VR 開始。保留分は破棄し新規レコードから転送する）' : 'false（セッション終了。転送を止める）'}`);
   if (active) {
     if (!vrActive) {
       vrActive = true;
@@ -697,16 +748,56 @@ function setXrActive(active: boolean): void {
       }
       restartMirrorTimer();
     }
-    // 通知前に届いた最新 1 件を「次の record」として届ける。
-    // 無ければ以後の到着を待つ（requestSession の解決用）。
+    // 通知前に届いた保留分は古いため転送せず破棄する。以後の新規到着から始める。
+    // exe は pace の停滞タイムアウト（500ms）で新規発行するため 1 秒以内に来るはずである。
     if (bufferedRecord !== null) {
       const rec = bufferedRecord;
       bufferedRecord = null;
-      log(`保留中の RenderRequest を転送（renderId=${rec.renderId}。有効化直後の 1 件）`);
-      deliverRecord(rec, '（保留分）');
+      log(`保留中の RenderRequest を破棄（renderId=${rec.renderId}。VR開始は新規レコードから始める。累計保留${xrDroppedRecords}件）`);
+    }
+    xrActiveSince = Date.now();
+    vrFirstRecordAt = null;
+    vrPixelsValid = false;
+    vrFirstAcceptLogged = false;
+    if (vrNoRecordWarnTimer !== null) {
+      clearTimeout(vrNoRecordWarnTimer);
+      vrNoRecordWarnTimer = null;
+    }
+    if (vrFirstStampTimer !== null) {
+      clearTimeout(vrFirstStampTimer);
+      vrFirstStampTimer = null;
+    }
+    // 動作は変えない。新規レコードが 1 秒待っても来ない場合だけ警告する。
+    // exe 無し動作（--no-exe・--self-test）では記録が来ないため予約しない。
+    if (!NO_EXE && !SELF_TEST) {
+      vrNoRecordWarnTimer = setTimeout(() => {
+        vrNoRecordWarnTimer = null;
+        if (xrActive && vrFirstRecordAt === null) {
+          log('警告: VR開始から1秒経っても RenderRequest が来ない（exe の pace 停滞タイムアウトを確認）');
+        }
+      }, 1000);
+      // 描かないページでも空回りさせるための予備期限。2 秒で開ける。
+      vrFirstStampTimer = setTimeout(() => {
+        vrFirstStampTimer = null;
+        if (xrActive && !vrPixelsValid) {
+          vrPixelsValid = true;
+          log('警告: VR開始から2秒経っても初回描画の通知が無いため Offer を開始する（ページが描いていない可能性）');
+        }
+      }, 2000);
     }
   } else {
     bufferedRecord = null;
+    xrActiveSince = null;
+    vrFirstRecordAt = null;
+    vrPixelsValid = false;
+    if (vrNoRecordWarnTimer !== null) {
+      clearTimeout(vrNoRecordWarnTimer);
+      vrNoRecordWarnTimer = null;
+    }
+    if (vrFirstStampTimer !== null) {
+      clearTimeout(vrFirstStampTimer);
+      vrFirstStampTimer = null;
+    }
     if (vrActive) {
       vrActive = false;
       log(`ミラー復帰: ブラウジング ${MIRROR_FPS}fps に戻す（セッション終了）`);
@@ -1230,6 +1321,14 @@ function finish(code: number): void {
   if (stopTimer) clearTimeout(stopTimer);
   if (graceTimer) clearTimeout(graceTimer);
   if (exeWaitTimer) clearTimeout(exeWaitTimer);
+  if (vrNoRecordWarnTimer !== null) {
+    clearTimeout(vrNoRecordWarnTimer);
+    vrNoRecordWarnTimer = null;
+  }
+  if (vrFirstStampTimer !== null) {
+    clearTimeout(vrFirstStampTimer);
+    vrFirstStampTimer = null;
+  }
   // offer 済み未 ACK は参照を held から外さず quarantined へ移して隔離する
   // （release しない。参照を捨てない）。未処理 paint は stale として即返すため
   // 未 offer の保留は残らない。
@@ -1291,7 +1390,7 @@ function finish(code: number): void {
   }
   flushLog();
   log(`M5 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
-    `stale=${stats.droppedStale} ` +
+    `stale=${stats.droppedStale} browseDrop=${stats.droppedBrowsing} ` +
     `ok=${stats.statusOk} copyFail=${stats.statusCopyFailed} verifyFail=${stats.statusVerifyFailed} ` +
     `records=${stats.renderRequests} xrDropped=${xrDroppedRecords} xrActive=${xrActive} ` +
     `inputs=${stats.inputStates} haptics=${stats.hapticSent} ` +
@@ -1658,6 +1757,18 @@ function start(): void {
       return;
     }
     setXrActive(msg);
+  });
+  // シムの初回制御ブロック描画の通知。Offer 開始の合図にする。
+  // 境界は文字列だけを受け、他の型は破棄する。
+  ipcMain.on('xr:stamped', (_event, msg: unknown) => {
+    if (typeof msg !== 'string' || msg === '') return;
+    if (!xrActive || vrPixelsValid) return;
+    vrPixelsValid = true;
+    if (vrFirstStampTimer !== null) {
+      clearTimeout(vrFirstStampTimer);
+      vrFirstStampTimer = null;
+    }
+    log(`[M5 VR開始] 初回描画を確認（renderId=${msg}。Offer を開始する）`);
   });
   // ページの到達確認用。exe 生存とパイプ接続だけを見る（HMD 装着の有無は見ない）。
   // シムは準備前に最大 15 秒ポーリングするため、最初の数回と結果変化だけ記録する。

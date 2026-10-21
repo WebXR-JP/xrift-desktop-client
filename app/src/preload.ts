@@ -53,6 +53,12 @@ const bridge = {
   sessionActive(active: boolean): void {
     ipcRenderer.send('xr:session', active);
   },
+  // シムの初回制御ブロック描画の通知。main はこの通知まで Offer しない。
+  // 境界は文字列だけを受け、他の型は送らない。
+  stamped(renderId: string): void {
+    if (typeof renderId !== 'string' || renderId === '') return;
+    ipcRenderer.send('xr:stamped', renderId);
+  },
 };
 
 contextBridge.exposeInMainWorld('__xriftXR', bridge);
