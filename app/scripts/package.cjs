@@ -4,12 +4,13 @@
 //
 // root の node_modules の @electron/packager を使う（app 自体に依存は無い）。
 // 同梱物: app/dist、app/pages、app/package.json（本体）、
-//   xrift_new.exe + xrift_transfer_addon.node（extraResource → resources/ 直下）。
+//   xrift_new.exe + xrift_transfer_addon.node（extraResource → resources/ 直下）、
+//   three.module.js + three.core.js（→ resources/node_modules/three/build/。pages の importmap 解決用）。
 // main は packagedResource() で resources/ 直下から解決する（開発時は従来パス）。
 'use strict';
 
 const { execFileSync } = require('node:child_process');
-const { existsSync, readdirSync, statSync } = require('node:fs');
+const { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } = require('node:fs');
 const { join } = require('node:path');
 
 const appDir = join(__dirname, '..');
@@ -74,10 +75,31 @@ async function main() {
     ignore: (p) => p !== '' && !keep.some((r) => r.test(p.replace(/\\/g, '/'))),
   });
   console.log(`[package] 出力: ${appOut}`);
+  // テストページ（pages/*.html）の importmap は app 相対で
+  // `../../node_modules/three/build/three.module.js` を指す。
+  // 配布物では resources/app/pages/... になるため、解決先は
+  // resources/node_modules/... である。開発時のみ存在するパスなので、
+  // 配布物にも同梱する（相対パスを変えずに済ませる）。
+  // three.module.js は ./three.core.js を import するため両方をコピーする
+  // （three.core.js 自体は追加の相対 import を持たないことを確認済み）。
+  const THREE_FILES = ['three.module.js', 'three.core.js'];
+  const threeSrcDir = join(repoRoot, 'node_modules', 'three', 'build');
+  for (const f of THREE_FILES) {
+    if (!existsSync(join(threeSrcDir, f))) {
+      fail(`three がありません: ${join(threeSrcDir, f)}（root で pnpm install を実行してください）`);
+    }
+  }
+  const resources = join(appOut, 'resources');
+  const threeDstDir = join(resources, 'node_modules', 'three', 'build');
+  mkdirSync(threeDstDir, { recursive: true });
+  for (const f of THREE_FILES) {
+    copyFileSync(join(threeSrcDir, f), join(threeDstDir, f));
+    const kb = (statSync(join(threeDstDir, f)).size / 1024).toFixed(0);
+    console.log(`[package] three 同梱: node_modules/three/build/${f} (${kb}KB)`);
+  }
   // 生成物の一覧（exe・addon・dist・pages の確認用）。
   const top = readdirSync(appOut);
   console.log(`[package] top: ${top.join(', ')}`);
-  const resources = join(appOut, 'resources');
   if (existsSync(resources)) {
     console.log(`[package] resources: ${readdirSync(resources).join(', ')}`);
   }

@@ -30,10 +30,10 @@ M5 の最初のスライス。exe 主導の描画要求（`RenderRequest`）を 
 ```powershell
 # XRift-Client から
 npx tsc -p app                 # ビルド（app/dist へ）
-npx electron app               # 起動（pages/test.html を開く。Ctrl+C で終了）
+npx electron app               # 起動（既定で https://app.xrift.net/ を開く。Ctrl+C で終了）
 
-# 20 秒の非装着検証（15 秒時点でページを PNG 保存）
-npx electron app --seconds=20 --capture-at=15000,m5-cap.png
+# 開発・検証では URL を明示する
+npx electron app --url=pages/test.html --seconds=20 --capture-at=15000,m5-cap.png
 
 # 引数（いずれも任意）
 #   --exe=<path>           xrift_new.exe（既定は native_new のビルド物）
@@ -47,10 +47,11 @@ npx electron app --seconds=20 --capture-at=15000,m5-cap.png
 #   --space=<auto|local|stage|local-floor>  exe の参照空間の要求（既定 auto）
 #   --seconds=N            N 秒で自動停止（既定 0=手動終了）
 #   --width=W --height=H   OSR ウィンドウ寸法（既定 2048x1024）
-#   --page=<file>          pages/ 以下の HTML（既定 test.html。`--url` があればそちらが優先）
+#   --page=<file>          pages/ 以下の HTML（`--url` があればそちらが優先）
 #   --url=<url>            開く対象（正典）。`https://…`/`file://…` は URL として開き、
 #                          それ以外（`pages/test.html`・`test.html` 等）は pages 配下の
-#                          ファイルとして開く。既定は `pages/test.html`。
+#                          ファイルとして開く。既定は `https://app.xrift.net/`。
+#                          開発・検証では `--url=pages/test.html` を明示すること。
 #                          例: `--url=pages/test.html`、`--url=https://app.xrift.net/`
 #   --capture-at=Ms,path[;Ms,path]  指定時刻に capturePage で PNG 保存（描画経路に入れない）
 #   --control-capture-at=Ms,path[;Ms,path]  同上（コントロール窓の capture。ミラー証拠用）
@@ -143,6 +144,20 @@ npx electron app --self-test                             # 自動検証（HMD �
   受理画像と不一致の可能性（二重符号化の疑い。DESIGN §9 の色未決）。
   提出画像の色の最終確認は HMD 実機で行うこと。
 
+## 既知の挙動（VRAM の実測。PICO/SteamVR）
+
+- 6 サイクル（各 12 秒 VR → ウィンドウ close）: app/exe とも exit 0、
+  close→終了 0.35〜0.59 秒、残存プロセスなし。
+- VRAM（nvidia-smi、MB）: 起動前 5,341 → XR セッション 3 回で 7,650 →
+  6 回で 8,541（約 +300MB/起動）。SteamVR 停止で 8,544→4,146、再起動後 5,392。
+- Electron のみ（`--no-exe`）×3 では増加 0（5,341→5,340）。
+  したがって Electron/OSR/ミラーは原因ではない。
+- 約 300MB は 7144×1786×2眼×3バッファ ≒ 306MB（スワップチェーン 1 組）とほぼ一致。
+- 原因候補: SteamVR コンポジタのアプリ別キャッシュ、またはクライアント終了時の解放遅延。
+  **SteamVR 再起動で解放**。回避策: 起動を繰り返したら SteamVR を再起動すること。
+  深追いは未実施（M5 完了を優先）。
+  詳細は `native_new/docs/DESIGN.md` §14 を参照。
+
 ## 現時点の制約（未対応）
 
 - 手の pose（grip/targetRay）は未対応。pipe の `InputState` が pose を運ばないため、
@@ -171,7 +186,20 @@ npx electron app --self-test                             # 自動検証（HMD �
   形式が変われば `countExeMeterChunk` も更新する。
 - 実測: 本番サイトで 350〜500ms の遅延（受理 7 件の年齢 345〜492ms、TTL 500ms ぎりぎり）。
   TTL は暫定 2s（`--record-ttl-ms=2000`）で渡す。描画解像度は `--render-scale=0.35` 程度を試せる。
-- SteamVR への登録（ライブラリ登録・ランチャー）は未対応。
+- SteamVR への登録（ライブラリ登録・ランチャー）は `scripts/register-steamvr.cjs` で行う。
+  開発版（`electron.exe` + `app` ディレクトリ）と配布版（`XRiftClient.exe`）は
+  同一 `app_key`（`net.xrift.client`）のため排他であり、`add` 時に置き換わる。
+  ```powershell
+  # app から。SteamVR を起動しておくこと
+  npm run register -- add              # 開発版を登録
+  npm run register -- check            # 登録確認（IsApplicationInstalled）
+  npm run register -- remove           # 登録解除
+  npm run register -- add --packaged   # 配布版を登録（npm run package の後）
+  npm run register -- check --packaged # 配布版の登録確認
+  npm run register -- remove --packaged # 配布版の登録解除
+  ```
+- 配布物の作成は `npm run package`（`dist-package/XRiftClient-win32-x64/`）。
+  `XRiftClient.exe --self-test` で addon/exe のパス解決を含めて検証できる。
 - `--url` での外部ページ（app.xrift.net 等）はホーム画面の読み込みとシム注入まで確認。
   XR 呼び出しはページ側の操作待ち（詳細は「非装着実行の実測」を参照）。
 - 旧アプリ（`src/electron`・`electron/`・`native/`）とは無関係に動く。

@@ -28,3 +28,4 @@ app/dist/
 app/logs/
 app/dist-package/
 app/xrift.vrmanifest
+app/xrift-packaged.vrmanifest

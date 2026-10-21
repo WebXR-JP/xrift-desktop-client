@@ -81,10 +81,11 @@ const URL_ARG = arg('url', '');
  * - `https?://`・`file://` で始まればそのまま URL として開く
  * - それ以外の空でない文字（`pages/test.html`・`test.html` 等）は pages 配下の
  *   ファイルとして開く（`--url=pages/test.html` の検証命令に対応するため）
- * - どちらも空なら既定の `pages/test.html`
+ * - どちらも空なら既定の本番 URL（`https://app.xrift.net/`）を開く。
+ *   開発・検証では `--url=pages/test.html` を明示すること
  */
 function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: string } {
-  const raw = URL_ARG !== '' ? URL_ARG : PAGE_ARG !== '' ? PAGE_ARG : 'test.html';
+  const raw = URL_ARG !== '' ? URL_ARG : PAGE_ARG !== '' ? PAGE_ARG : 'https://app.xrift.net/';
   if (/^https?:\/\//i.test(raw) || /^file:\/\//i.test(raw)) {
     return { kind: 'url', url: raw };
   }
