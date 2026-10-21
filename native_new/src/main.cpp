@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -60,6 +61,11 @@ void PrintHelp(const char* argv0) {
       "            （既定 off。on のとき未処理の画像がある間は RenderRequest を送らず、\n"
       "            Offer 処理後の次のフレームで発行する。500ms 停滞したら新しい\n"
       "            レコードで詰まりを解く。app 経由の通常運用は on を渡す）\n"
+  "            --dump-exit-stage は終了時の破棄段階ログ（既定 off。\n"
+  "            環境変数 XRIFT_EXIT_STAGE があればそちらでも有効になる）\n"
+  "            --no-quick-exit は終了時の即時終了を止め、旧来の RAII 破棄を行う\n"
+  "            （既定は統計出力と明示 teardown の後に残りの破棄を省略して終了する。\n"
+  "            終了時クラッシュの回避用。切り分け以外では付けない）\n"
       "            入力は毎秒サマリ（[M4入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
       "            状態変化のフレームで [M4エッジ] を出す。haptics 受信は XrResult を\n"
       "            ログに残す\n"
@@ -231,6 +237,11 @@ int main(int argc, char** argv) {
         }
       } else if (std::strcmp(argv[i], "--pace-records") == 0) {
         opts.paceRecords = true;
+      } else if (std::strcmp(argv[i], "--dump-exit-stage") == 0) {
+        opts.dumpExitStage = true;
+      } else if (std::strcmp(argv[i], "--no-quick-exit") == 0) {
+        // 診断用。既定の即時終了を止め、旧来の RAII 破棄を行う。
+        opts.quickExit = false;
       } else if (std::strcmp(argv[i], "--no-resubmit") == 0) {
         opts.resubmit = false;
       } else if (StartsWith(argv[i], "--resubmit-max-age-ms=")) {
@@ -260,7 +271,30 @@ int main(int argc, char** argv) {
       PrintHelp(argv[0]);
       return 1;
     }
-    return xrift::transfer::RunXrTransfer(opts);
+    // 生成・接続の失敗（パイプ不在等）は例外で返る。捕捉せずに抜けると
+    // 未捕捉例外の abort になるため、ここで 1 に丸めて通常終了させる。
+    // ADR: 終了時クラッシュの回避は RunXrTransfer 内の通常出口で行う
+    // （統計出力と明示 teardown の後に残りの RAII 破棄を飛ばす）。
+    // ここに届くのは旧経路（--no-quick-exit）か開始前の早期 return 経路だけであり、
+    // 既定では stdout/stderr を flush してから残りの破棄（静的デストラクタ等）を
+    // 飛ばして終了する。エラー経路の統計とメッセージは RunXrTransfer 側で出す。
+    int code = 0;
+    try {
+      code = xrift::transfer::RunXrTransfer(opts);
+    } catch (const std::exception& e) {
+      xrift::Error("XR転送の異常終了: %s", e.what());
+      code = 1;
+    } catch (...) {
+      xrift::Error("XR転送の異常終了（不明な例外）");
+      code = 1;
+    }
+    if (opts.quickExit) {
+      xrift::Info("終了: 残りの破棄を省略して終了する（--no-quick-exit で旧経路）");
+      std::fflush(stdout);
+      std::fflush(stderr);
+      std::_Exit(code);
+    }
+    return code;
   }
   if (argc >= 2) {
     xrift::Error("不明な引数: %s", argv[1]);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "transfer/protocol.h"
@@ -9,6 +11,16 @@
 // Windows 専用。Linux 対応時に FD 転送へ差し替える境界がこのクラスである。
 
 namespace xrift::transfer {
+
+// 送受信の失敗理由付き例外。Win32 エラーを運び、呼び出し側が切断
+// （相手先の正常な破棄。統計付きの正常終了にする）と異常を区別できるようにする。
+// 切断そのもの（相手不在・EOF）は例外ではなく false 戻りで返す。
+// std::runtime_error を継承するため、従来の catch もそのまま受けられる。
+struct PipeError : public std::runtime_error {
+  uint32_t code;  // Win32 エラー（GetLastError の値）。Linux では使わない。
+  PipeError(const std::string& message, uint32_t errorCode)
+      : std::runtime_error(message), code(errorCode) {}
+};
 
 class PipeClient {
  public:

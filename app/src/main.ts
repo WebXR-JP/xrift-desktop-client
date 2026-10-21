@@ -284,9 +284,21 @@ const handleCounts = new Map<string, number>();
 const paintTimes: number[] = [];
 let exeProc: ChildProcess | null = null;
 let socket: net.Socket | null = null;
+// exe の stdout/stderr 保存先ストリーム。finish で end して書き切りを待つため
+// start の局所変数ではなくここに置く（所有権は finish が引き取る）。
+let exeLogStream: fs.WriteStream | null = null;
 let winRef: BrowserWindow | null = null; // レコード転送先（createWindow が設定する）。
 let stopTimer: NodeJS.Timeout | null = null;
 let graceTimer: NodeJS.Timeout | null = null;
+// beginShutdown の開始済み旗。--seconds とウィンドウ close の競合で
+// 二重開始すると猶予タイマーが作り直されて終了が延びるため、2 回目以降は無視する。
+// stopping（新規 paint の停止）とは別であり、優雅な停止の手順自体の多重起動を防ぐ。
+let shutdownStarted = false;
+// exe の stdout/stderr の行バッファ。チャンク境界で行が切れるため、
+// 改行で区切れた完成行だけを統計抽出に使う。残りは finish 時に掃き出す。
+let exeLineBuf = '';
+// exe の終了統計（XR転送統計）を app ログに残したか。終了時の必須証拠である。
+let exeStatsLogged = false;
 const captureTimers: NodeJS.Timeout[] = [];
 const controlCaptureTimers: NodeJS.Timeout[] = [];
 // ---- C 案のミラー状態。OSR（不可視）の capturePage をタイマーで拾い、
@@ -350,6 +362,35 @@ function countExeMeterChunk(text: string): void {
       vrMeter[key]++;
       j = text.indexOf(needle, j + 1);
     }
+  }
+}
+// exe の stdout/stderr チャンクから `XR転送統計` の完成行を抜き出して app ログに残す。
+// 終了証拠としてウィンドウ close・--seconds のいずれでも必須であるため、
+// 行の途中で切れた分は exeLineBuf に溜め、finish 時の掃き出しで回収する。
+// 前提: exe の統計行は `XR転送統計:` を含む 1 行である（XrStats::Print の形式）。
+function noteExeStatsChunk(text: string): void {
+  if (!text.includes('XR転送統計') && !text.includes('\n')) {
+    exeLineBuf += text;
+    return;
+  }
+  exeLineBuf += text;
+  const parts = exeLineBuf.split('\n');
+  exeLineBuf = parts.pop() ?? '';
+  for (const raw of parts) {
+    const line = raw.replace(/\r$/, '');
+    if (line.includes('XR転送統計')) {
+      exeStatsLogged = true;
+      log(`exe統計: ${line.slice(0, 2000)}`);
+    }
+  }
+}
+// finish 時の掃き出し。close（EOF）までに届いた末尾の断片を回収する。
+function flushExeStats(): void {
+  const line = exeLineBuf.replace(/\r$/, '');
+  exeLineBuf = '';
+  if (line.includes('XR転送統計')) {
+    exeStatsLogged = true;
+    log(`exe統計: ${line.slice(0, 2000)}`);
   }
 }
 // VR 中の 5 秒計測。paint レート（描画が遅いか）と受理率（転送が遅いか）を切り分ける。
@@ -1087,7 +1128,12 @@ async function createControlWindow(): Promise<BrowserWindow> {
   });
   win.on('closed', () => {
     if (controlRef === win) controlRef = null;
-    log('control window closed（ミラー送信を止める）');
+    // ADR: コントロール窓は可視の唯一の操作対象である。閉じたらアプリ全体を
+    // 終了する（OSR 窓は不可視のため閉じる操作の対象にならない）。
+    // 処理中の offer を隔離しないよう優雅な停止に入る。finish の finished 旗で
+    // 多重呼び出しを防ぐため、close 競合でハングしない。
+    log('control window closed（アプリ全体を終了する）');
+    beginShutdown(0);
   });
   win.webContents.on('did-finish-load', () => {
     log('control did-finish-load');
@@ -1290,8 +1336,45 @@ async function runSelfTest(osr: BrowserWindow, control: BrowserWindow): Promise<
 function maybeFinish(): void {  if (!stopping || finished) return;
   if (inFlight !== null) return;
   if (socket === null || socket.destroyed) return;
+  // ADR: XR ループは Offer 待ちで空フレームを回し続けるため、読取側を開いたままの
+  // 半閉鎖（socket.end）では切断を検知できない。finish と同じく破棄して切断として
+  // 知らせ、exe に統計を出させる。inFlight が無いことは上で確認済みのため安全である。
   log('全借用の ACK が揃ったためソケットを閉じる');
-  try { socket.end(); } catch { /* 無視 */ }
+  try { socket.destroy(); } catch { /* 無視 */ }
+}
+
+// ADR: ユーザー close・before-quit・SIGINT/SIGTERM・--seconds のいずれもこの
+// 優雅な停止に入る。新規 paint を止めて未処理の Done を最大 3 秒待ち、揃えば
+// maybeFinish がソケット破棄→close→exe 終了→finish の経路で終わる。
+// 直接 finish(0) すると処理中の offer を必ず隔離して exit 2 になるため避ける。
+// exe が無い動作・ソケットが無い場合は待っても意味が無いため即 finish する。
+// 正常終了（全 Done 返却済み・隔離 0・exe 0）なら app も 0 にする。
+// 猶予切れで未 ACK が残った場合のみ非ゼロ（2。隔離扱い）にする。
+// drainedCode は猶予切れで残債が無い場合の終了コードであり、通常は 0 を渡す。
+// --seconds の自動停止も正常終了として 0 を渡す（従来の 3 は使わない）。
+function beginShutdown(drainedCode: number): void {
+  if (finished) return;
+  // --seconds とウィンドウ close の競合で二重開始すると猶予タイマーが
+  // 作り直されて終了が延びるため、2 回目以降は何もしない。
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  if (NO_EXE || SELF_TEST || socket === null || socket.destroyed) {
+    finish(drainedCode);
+    return;
+  }
+  log('終了手順を開始する（新規 paint を止め、未処理の Done を最大 3 秒待つ）');
+  stopping = true;
+  if (stopTimer !== null) {
+    clearTimeout(stopTimer);
+    stopTimer = null;
+  }
+  maybeFinish();
+  if (graceTimer !== null) clearTimeout(graceTimer);
+  // 未 ACK が残る猶予切れは隔離（失敗）扱いのため終了 2 にする。
+  graceTimer = setTimeout(() => {
+    log('grace 期限切れ。未 ACK を隔離して終了する');
+    finish(inFlight !== null ? 2 : drainedCode);
+  }, 3000);
 }
 
 function finish(code: number): void {
@@ -1407,13 +1490,15 @@ function finish(code: number): void {
   } catch { /* 終了時は無視 */ }
   // exe 側の最終統計の出力を待つため、正常終了を最大 3 秒待ってから kill する。
   // 既に終了していれば即座に抜ける。切断検知の直後に kill すると exe の統計が欠ける。
+  // ADR: 終了は stdio の EOF（close）で待つ。exit だけではパイプ中の最終統計を
+  // 取りこぼす（ハーネスと同一の待ち方）。
   const waitExe = new Promise<void>((resolve) => {
     if (!exeProc || exeProc.exitCode !== null || exeProc.signalCode !== null) {
       resolve();
       return;
     }
     const t = setTimeout(resolve, 3000);
-    exeProc.once('exit', () => {
+    exeProc.once('close', () => {
       clearTimeout(t);
       resolve();
     });
@@ -1422,8 +1507,39 @@ function finish(code: number): void {
     try {
       if (exeProc && !exeProc.killed && exeProc.exitCode === null) exeProc.kill();
     } catch { /* 無視 */ }
-    flushLog();
-    app.exit(finalCode);
+    // exe の stdout を close（EOF）まで読み切った後に末尾断片を回収し、
+    // XR転送統計が app ログに入ったかを確認する（終了証拠として必須）。
+    try {
+      flushExeStats();
+    } catch { /* 計測の失敗は本線にしない */ }
+    if (exeProc !== null && !exeStatsLogged) {
+      log('警告: exe の XR転送統計を回収できない（exe が統計前に終了したか、出力の取りこぼし）');
+    }
+    // exe ログの書き切りを待ってから抜ける（統計行を落とさない）。詰まっても
+    // 500ms で打ち切り、ハングしない。二重呼び出しはしない。
+    let exited = false;
+    const done = (): void => {
+      if (exited) return;
+      exited = true;
+      flushLog();
+      app.exit(finalCode);
+    };
+    const stream = exeLogStream;
+    exeLogStream = null;
+    if (stream === null) {
+      done();
+      return;
+    }
+    try {
+      const t = setTimeout(done, 500);
+      stream.once('finish', () => {
+        clearTimeout(t);
+        done();
+      });
+      stream.end();
+    } catch {
+      done();
+    }
   });
 }
 
@@ -1562,16 +1678,12 @@ async function createWindow(): Promise<BrowserWindow> {
   if (SECONDS > 0) {
     stopTimer = setTimeout(() => {
       log(`${SECONDS}s 経過。新規 paint の受付を止める`);
-      stopping = true;
-      maybeFinish();
       // inFlight が残れば猶予後に隔離して終了する（timeout を返却許可にしない）。
-      graceTimer = setTimeout(() => {
-        log('grace 期限切れ。未 ACK を隔離して終了する');
-        // 未 ACK が残る猶予切れは隔離（失敗）扱いのため終了 2 にする。残債が無ければ 3。
-        // ただし exe 無し動作（--no-exe・--self-test）はパイプが無いため猶予切れが
-        // 正常終了の経路になる。残債が無ければ 0 で終える（exe 有りは変えない）。
-        finish(inFlight !== null ? 2 : (NO_EXE || SELF_TEST ? 0 : 3));
-      }, 8000);
+      // 残債が無ければ正常終了の 0 で終える（exe 有りでも変えない）。
+      // 正常終了（全 Done 返却済み・隔離 0・exe 0）なら app も 0 になる。
+      // ADR: 猶予は beginShutdown の 3 秒に抑える。通常の Done は 1 拍以内に来る
+      // ため十分であり、--seconds 自動終了を 3〜5 秒に収める。
+      beginShutdown(0);
     }, SECONDS * 1000);
   }
   return win;
@@ -1612,7 +1724,7 @@ function start(): void {
   log(`exe: ${EXE_PATH} ${exeArgs.join(' ')}`);
   // exe の出力をファイルへ保存する（受理/不明 ID の内訳用）。端末にもそのまま出す。
   let exeStdio: 'inherit' | 'pipe' = 'inherit';
-  let exeLogStream: fs.WriteStream | null = null;
+  exeLogStream = null;
   if (EXE_LOG !== '') {
     const exeLogPath = path.isAbsolute(EXE_LOG) ? EXE_LOG : path.join(logDir, EXE_LOG);
     try {
@@ -1630,8 +1742,11 @@ function start(): void {
     const forward = (chunk: Buffer): void => {
       stream.write(chunk);
       // VR 計測用に提出・棄却の行を数える（描画経路には触らない）。
+      // 終了統計（XR転送統計）は app ログにも残す（終了証拠として必須）。
       try {
-        countExeMeterChunk(chunk.toString('utf8'));
+        const text = chunk.toString('utf8');
+        countExeMeterChunk(text);
+        noteExeStatsChunk(text);
       } catch { /* 計測の失敗は本線にしない */ }
       try {
         process.stdout.write(chunk);
@@ -1641,9 +1756,8 @@ function start(): void {
     };
     exeProc.stdout?.on('data', forward);
     exeProc.stderr?.on('data', forward);
-    exeProc.on('exit', () => {
-      try { stream.end(); } catch { /* 終了時は無視 */ }
-    });
+    // ADR: ストリームの end は finish が引き取る（close 待ち後の書き切り用）。
+    // ここで end すると finish 側の flush 待ちが空振りして遅延するため触らない。
   }
   log(`exe spawned: pid=${exeProc.pid} pipe=${PIPE_PATH}`);
   exeProc.on('error', (e) => {
@@ -1826,7 +1940,27 @@ app.whenReady().then(() => {
   start();
 });
 process.on('SIGINT', () => {
-  log('SIGINT を受けた。終了する');
-  finish(0);
+  log('SIGINT を受けた。終了手順に入る');
+  beginShutdown(0);
 });
-app.on('window-all-closed', () => { /* 何もしない（OSR 収集中は閉じない） */ });
+process.on('SIGTERM', () => {
+  log('SIGTERM を受けた。終了手順に入る');
+  beginShutdown(0);
+});
+// ADR: 終了はすべて beginShutdown→finish 経由に一本化する。コントロール窓の
+// close が先行した場合は finished 旗で何もしない。before-quit では既定の終了を
+// 止めて finish の非同期待ち（exe の統計回収）を優先し、finish 側の app.exit で抜ける。
+// app.exit() 自体は before-quit を再発火しないため二重終了にならない。
+app.on('before-quit', (event) => {
+  if (!finished) {
+    event.preventDefault();
+    log('before-quit を受けた。終了手順に入る');
+    beginShutdown(0);
+  }
+});
+app.on('window-all-closed', () => {
+  if (!finished) {
+    log('window-all-closed を受けた。終了手順に入る');
+    beginShutdown(0);
+  }
+});

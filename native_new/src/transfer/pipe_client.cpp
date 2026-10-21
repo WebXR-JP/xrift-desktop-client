@@ -14,8 +14,9 @@
 namespace xrift::transfer {
 namespace {
 
-// 最後の Win32 エラーを添えた例外文を作る。
-std::runtime_error WinError(const char* what) {
+// 最後の Win32 エラーを添えた例外を作る。呼び出し側が切断と異常を区別できる
+// よう、PipeError（コード付き）で返す。throw は呼び出し側が行う。
+PipeError WinError(const char* what) {
   const DWORD code = ::GetLastError();
   char* text = nullptr;
   ::FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
@@ -33,7 +34,7 @@ std::runtime_error WinError(const char* what) {
     ::LocalFree(text);
   }
   message += ")";
-  return std::runtime_error(message);
+  return PipeError(message, static_cast<uint32_t>(code));
 }
 
 uint64_t NowUs() {

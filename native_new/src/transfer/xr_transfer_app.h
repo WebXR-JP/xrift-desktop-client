@@ -43,6 +43,13 @@ struct XrTransferOptions {
                              // Offer 処理後に次のフレームで発行する。応答停滞時は
                              // 新しいレコードで詰まりを解く（DESIGN §7）。
                              // off は現行どおり（ハーネスの 90fps 検証を保つ）。
+  // 終了段階ログ（--dump-exit-stage / XRIFT_EXIT_STAGE）。破棄順の切り分け用。
+  // 既定 off。通常経路の出力は変えない。
+  bool dumpExitStage = false;
+  // 正常・異常を問わず統計出力と明示 teardown の後に残りの RAII・静的デストラクタを
+  // 走らせない即時終了を行うか（既定 on）。終了時の非決定的クラッシュの回避用。
+  // off（--no-quick-exit）は従来の RAII 破棄を残す診断経路である。
+  bool quickExit = true;
 };
 
 // XR 提出ループを実行する。成功時は 0 を返す。

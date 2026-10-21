@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1010,6 +1011,34 @@ int RunXrTransfer(const XrTransferOptions& options) {
     Info("検証フック有効: --dump-submit=%s --dump-frame=%d（その回目の提出時に両眼を PPM 保存）",
          options.dumpSubmitDir.c_str(), options.dumpFrame);
   }
+  // 終了段階ログ（--dump-exit-stage / XRIFT_EXIT_STAGE）。破棄順の切り分け用。
+  // 既定 off。通常経路の出力は変えない。Info は行ごとに flush するため、
+  // 異常終了時も最後に出た段階まで残る。
+  // 環境変数の有無は GetEnvironmentVariableA で見る（getenv の警告を避ける）。
+  bool stage_log = options.dumpExitStage;
+  if (!stage_log) {
+    stage_log = ::GetEnvironmentVariableA("XRIFT_EXIT_STAGE", nullptr, 0) != 0;
+  }
+  auto stage = [&](const char* what) {
+    if (stage_log) {
+      Info("終了段階: %s", what);
+    }
+  };
+  if (stage_log) {
+    Info("終了段階ログ有効（--dump-exit-stage / XRIFT_EXIT_STAGE）");
+  }
+  // ADR: 終了時の非決定的クラッシュ（実測: 統計出力後の残り破棄で 0xC0000005・
+  // 0xC0000409）は、明示 teardown 後に残る RAII・静的デストラクタのいずれかで
+  // 起きる。必要な後始末（セッション終了・パイプ・統計 flush）は統計出力時点で
+  // 済んでいるため、以後は破棄を走らせず即時終了する（既定 on）。
+  // Info/Error は行ごとに flush するが、_Exit 前に念のため両方を flush する。
+  // --no-quick-exit では従来の RAII 破棄を残す（切り分け用）。
+  auto quick_exit = [&](int code) {
+    Info("終了: 残りの破棄を省略して終了する（--no-quick-exit で旧経路）");
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(code);
+  };
 
   // 転送セッションを先に作る。同一 VkDevice を XR セッションと共有し、
   // 自前イメージから swapchain への blit を同一デバイス内で行う。
@@ -1050,12 +1079,22 @@ int RunXrTransfer(const XrTransferOptions& options) {
     session = std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan(), space_pref);
   } catch (const std::exception& e) {
     Error("XR セッションの生成に失敗: %s", e.what());
+    // 生成失敗時も統計（空）とメッセージは残す。以後の RAII 破棄は
+    // quick-exit で飛ばす（終了時クラッシュの回避。正常経路と同一の出口）。
+    stats.Print(ledger.stats(), input.stats());
+    if (options.quickExit) {
+      quick_exit(1);
+    }
     return 1;
   }
   try {
     input.Create(transfer.XrInstance().handle());
   } catch (const std::exception& e) {
     Error("入力アクションの生成に失敗: %s", e.what());
+    stats.Print(ledger.stats(), input.stats());
+    if (options.quickExit) {
+      quick_exit(1);
+    }
     return 1;
   }
   if (!input.AttachSpaces(session->handle())) {
@@ -1067,6 +1106,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
                                                    gfx::M2PreferredSwapchainFormats());
   } catch (const std::exception& e) {
     Error("swapchain の生成に失敗: %s", e.what());
+    stats.Print(ledger.stats(), input.stats());
+    if (options.quickExit) {
+      quick_exit(1);
+    }
     return 1;
   }
   if (swapchains->format() != vk::Format::eB8G8R8A8Unorm) {
@@ -1078,7 +1121,18 @@ int RunXrTransfer(const XrTransferOptions& options) {
   blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains, options.dumpSubmitDir);
   M2BlockReader reader(transfer.Vulkan());
   HoldImage hold(transfer.Vulkan());
-  PipeClient pipe(options.pipeName);
+  // 接続失敗は例外で返る。統計とメッセージを残してから投げ直す
+  // （呼び出し側は 1 に丸めて通常終了させる）。
+  std::unique_ptr<PipeClient> pipe_owned;
+  try {
+    pipe_owned = std::make_unique<PipeClient>(options.pipeName);
+  } catch (const std::exception& e) {
+    Error("パイプ接続に失敗: %s", e.what());
+    stats.Print(ledger.stats(), input.stats());
+    throw;
+  }
+  // 以後は参照で使う（呼び出し側の記述は変えない。破棄順序も変わらない）。
+  PipeClient& pipe = *pipe_owned;
   Info("パイプ接続: main プロセスと接続した");
 
   XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1145,6 +1199,29 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // ため、少なくともハングせず統計を残すことを優先し、正常な切断は 0、異常は非ゼロで返す。
   bool pipeAlive = true;
   int exitCode = 0;
+  // 送信失敗の扱い。相手先の破棄に伴う切断（BROKEN_PIPE 等）は正常な終了手順の
+  // 合図であり、受信側の切断検知と同じく統計付きの正常終了にする（exit は 0 のまま）。
+  // アプリ側は未返却の借用を隔離して非ゼロ化するため、失敗の見落としにはならない。
+  // それ以外の送信失敗は異常として非ゼロ終了にする。
+  // 終了直前の競合（サーバ破棄と次フレーム送信の入れ違い）は切断側に倒す。
+  auto note_send_failure = [&](const char* what, const std::exception& e) {
+    const PipeError* pipe_error = dynamic_cast<const PipeError*>(&e);
+    // 相手先の破棄に伴う切断コード（いずれも「パイプは閉じられた」の変種）。
+    // GetOverlappedResult/WriteFile の失敗理由として実測した 232 を含む。
+    const bool graceful = pipe_error != nullptr &&
+                          (pipe_error->code == ERROR_BROKEN_PIPE ||
+                           pipe_error->code == ERROR_NO_DATA ||
+                           pipe_error->code == ERROR_PIPE_NOT_CONNECTED);
+    if (graceful) {
+      Info("%s送信先の切断を検知（Win32=%lu）のため新規受付を止めて終了する", what,
+           static_cast<unsigned long>(pipe_error->code));
+    } else {
+      Error("%s送信に失敗: %s", what, e.what());
+      exitCode = 1;
+    }
+    pipeAlive = false;
+    quit = true;
+  };
   // 最後に Offer（有効・無効を問わず何らかの受信）があった時刻。初回受信前は idle 判定を
   // 行わない（起動直後の誤終了を避ける）。
   bool haveOfferEver = false;
@@ -1407,10 +1484,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       try {
         pipe.Send(done);
       } catch (const std::exception& e) {
-        Error("ACK 送信に失敗: %s", e.what());
-        pipeAlive = false;
-        exitCode = 1;
-        quit = true;
+        note_send_failure("ACK", e);
         return;
       }
       if (have_last) {
@@ -1472,6 +1546,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
     hasFresh = true;
   };
 
+  // XRループの例外（xrWaitFrame 等の CheckXr 失敗）は統計付きで終了する。
+  // 統計欠落と abort（未捕捉例外の即死）を避けるための境界である。
+  // なお通常の終了（秒数・切断・途絶）は break で抜け、ここには来ない。
+  try {
   while (!quit) {
     if (deadlineUs != 0 && NowUs() >= deadlineUs) {
       Info("指定秒数を経過したため終了する");
@@ -1620,10 +1698,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
             pipe.Send(req);
             ++stats.requests;
           } catch (const std::exception& e) {
-            Error("RenderRequest 送信に失敗: %s", e.what());
-            pipeAlive = false;
-            exitCode = 1;
-            quit = true;
+            note_send_failure("RenderRequest", e);
           }
           rendered = true;
           if (options.paceRecords) {
@@ -1682,10 +1757,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
                                         input_latch[1]));
         ++stats.inputSent;
       } catch (const std::exception& e) {
-        Error("InputState 送信に失敗: %s", e.what());
-        pipeAlive = false;
-        exitCode = 1;
-        quit = true;
+        note_send_failure("InputState", e);
       }
       if (NowUs() - last_input_log_us >= 1000000u) {
         last_input_log_us = NowUs();
@@ -1834,6 +1906,11 @@ int RunXrTransfer(const XrTransferOptions& options) {
     }
     CheckXr(xrEndFrame(session->handle(), &end_info), "xrEndFrame");
   }
+  } catch (const std::exception& e) {
+    Error("XRループの異常終了: %s（統計を出して終了する）", e.what());
+    pipeAlive = false;
+    exitCode = 1;
+  }
 
   stats.Print(ledger.stats(), input.stats());
   Info("M2 中間破棄: %llu（最新優先のため Done のみ返した件数）",
@@ -1847,6 +1924,25 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
   if (!pipeAlive) {
     Info("パイプ終了に伴う終了（exit=%d）", exitCode);
+  }
+  // セッション束は明示の順序で破棄する（blit → swapchain → session）。
+  // 宣言順の逆順 RAII でも同じ順序になるが、段階ログと合わせて順序を固定する。
+  // なお実行中のまま xrDestroySession しても SteamVR は受け付けることを確認済み
+  // （終了時 exit 0）。STOPPING 未満での xrEndSession は NOT_STOPPING で失敗する
+  // ため、ここであえて End は呼ばない（イベント経路の End に任せる）。
+  stage("セッション束の破棄を開始する");
+  stage("blit を破棄する");
+  blit.reset();
+  stage("swapchain を破棄する");
+  swapchains.reset();
+  stage("セッションを破棄する");
+  session.reset();
+  stage("セッション束の破棄完了（残りは RAII 破棄）");
+  // 残りの RAII（TransferSession・reader・pipe 等）と静的デストラクタは
+  // 走らせずに終了する（既定 on。終了時クラッシュの回避）。
+  // --no-quick-exit では旧来どおり return し、RAII 破棄を行う（切り分け用）。
+  if (options.quickExit) {
+    quick_exit(exitCode);
   }
   return exitCode;
 }
