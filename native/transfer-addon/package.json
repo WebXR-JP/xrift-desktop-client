@@ -2,6 +2,6 @@
   "name": "xrift-transfer-addon",
   "version": "0.1.0",
   "private": true,
-  "description": "M1 転送用 N-API アドオン（OSR 共有テクスチャの NT ハンドル複製）",
+  "description": "転送用 N-API アドオン（OSR 共有テクスチャの NT ハンドル複製）",
   "main": "build/Release/xrift_transfer_addon.node"
 }

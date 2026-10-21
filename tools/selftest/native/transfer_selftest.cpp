@@ -5,7 +5,7 @@
 #include <string>
 
 #include "transfer/input_state.h"
-#include "transfer/m2_blocks.h"
+#include "transfer/control_blocks.h"
 #include "transfer/protocol.h"
 #include "transfer/render_record.h"
 #include "xr/input.h"
@@ -18,9 +18,9 @@ int g_failures = 0;
 
 void Check(bool cond, const char* name) {
   if (cond) {
-    std::printf("[m2-selftest] ok: %s\n", name);
+    std::printf("[transfer-selftest] ok: %s\n", name);
   } else {
-    std::printf("[m2-selftest] FAIL: %s\n", name);
+    std::printf("[transfer-selftest] FAIL: %s\n", name);
     ++g_failures;
   }
 }
@@ -39,7 +39,7 @@ EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float o
 
 }  // namespace
 
-int RunM2SelfTest() {
+int RunTransferSelfTest() {
   // 1. 配置の実行時確認（static_assert の相手側。JS との一致は protocol-test.js で行う）。
   Check(sizeof(TransferMessage) == 256, "メッセージ 256B");
   Check(offsetof(TransferMessage, renderId) == 40, "renderId オフセット 40");
@@ -67,23 +67,23 @@ int RunM2SelfTest() {
   Check(QuantizePos(-99.0f) == 0 && QuantizePos(99.0f) == 255, "pos 範囲外は端に寄せる");
   Check(QuantizeOri(-1.0f) == 0 && QuantizeOri(1.0f) == 255, "ori 量子化の両端");
 
-  // 4. pose タグの決定性と感度。値は JS 側（m2-codec-test.js）と共有する。
+  // 4. pose タグの決定性と感度。値は JS 側（control-codec.test.cjs）と共有する。
   // 変更時は JS 側の期待値も同時に更新する。
   const uint16_t tagA = PoseTag(42, 1, 7, left, right);
   const uint16_t tagA2 = PoseTag(42, 1, 7, left, right);
   Check(tagA == tagA2, "pose タグの決定性");
-  std::printf("[m2-selftest] tag vectors: id=42 tag=0x%04x\n", tagA);
+  std::printf("[transfer-selftest] tag vectors: id=42 tag=0x%04x\n", tagA);
   const EyePose leftMoved = Pose(0.2f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
   Check(PoseTag(42, 1, 7, leftMoved, right) != tagA, "pose 変化でタグが変わる");
   Check(PoseTag(43, 1, 7, left, right) != tagA, "ID 変化でタグが変わる");
   Check(PoseTag(42, 1, 8, left, right) != tagA, "space 世代変化でタグが変わる");
   const uint16_t tagB = PoseTag(0x123456789ABCDEF0ull, 3, 11, leftMoved, left);
-  std::printf("[m2-selftest] tag vectors: id=0x123456789ABCDEF0 tag=0x%04x\n", tagB);
+  std::printf("[transfer-selftest] tag vectors: id=0x123456789ABCDEF0 tag=0x%04x\n", tagB);
 
-  // 4b. 制御ブロックの画素往復（m2_blocks.h。GPU コピー経路の CPU 側再現）。
-  // JS 側（m2-codec-test.js）の符号化とセル配置が一致することの相手側である。
+  // 4b. 制御ブロックの画素往復（control_blocks.h。GPU コピー経路の CPU 側再現）。
+  // JS 側（control-codec.test.cjs）の符号化とセル配置が一致することの相手側である。
   {
-    uint8_t pixels[kM2BlockBytes];
+    uint8_t pixels[kControlBlockBytes];
     const uint16_t samples[5] = {0, 1, tagA, tagB, 0xFFFF};
     bool roundtrip_ok = true;
     for (uint16_t s : samples) {
@@ -121,7 +121,7 @@ int RunM2SelfTest() {
   Check(st.accepted == 1 && st.unknownId == 1 && st.poseMismatch == 1 && st.spaceMismatch == 1 &&
             st.expired == 1,
         "理由別カウントの内訳");
-  std::printf("[m2-selftest] stats: accepted=%llu unknown=%llu poseNg=%llu spaceNg=%llu expired=%llu\n",
+  std::printf("[transfer-selftest] stats: accepted=%llu unknown=%llu poseNg=%llu spaceNg=%llu expired=%llu\n",
               static_cast<unsigned long long>(st.accepted),
               static_cast<unsigned long long>(st.unknownId),
               static_cast<unsigned long long>(st.poseMismatch),
@@ -134,14 +134,14 @@ int RunM2SelfTest() {
   Check(ledger.Accept(id16, tag, 7, t0 + 5000) == RejectReason::SpaceMismatch,
         "旧世代の画像は進行後も棄却");
 
-  // 8. M4: 接続世代の進行で旧レコードは失効する（セッション再生成時の切り替え）。
+  // 8. 接続世代の進行で旧レコードは失効する（セッション再生成時の切り替え）。
   RenderLedger conn_ledger(1, 7);
   conn_ledger.Issue(42, left, right, lf, rf, 2048, 1024, t0);
   conn_ledger.AdvanceConnEpoch(2);
   Check(conn_ledger.size() == 0, "接続世代の進行で台帳は空になる");
   Check(conn_ledger.connEpoch() == 2, "接続世代の保持");
 
-  // 9. M4: HapticCommand の往復と妥当性（配置は protocol.h の定義どおり）。
+  // 9. HapticCommand の往復と妥当性（配置は protocol.h の定義どおり）。
   {
     const TransferMessage haptic = MakeHapticCommand(1, 0.8f, 300);
     Check(IsValidHapticCommand(haptic), "HapticCommand 有効");
@@ -159,7 +159,7 @@ int RunM2SelfTest() {
     Check(!IsValidHapticCommand(bad_dur), "持続 0 の指令は無効");
   }
 
-  // 10. M4: profile 識別子と量子化（JS 側 protocol-test.js と同じ表・同じ式）。
+  // 10. profile 識別子と量子化（JS 側 protocol-test.js と同じ表・同じ式）。
   Check(ProfileIdFromName("") == 0, "空 profile は未取得");
   Check(ProfileIdFromName("/interaction_profiles/bytedance/pico4_controller") == 6,
         "PICO 4 の識別子");
@@ -171,9 +171,9 @@ int RunM2SelfTest() {
   Check(QuantizeStick(-1.0f) == static_cast<uint8_t>(static_cast<int8_t>(-127)) &&
             QuantizeStick(1.0f) == 127,
         "スティック量子化の両端");
-  Check(sizeof(TransferMessage) == 256, "M5 追加後もメッセージ 256B");
+  Check(sizeof(TransferMessage) == 256, "拡張後もメッセージ 256B");
 
-  // 11. M4計測: 押下エッジの検出と 1 秒ラッチ（HMD 無しで形式を確認する）。
+  // 11. 入力計測: 押下エッジの検出と 1 秒ラッチ（HMD 無しで形式を確認する）。
   // 実機の取りこぼし（短い押下・primary/menu の未記録）の切り分け用である。
   {
     // 合成スナップショットの雛形。ボタンは非押下・Inactive、pose は無効から始める。
@@ -235,7 +235,7 @@ int RunM2SelfTest() {
     Check(pose_edge.find("L.connected no->yes") != std::string::npos, "接続変化のエッジ");
   }
 
-  // 12. M4計測: 押下ラッチの bit 割付けと InputState への格納（予約先頭 2B）。
+  // 12. 入力計測: 押下ラッチの bit 割付けと InputState への格納（予約先頭 2B）。
   {
     xr::InputSnapshot s{};
     s.frameNo = 77;
@@ -271,7 +271,7 @@ int RunM2SelfTest() {
     Check(custom.Accept(cid16, ctag, 7, t0 + 2000001) == RejectReason::Expired,
           "TTL 2s 超の画像は棄却");
   }
-  // 13. M5: InputState のコントローラ pose（左右の grip/aim）の往復。
+  // 13. InputState のコントローラ pose（左右の grip/aim）の往復。
   // 配置は protocol.h の kInput*（C++ と JS の一致は protocol-test.js で行う）。
   // 有効性は手 flags が表し、無効時の値は 0 のままである。
   {
@@ -332,10 +332,10 @@ int RunM2SelfTest() {
   }
 
   if (g_failures > 0) {
-    std::printf("[m2-selftest] FAIL %d 件\n", g_failures);
+    std::printf("[transfer-selftest] FAIL %d 件\n", g_failures);
     return 1;
   }
-  std::printf("[m2-selftest] all ok\n");
+  std::printf("[transfer-selftest] all ok\n");
   return 0;
 }
 

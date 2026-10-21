@@ -1,13 +1,13 @@
-// M2 コーデック試験（素の node で実行可。前提: `npm run build` で dist が最新）。
-// C++ 側（tools/selftest の --m2-selftest）と同じ
+// 制御ブロック・コーデック試験（素の node で実行可。前提: `npm run build` で dist が最新）。
+// C++ 側（tools/selftest の --selftest）と同じ
 // ベクトルで一致を確かめる。期待値を変えたら両側を同時に更新すること。
-// 使い方: node tools/test/client/m2codec.test.cjs
+// 使い方: node tools/test/client/control-codec.test.cjs
 'use strict';
 const assert = require('node:assert');
-const codec = require('../../../client/dist/m2codec.js');
+const codec = require('../../../client/dist/control-codec.js');
 const { quantizePos, quantizeOri, poseTag, renderId16, encodeBlock16, decodeBlock16 } = codec;
 
-// 量子化の両端と範囲外の寄せ（C++ の --m2-selftest と同じ条件）。
+// 量子化の両端と範囲外の寄せ（C++ の --selftest と同じ条件）。
 assert.strictEqual(quantizePos(-4.0), 0);
 assert.strictEqual(quantizePos(4.0), 255);
 assert.strictEqual(quantizePos(-99), 0);
@@ -15,7 +15,7 @@ assert.strictEqual(quantizePos(99), 255);
 assert.strictEqual(quantizeOri(-1.0), 0);
 assert.strictEqual(quantizeOri(1.0), 255);
 
-// C++ の --m2-selftest とのタグベクトルの一致。
+// C++ の --selftest とのタグベクトルの一致。
 const left = { position: [0.1, 1.6, 0.0], orientation: [0, 0, 0, 1] };
 const right = { position: [0.164, 1.6, 0.0], orientation: [0, 0, 0, 1] };
 const tagA = poseTag(42n, 1, 7, left, right);
@@ -43,5 +43,5 @@ const freshTag = poseTag(100n, 1, 7, leftMoved, right);
 const mixedTag = poseTag(100n, 1, 7, left, right);
 assert.notStrictEqual(freshTag, mixedTag, '新 ID に旧 pose を混ぜるとタグ不一致');
 
-console.log(`m2codec.test: ok（量子化・タグ一致 id=42:0x${tagA.toString(16)} ` +
+console.log(`control-codec.test: ok（量子化・タグ一致 id=42:0x${tagA.toString(16)} ` +
   `id=0x1234..:0x${tagB.toString(16)}・文字列 ID・ブロック往復・混入検出を確認）`);

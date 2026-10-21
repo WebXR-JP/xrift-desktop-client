@@ -5,7 +5,7 @@
  * WebXR シム（`./shim`）は `executeInMainWorld` でページより先に注入する。
  */
 import { contextBridge, ipcRenderer } from 'electron';
-import { installM5XR } from './shim.js';
+import { installXRiftXR } from './shim.js';
 
 /** renderer へ送る描画要求。構造は `protocol.ts` の `XrRecord` と同じ。 */
 export interface RecordPayload {
@@ -63,4 +63,4 @@ const bridge = {
 
 contextBridge.exposeInMainWorld('__xriftXR', bridge);
 // ページのスクリプトより先に navigator.xr を差し替える
-contextBridge.executeInMainWorld({ func: installM5XR });
+contextBridge.executeInMainWorld({ func: installXRiftXR });

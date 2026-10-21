@@ -1,5 +1,5 @@
 // InputState の配置試験（素の node で実行可。前提: `npm run build` で dist が最新）。
-// C++ 側（protocol.h の kInput* 配置・--m2-selftest）と同じオフセットで一致を確かめる。
+// C++ 側（protocol.h の kInput* 配置・--selftest）と同じオフセットで一致を確かめる。
 // 使い方: node tools/test/client/protocol.test.cjs
 'use strict';
 const assert = require('node:assert');

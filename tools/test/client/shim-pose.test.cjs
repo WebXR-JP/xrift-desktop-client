@@ -1,5 +1,5 @@
 // シムの pose 検証（素の node で実行可。前提: `npm run build` で dist が最新）。
-// ブラウザの最小スタブ上で `installM5XR` を動かし、以下を確かめる。
+// ブラウザの最小スタブ上で `installXRiftXR` を動かし、以下を確かめる。
 //   - pose 無効時（非装着相当）: `targetRaySpace` / `gripSpace` の `getPose` が
 //     null を返し、例外が出ない
 //   - pose 有効時: `getPose` が position/orientation 由来の行列を返す
@@ -78,8 +78,8 @@ async function main() {
   Object.defineProperty(globalThis, 'navigator', { value: {}, configurable: true, writable: true });
   globalThis.document = makeDocument();
 
-  const { installM5XR } = require('../../../client/dist/shim.js');
-  installM5XR();
+  const { installXRiftXR } = require('../../../client/dist/shim.js');
+  installXRiftXR();
   const xr = globalThis.navigator.xr;
   assert.ok(xr, 'navigator.xr が差し替わる');
   assert.strictEqual(await xr.isSessionSupported('immersive-vr'), true);

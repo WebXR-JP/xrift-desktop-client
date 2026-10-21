@@ -3,10 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 
-// M2 転送プロトコル（Electron main ⇔ xrift_new.exe）の固定長バイナリ形式。
+// 転送プロトコル（Electron main ⇔ xrift_native.exe）の固定長バイナリ形式。
 // main がサーバ、exe がクライアント。1 メッセージ 256 バイト、リトルエンディアン。
-// M1 の 64B 配置は先頭 64B として保存する（Offer/Done の既存オフセットは不変）。
-// 64〜191B に M2 の RenderRequest 領域を足し、M5 で 192〜255B に拡張する。
+// 旧 64B 配置は先頭 64B として保存する（Offer/Done の既存オフセットは不変）。
+// 64〜191B に RenderRequest 領域を足し、192〜255B に拡張した。
 // InputState のコントローラ pose は 88〜143B（InputState では未使用の
 // RenderRequest 欄の再利用。種別で区別する）と 160〜215B に載る（下の kInput* 配置）。
 // Node 側（client/src/protocol.ts と tools/test/client/protocol.test.cjs）は
@@ -17,15 +17,15 @@ namespace xrift::transfer {
 
 // "XRFT" をリトルエンディアン u32 で読んだ値。
 constexpr uint32_t kMagic = 0x54465258u;
-// M2 で 192B 化したため版を上げる。M1 の 64B 送信側とは枠が合わないため混用しない。
-// M5 で 256B 化したため更に版を上げる。192B の相手とは枠が合わないため混用しない。
+// 192B 化したため版を上げる。旧 64B 送信側とは枠が合わないため混用しない。
+// 256B 化したため更に版を上げる。192B の相手とは枠が合わないため混用しない。
 constexpr uint16_t kVersion = 3;
 
 constexpr uint16_t kTypeOffer = 1;          // main → exe。借用中の複製ハンドルを渡す。
 constexpr uint16_t kTypeDone = 2;           // exe → main。GPU コピー完了（または失敗）を返す。
 constexpr uint16_t kTypeRenderRequest = 3;  // exe → main。描画要求（pose/FOV と要求を供給）。
-constexpr uint16_t kTypeHapticCommand = 4;  // main → exe。haptics 指令（M4）。
-constexpr uint16_t kTypeInputState = 5;     // exe → main。入力スナップショット（M4）。
+constexpr uint16_t kTypeHapticCommand = 4;  // main → exe。haptics 指令。
+constexpr uint16_t kTypeInputState = 5;     // exe → main。入力スナップショット。
 
 constexpr uint32_t kFormatBgra8Unorm = 0;  // OSR pixelFormat "bgra" に対応。
 
@@ -62,13 +62,13 @@ struct EyeFov {
 // format 24, handle 28, status 36, renderId 40, connEpoch 48, spaceEpoch 52,
 // leftPos 56, leftOri 68, rightPos 84, rightOri 96, leftFov 112, rightFov 128,
 // reqWidth 144, reqHeight 148, reserved 152。合計 256 バイト。
-// Offer/Done では 40 以降を 0 で送り、受信側は読まない（M1 経路の挙動は変えない）。
+// Offer/Done では 40 以降を 0 で送り、受信側は読まない（旧経路の挙動は変えない）。
 // RenderRequest（exe→main）では borrowId/handle/status を 0 にし、renderId 以降を使う。
 // width/height は RenderRequest では要求アトラス寸法（横並び全体）を入れる。
 // InputState（exe→main）では予約先頭 2B（reserved[0]=左、[1]=右）に押下ラッチ
 // （その 1 秒間に押されたボタンの集合。buttons 欄と同じ bit 割付け）を載せる。
 // 短い押下の取りこぼし診断用であり、旧復号器は予約域を読まないため版は上げない。
-// M5 の InputState のコントローラ pose（下の kInputGrip*・kInputAim* 配置）は
+// InputState のコントローラ pose（下の kInputGrip*・kInputAim* 配置）は
 // 種別で区別する再利用であり、RenderRequest の既存欄のオフセットは変えない。
 struct TransferMessage {
   uint32_t magic = 0;
@@ -168,16 +168,16 @@ inline TransferMessage MakeRenderRequest(uint64_t renderId, uint32_t connEpoch,
   return m;
 }
 
-// ---- M4: haptics 指令（main → exe）と入力スナップショット（exe → main） ----
-// どちらも 256B 固定の TransferMessage に載せる。M5 で 192B→256B 化したため
+// ---- haptics 指令（main → exe）と入力スナップショット（exe → main） ----
+// どちらも 256B 固定の TransferMessage に載せる。192B→256B 化したため
 // 版を上げる（kVersion=3。枠が合わない 192B の相手とは混用しない）。
-// 未知の種別を読む側は無視するため、M1/M2 の既存経路の挙動は変えない。
+// 未知の種別を読む側は無視するため、既存経路の挙動は変えない。
 // レイアウトを変えたら C++ 側・JS 側（main.js と protocol-test.js）を同時に更新する。
 
 // HapticCommand（main → exe）の配置。hand 以外は 0 で送らない。
 // hand: u32（renderId の下位 32bit。0=左、1=右。上位 32bit は 0）、
 // amplitude: float（leftPos[0] と同位置。0〜1）、durationMs: u32（connEpoch と同位置）。
-// いずれも M2 の RenderRequest とは種別で区別するため、既存オフセットの再利用である。
+// いずれも RenderRequest とは種別で区別するため、既存オフセットの再利用である。
 inline TransferMessage MakeHapticCommand(uint32_t hand, float amplitude, uint32_t durationMs) {
   TransferMessage m{};
   m.magic = kMagic;
@@ -330,7 +330,7 @@ constexpr size_t kInputHandAnalogSupported = 13;  // bit0=trigger、bit1=squeeze
 // InputState（exe → main）のコントローラ pose 配置。各 pose は position xyz＋
 // orientation xyzw の float LE（28B）である。
 // 左手 2 pose は InputState では未使用の 88〜143B（RenderRequest では rightPos 末尾・
-// rightOri・左右 FOV の位置）に、右手 2 pose は M5 拡張の 160〜215B に載せる。
+// rightOri・左右 FOV の位置）に、右手 2 pose は 160〜215B の拡張領域に載せる。
 // 種別（type=5）で区別する再利用であり、RenderRequest の既存欄のオフセットは
 // 変えない。InputState では 144〜159B（req 欄・ラッチ・詰め物）と 216〜255B は 0 である。
 // 有効性は既存の手 flags（bit1=grip・bit2=aim）で表し、新たな欄は設けない。
@@ -373,7 +373,7 @@ inline ControllerPose ReadInputPose(const TransferMessage& m, size_t offset) {
   return pose;
 }
 
-// M5 の InputState pose 配置。左手 2 pose は 88〜143B、右手 2 pose は 160〜215B であり、
+// InputState pose 配置。左手 2 pose は 88〜143B、右手 2 pose は 160〜215B であり、
 // 境界は 4B 揃え、末尾は 256B に収まること。ラッチ（152,153）と req 欄（144〜151）は避ける。
 static_assert(kInputAimLeft == kInputGripLeft + kInputPoseSize, "左 aim pose は左 grip の直後であること");
 static_assert(kInputAimRight == kInputGripRight + kInputPoseSize,

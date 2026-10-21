@@ -1,5 +1,5 @@
 /**
- * M5 新アプリの main プロセス。
+ * Client アプリの main プロセス。
  *
  * 役割: パイプサーバ + 借用台帳 + `release()` 専任。提出には関与しない。
  *  - OSR ウィンドウ（show:false、offscreen useSharedTexture）で paint を受ける
@@ -36,7 +36,7 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 // パッケージ版（app.isPackaged）では argv にスクリプトパスが含まれないため、
 // 開発時（electron . …）より 1 つ前から読む。SteamVR からの起動引数もここに載る。
-// ADR: slice 位置を各所で直書きせず ARGV に一本化する（ずれると --self-test 等の
+// ADR: slice 位置を各所で直書きせず ARGV に一本化する（ずれると --selftest 等の
 // フラグが黙って無視され、通常起動として固まる）。
 const ARGV: readonly string[] = process.argv.slice(app.isPackaged ? 1 : 2);
 function arg(name: string, def: string): string {
@@ -58,12 +58,12 @@ function packagedResource(fileName: string): string | null {
   } catch { /* 開発実行では resourcesPath が無い場合がある */ }
   return null;
 }
-const DEV_EXE_PATH = path.join(__dirname, '..', '..', 'native', 'build', 'windows', 'Release', 'xrift_new.exe');
+const DEV_EXE_PATH = path.join(__dirname, '..', '..', 'native', 'build', 'windows', 'Release', 'xrift_native.exe');
 const DEV_ADDON_PATH = path.join(
   __dirname, '..', '..', 'native', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node',
 );
-const EXE_PATH = arg('exe', packagedResource('xrift_new.exe') ?? DEV_EXE_PATH);
-const PIPE_PATH = arg('pipe', `\\\\.\\pipe\\xrift_m5_${process.pid}`);
+const EXE_PATH = arg('exe', packagedResource('xrift_native.exe') ?? DEV_EXE_PATH);
+const PIPE_PATH = arg('pipe', `\\\\.\\pipe\\xrift_${process.pid}`);
 const RENDER_SCALE = arg('render-scale', '0.5');
 const RECORD_TTL_MS = Math.max(1, parseInt(arg('record-ttl-ms', '2000'), 10) || 2000);
 const SECONDS = Math.max(0, parseInt(arg('seconds', '0'), 10) || 0);
@@ -111,7 +111,7 @@ function resolveTarget(): { kind: 'url'; url: string } | { kind: 'file'; file: s
 const ADDON_PATH = arg('addon', packagedResource('xrift_transfer_addon.node') ?? DEV_ADDON_PATH);
 // tools/pages 配下の検証ページの解決。開発時は repo 直下の tools/、
 // 配布時は extraResource（resources/tools/）から読む。
-// ADR: self-test が読む mirror-input.html は製品ページではないため client/pages には置かず、
+// ADR: selftest が読む mirror-input.html は製品ページではないため client/pages には置かず、
 // package.cjs が配布物へ同梱する（開発時と配布時で基準が違うため存在確認で切り替える）。
 function toolPagePath(name: string): string {
   try {
@@ -122,7 +122,7 @@ function toolPagePath(name: string): string {
 }
 // exe の stdout/stderr の保存先（受理/不明 ID の内訳用）。相対パスは logs/ 基準。
 // `--exe-log=`（空）で従来の inherit（保存しない）に戻す。
-const EXE_LOG = arg('exe-log', 'm5-exe.log');
+const EXE_LOG = arg('exe-log', 'native.log');
 if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
   console.error(`unknown --space=${SPACE}（auto / local / stage / local-floor のいずれか）`);
   process.exitCode = 1;
@@ -133,7 +133,7 @@ if (!['auto', 'local', 'stage', 'local-floor'].includes(SPACE)) {
 const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   'exe', 'addon', 'pipe', 'render-scale', 'record-ttl-ms', 'seconds', 'space', 'url',
   'width', 'height', 'exe-log', 'mirror-fps', 'mirror-vr-fps', 'control-width',
-  'control-height', 'self-test',
+  'control-height', 'selftest',
 ]);
 for (const a of ARGV) {
   if (a === '--' || !a.startsWith('--')) continue;
@@ -145,11 +145,11 @@ for (const a of ARGV) {
     break;
   }
 }
-// C 案（OSR のミラー + 入力転送）の設定。`--self-test` は
+// C 案（OSR のミラー + 入力転送）の設定。`--selftest` は
 // ミラー・入力転送・VR リサイズの自動検証を行い、結果で終了する（HMD 不要）。
-// self-test は exe 無しで回すため、exe の spawn・パイプサーバを飛ばす
-// （self-test 内部専用であり、通常起動のフラグではない）。
-const SELF_TEST = ARGV.includes('--self-test');
+// selftest は exe 無しで回すため、exe の spawn・パイプサーバを飛ばす
+// （selftest 内部専用であり、通常起動のフラグではない）。
+const SELF_TEST = ARGV.includes('--selftest');
 const MIRROR_FPS = Math.min(30, Math.max(1, parseInt(arg('mirror-fps', '10'), 10) || 10));
 // ADR: VR 中のミラーは既定で停止する（0=停止）。ブラウジング中は 10fps のまま。
 // 0 を許すため下限は 0 とし、数値以外は既定 0 に倒す。
@@ -165,8 +165,8 @@ const CTL_H = parseInt(arg('control-height', '600'), 10) || 600;
 // ---- ログ（stdout とファイルの両方。ランチャー経由だとコンソールが無いため）
 const logDir = path.join(__dirname, '..', 'logs');
 fs.mkdirSync(logDir, { recursive: true });
-const logPath = path.join(logDir, 'm5-run.log');
-const statsPath = path.join(logDir, 'm5-stats.json');
+const logPath = path.join(logDir, 'client.log');
+const statsPath = path.join(logDir, 'stats.json');
 const logLines: string[] = [];
 function log(msg: string): void {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -261,7 +261,7 @@ const stats = {
   inputStates: 0, // exe から受けた InputState の件数。
   lastInput: null as InputSnapshot | null, // 最後に受けた InputState の要約（統計用）。
   hapticSent: 0, // exe へ送った HapticCommand の件数。
-  controlCaptures: 0, // self-test で保存したコントロール窓 PNG の枚数。
+  controlCaptures: 0, // selftest で保存したコントロール窓 PNG の枚数。
   mirrorFrames: 0, // コントロール窓へ送ったミラーの枚数。
   mirrorErrors: 0, // ミラー capture・送信の失敗回数。
   mirrorCaptureAvgMs: 0, // capturePage の平均所要（終了時に確定）。
@@ -307,7 +307,7 @@ const mirrorTimes: number[] = []; // ミラー送信時刻（直近の fps 計�
 // VR 中の 5 秒計測用。exe の stdout を main が中継する際に数える（提出・棄却の内訳）。
 // paint レート（OSR 側の描画）と受理率（exe 側の照合）を切り分けるため、5 秒ごとにログに出す。
 const vrMeter = {
-  submits: 0, // exe の M2 提出（受理して blit へ進んだ件数）。
+  submits: 0, // exe の XR 提出（受理して blit へ進んだ件数）。
   unknownId: 0, // 棄却の内訳（保持に無い renderId）。
   poseMismatch: 0, // 棄却の内訳（pose タグ不一致）。
   spaceMismatch: 0, // 棄却の内訳（space 世代不一致）。
@@ -319,30 +319,30 @@ const vrMeter = {
 };
 let vrMeterTimer: NodeJS.Timeout | null = null;
 // exe の 1 チャンクから提出・棄却の行を数える。exe のログ形式
-// （`M2 提出:`・`M2 棄却: <理由>`）に依存するため、形式が変わればここも更新する。
+// （`XR 提出:`・`XR 棄却: <理由>`）に依存するため、形式が変わればここも更新する。
 function countExeMeterChunk(text: string): void {
-  if (!text.includes('M2 ')) return;
+  if (!text.includes('XR ')) return;
   const prevSubmits = vrMeter.submits;
   // 提出は 1 行 1 件である。
-  let i = text.indexOf('M2 提出:');
+  let i = text.indexOf('XR 提出:');
   while (i >= 0) {
     vrMeter.submits++;
-    i = text.indexOf('M2 提出:', i + 1);
+    i = text.indexOf('XR 提出:', i + 1);
   }
   // 有効化後の最初の受理までの時間を記録する（VR 開始の立ち上がり観測用）。
   if (xrActive && !vrFirstAcceptLogged && vrMeter.submits > prevSubmits && xrActiveSince !== null) {
     vrFirstAcceptLogged = true;
     const elapsed = Date.now() - xrActiveSince;
-    const m = /M2 提出: renderId=(\d+)/.exec(text);
+    const m = /XR 提出: renderId=(\d+)/.exec(text);
     const idNote = m !== null ? `（renderId=${m[1]}）` : '';
-    log(`[M5 VR開始] 最初の受理まで ${elapsed}ms${idNote}`);
+    log(`[VR開始] 最初の受理まで ${elapsed}ms${idNote}`);
   }
   // 棄却は理由名で内訳を数える（render_record.h の RejectReasonName と一致）。
   const reasons: [string, 'unknownId' | 'poseMismatch' | 'spaceMismatch' | 'expired'][] = [
-    ['M2 棄却: 不明ID', 'unknownId'],
-    ['M2 棄却: pose不一致', 'poseMismatch'],
-    ['M2 棄却: space世代不一致', 'spaceMismatch'],
-    ['M2 棄却: 失効', 'expired'],
+    ['XR 棄却: 不明ID', 'unknownId'],
+    ['XR 棄却: pose不一致', 'poseMismatch'],
+    ['XR 棄却: space世代不一致', 'spaceMismatch'],
+    ['XR 棄却: 失効', 'expired'],
   ];
   for (const [needle, key] of reasons) {
     let j = text.indexOf(needle);
@@ -409,7 +409,7 @@ function logVrMeter(): void {
     vrMeter.spaceMismatch + vrMeter.expired;
   const totRate = totDecided > 0 ? `${(vrMeter.submits / totDecided * 100).toFixed(1)}%` : '−';
   const perPaint = dPaints > 0 ? (dSub / dPaints).toFixed(2) : '−';
-  log(`[M5 VR計測] paint=${dPaints}/5s（${(dPaints / 5).toFixed(1)}/s） ` +
+  log(`[VR計測] paint=${dPaints}/5s（${(dPaints / 5).toFixed(1)}/s） ` +
     `offers=${stats.offers} dones=${stats.dones} stalePaint+${dStale}（累計${stats.droppedStale}） ` +
     `提出+${dSub}（累計${vrMeter.submits}） ` +
     `棄却+${dRej}` +
@@ -661,7 +661,7 @@ function onDone(borrowId: number, status: number): void {
 // 両眼横並びのため 2*reqWidth × reqHeight にする。初回とサイズ変更時のみ変える。
 // VR への切替は xrActive（renderer の requestSession 通知）で決める。
 // xrActive が false の間はリサイズも転送もしない（サイトを開いただけでは VR にしない）。
-// self-test の VR リサイズ検証もこの関数を通す（本番と同一経路）。
+// selftest の VR リサイズ検証もこの関数を通す（本番と同一経路）。
 function applyVrResize(reqW: number, reqH: number, renderId: string): void {
   const osr = winRef;
   if (osr === null || osr.isDestroyed()) return;
@@ -722,7 +722,7 @@ function deliverRecord(rec: XrRecord, via: string): void {
     if (recordLogCount < 3 && winRef !== null && !winRef.isDestroyed()) {
       recordLogCount++;
       const [nowW, nowH] = winRef.getContentSize();
-      log(`[M5記録] #${recordLogCount} renderId=${rec.renderId} req=${rec.reqWidth}x${rec.reqHeight}/眼 window=${nowW}x${nowH} xrActive=true${via}`);
+      log(`[描画要求] #${recordLogCount} renderId=${rec.renderId} req=${rec.reqWidth}x${rec.reqHeight}/眼 window=${nowW}x${nowH} xrActive=true${via}`);
     }
     if (winRef !== null && !winRef.isDestroyed()) winRef.webContents.send('xr:record', rec);
     if (xrActive && vrFirstRecordAt === null && xrActiveSince !== null) {
@@ -731,7 +731,7 @@ function deliverRecord(rec: XrRecord, via: string): void {
         clearTimeout(vrNoRecordWarnTimer);
         vrNoRecordWarnTimer = null;
       }
-      log(`[M5 VR開始] 最初の記録まで ${vrFirstRecordAt - xrActiveSince}ms（renderId=${rec.renderId}）`);
+      log(`[VR開始] 最初の記録まで ${vrFirstRecordAt - xrActiveSince}ms（renderId=${rec.renderId}）`);
     }
   } else if (winRef !== null && !winRef.isDestroyed()) {
     winRef.webContents.send('xr:record', rec);
@@ -797,7 +797,7 @@ function setXrActive(active: boolean): void {
       vrFirstStampTimer = null;
     }
     // 動作は変えない。新規レコードが 1 秒待っても来ない場合だけ警告する。
-    // self-test では記録が来ないため予約しない。
+    // selftest では記録が来ないため予約しない。
     if (!SELF_TEST) {
       vrNoRecordWarnTimer = setTimeout(() => {
         vrNoRecordWarnTimer = null;
@@ -851,7 +851,7 @@ function onInputState(m: Buffer): void {
   const now = Date.now();
   if (now - lastInputLogAt >= 1000) {
     lastInputLogAt = now;
-    log(`[M5入力] L: ${summarizeHand(snap.left)} | R: ${summarizeHand(snap.right)} ` +
+    log(`[入力] L: ${summarizeHand(snap.left)} | R: ${summarizeHand(snap.right)} ` +
       `(frame=${snap.frame} conn=${snap.connEpoch} space=${snap.spaceEpoch} ` +
       `latch=L:${snap.latchLeft} R:${snap.latchRight})`);
   }
@@ -994,7 +994,7 @@ function restartMirrorTimer(): void {
 }
 
 // ミラー停止。タイマー解除だけであり、送り済みフレームの後始末は要らない。
-// 終了処理・self-test の停止確認から呼ぶ（安全な多重呼び出し）。
+// 終了処理・selftest の停止確認から呼ぶ（安全な多重呼び出し）。
 function stopMirror(): void {
   mirrorStopped = true;
   if (mirrorTimer !== null) {
@@ -1110,7 +1110,7 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// self-test（HMD 不要）。ミラー・入力転送・VR リサイズ・停止を本番経路で確かめる。
+// selftest（HMD 不要）。ミラー・入力転送・VR リサイズ・停止を本番経路で確かめる。
 // OSR には tools/pages/mirror-input.html を開き、ボタン押下と文字入力を handleMirrorInput
 // 経由（= コントロール窓と同じ入口）で送り、DOM の変化と PNG で確認する。
 async function runSelfTest(osr: BrowserWindow, control: BrowserWindow): Promise<void> {
@@ -1198,7 +1198,7 @@ async function runSelfTest(osr: BrowserWindow, control: BrowserWindow): Promise<
     // OSR を VR サイズへ広げ、ミラーが VR モード（既定は停止）でハングしないことを確かめる。
     const framesBefore = stats.mirrorFrames;
     // ADR: 本番では renderer の requestSession 通知で xrActive が立つため、
-    // self-test でも同一の入口（setXrActive）を通してからリサイズする。
+    // selftest でも同一の入口（setXrActive）を通してからリサイズする。
     setXrActive(true);
     if (!xrActive) fail('setXrActive(true) で xrActive が立たない');
     else pass('xrActive が立つ（セッション開始の通知）');
@@ -1402,7 +1402,7 @@ function finish(code: number): void {
     } catch { /* 無視 */ }
   }
   flushLog();
-  log(`M5 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
+  log(`Client 終了 code=${finalCode} offers=${stats.offers} dones=${stats.dones} drops=${stats.drops} ` +
     `stale=${stats.droppedStale} browseDrop=${stats.droppedBrowsing} ` +
     `ok=${stats.statusOk} copyFail=${stats.statusCopyFailed} verifyFail=${stats.statusVerifyFailed} ` +
     `records=${stats.renderRequests} xrDropped=${xrDroppedRecords} xrActive=${xrActive} ` +
@@ -1514,7 +1514,7 @@ async function createWindow(): Promise<BrowserWindow> {
     }
     // 本番ページの XR 到達確認（isSessionSupported/requestSession の有無）を
     // ログで追えるよう、XR 関連の行も拾う（通常ページの雑音は入れない）。
-    const interesting = message.includes('[XRift M5]') || message.includes('[M5') || level === 2 ||
+    const interesting = message.includes('[XRift XR]') || level === 2 ||
       /xr|immersive|session|haptic|pulse/i.test(message);
     if (interesting) {
       log('renderer-console: ' + message.replace(/%c|color:#a07cff/g, '').trim().slice(0, 2000));
@@ -1592,7 +1592,7 @@ async function createWindow(): Promise<BrowserWindow> {
     log(`did-fail-load code=${code} desc=${desc} url=${validatedUrl}`);
   });
 
-  // self-test では検証ページ（ボタン・入力欄つき）を強制する（引数の指定より優先）。
+  // selftest では検証ページ（ボタン・入力欄つき）を強制する（引数の指定より優先）。
   const target = SELF_TEST
     ? { kind: 'file', file: toolPagePath('mirror-input.html') } as const
     : resolveTarget();
@@ -1619,7 +1619,7 @@ async function createWindow(): Promise<BrowserWindow> {
 }
 
 function start(): void {
-  // self-test は HMD・exe 無しで回すため、exe 不要扱いにする（self-test 内部専用）。
+  // selftest は HMD・exe 無しで回すため、exe 不要扱いにする（selftest 内部専用）。
   const noExeMode = SELF_TEST;
   // render-scale の範囲確認（0.2〜1.0。既定 0.5）。範囲外は exe が拒否するため先に落とす。
   const scaleNum = Number(RENDER_SCALE);
@@ -1768,7 +1768,7 @@ function start(): void {
     log(`pipe server listening: ${PIPE_PATH}`);
   });
   } else {
-    log('self-test のため spawn・パイプサーバを飛ばす（ミラー・入力転送のみ）');
+    log('selftest のため spawn・パイプサーバを飛ばす（ミラー・入力転送のみ）');
   }
 
   // renderer からの haptics 要求を exe へ中継する。境界で数値を検証する。
@@ -1804,7 +1804,7 @@ function start(): void {
       clearTimeout(vrFirstStampTimer);
       vrFirstStampTimer = null;
     }
-    log(`[M5 VR開始] 初回描画を確認（renderId=${msg}。Offer を開始する）`);
+    log(`[VR開始] 初回描画を確認（renderId=${msg}。Offer を開始する）`);
   });
   // ページの到達確認用。exe 生存とパイプ接続だけを見る（HMD 装着の有無は見ない）。
   // シムは準備前に最大 15 秒ポーリングするため、最初の数回と結果変化だけ記録する。
@@ -1826,13 +1826,13 @@ function start(): void {
 
   createWindow().then((osr) => {
     // OSR の後にコントロール窓を作り、ミラー・状態配信を開始する。
-    // self-test はここから自動検証に入り、結果で終了する。
+    // selftest はここから自動検証に入り、結果で終了する。
     createControlWindow().then((control) => {
       startMirror();
       startStatusBroadcast();
       startVrMeter();
       if (SELF_TEST) {
-        // HARD TIMEOUT の前に終わらせるための保険（self-test 専用）。
+        // HARD TIMEOUT の前に終わらせるための保険（selftest 専用）。
         setTimeout(() => {
           log('[SELFTEST] 制限時間切れのため中断する');
           finish(2);

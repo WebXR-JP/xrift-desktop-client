@@ -1,5 +1,5 @@
 /**
- * M5 の WebXR 実装。ページ内に注入する（`executeInMainWorld` で関数ごと渡すため、
+ * WebXR 実装。ページ内に注入する（`executeInMainWorld` で関数ごと渡すため、
  * この関数は自己完結していること。外側の変数・import を参照しない）。
  *
  * 移植元は `electron/webxr-mainworld.cjs` であり、API 形状・数学・イベントロジックを保つ。
@@ -11,8 +11,8 @@
  */
 
 /** ページへ注入する WebXR 実装の本体。preload から `executeInMainWorld` で呼ぶ。 */
-export function installM5XR(): void {
-  interface M5Record {
+export function installXRiftXR(): void {
+  interface XrRecord {
     renderId: string;
     connEpoch: number;
     spaceEpoch: number;
@@ -26,18 +26,18 @@ export function installM5XR(): void {
     reqHeight: number;
     staleHint: boolean;
   }
-  interface M5Pose {
+  interface ControllerPose {
     valid: boolean;
     position: number[];
     orientation: number[];
   }
-  interface M5Hand {
+  interface InputHand {
     connected: boolean;
     profile: string;
     /** grip 空間の pose。無効時はシムの `gripSpace` が null を返す。 */
-    grip: M5Pose;
+    grip: ControllerPose;
     /** aim 空間の pose。無効時はシムの `targetRaySpace` が null を返す。 */
-    aim: M5Pose;
+    aim: ControllerPose;
     trigger: number;
     squeeze: number;
     thumbstickClick: boolean;
@@ -50,9 +50,9 @@ export function installM5XR(): void {
     hasThumbstick: boolean;
     hasTrackpad: boolean;
   }
-  interface M5Bridge {
-    onRecord(cb: (rec: M5Record) => void): void;
-    onInput(cb: (snap: { left: M5Hand; right: M5Hand; latchLeft?: string; latchRight?: string }) => void): void;
+  interface XRiftBridge {
+    onRecord(cb: (rec: XrRecord) => void): void;
+    onInput(cb: (snap: { left: InputHand; right: InputHand; latchLeft?: string; latchRight?: string }) => void): void;
     haptic(hand: number, intensity: number, durationMs: number): void;
     probe(): Promise<{ ok: boolean }>;
     sessionActive(active: boolean): void;
@@ -60,13 +60,13 @@ export function installM5XR(): void {
     // 無い橋（旧 preload・試験スタブ）でも描画駆動は変えない。
     stamped?(renderId: string): void;
   }
-  const bridge = (window as unknown as { __xriftXR?: M5Bridge }).__xriftXR;
-  if (!bridge || (window as unknown as { __xriftM5Installed?: boolean }).__xriftM5Installed) return;
-  const B: M5Bridge = bridge;
-  (window as unknown as { __xriftM5Installed?: boolean }).__xriftM5Installed = true;
-  const log = (...a: unknown[]): void => console.log('%c[XRift M5]', 'color:#a07cff', ...a);
+  const bridge = (window as unknown as { __xriftXR?: XRiftBridge }).__xriftXR;
+  if (!bridge || (window as unknown as { __xriftXRInstalled?: boolean }).__xriftXRInstalled) return;
+  const B: XRiftBridge = bridge;
+  (window as unknown as { __xriftXRInstalled?: boolean }).__xriftXRInstalled = true;
+  const log = (...a: unknown[]): void => console.log('%c[XRift XR]', 'color:#a07cff', ...a);
 
-  // ------------------------------------------------------------ M2 制御ブロック
+  // ------------------------------------------------------------ 制御ブロック
   // exe が画像から ID/pose を読むための画素内メタ。配置の正典は
   // `native/src/transfer/xr_transfer_app.cpp` の kBlockOrg*（A=(64,64)、
   // B=(128,64)、マーカーは左 (160,8)・右 (右半分起点+160,8)、各 32x32）である。
@@ -74,28 +74,28 @@ export function installM5XR(): void {
   // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに使った
   // record のタグに限る（painted 画像の内容とタグが同一 record に対応する）。
   // ページが rAF を呼ばなかった record では更新しない（描画していないため）。
-  // 計算式は `src/m2codec.ts`（= C++ の PoseTag）と同一であり、
+  // 計算式は `src/control-codec.ts`（= C++ の PoseTag）と同一であり、
   // 変えたら両方を同時に更新する。注入関数は自己完結のため import できず同等品を持つ。
-  const M2_AX = 64, M2_BX = 128, M2_BY = 64, M2_CELL = 4;
-  const M2_MLX = 160, M2_MDX = 160, M2_MY = 8, M2_MS = 32;
-  function m2Quant(v: number, lo: number, hi: number): number {
+  const CONTROL_AX = 64, CONTROL_BX = 128, CONTROL_BY = 64, CONTROL_CELL = 4;
+  const CONTROL_MLX = 160, CONTROL_MDX = 160, CONTROL_MY = 8, CONTROL_MS = 32;
+  function quantizeByte(v: number, lo: number, hi: number): number {
     const t = ((v - lo) / (hi - lo)) * 255;
     if (!(t >= 0)) return 0;
     if (!(t <= 255)) return 255;
     return Math.floor(t + 0.5);
   }
   // C++ の PoseTag と同じバイト列（計 30B）の FNV-1a 下位 16bit。
-  function m2PoseTag(rec: M5Record): number {
+  function poseTag(rec: XrRecord): number {
     const bytes: number[] = [];
     let id = BigInt(rec.renderId);
     for (let i = 0; i < 8; i++) { bytes.push(Number(id & 0xffn)); id >>= 8n; }
     const conn = rec.connEpoch >>> 0, space = rec.spaceEpoch >>> 0;
     for (let i = 0; i < 4; i++) bytes.push((conn >>> (i * 8)) & 0xff);
     for (let i = 0; i < 4; i++) bytes.push((space >>> (i * 8)) & 0xff);
-    for (let i = 0; i < 3; i++) bytes.push(m2Quant(rec.leftPos[i], -4, 4));
-    for (let i = 0; i < 4; i++) bytes.push(m2Quant(rec.leftOri[i], -1, 1));
-    for (let i = 0; i < 3; i++) bytes.push(m2Quant(rec.rightPos[i], -4, 4));
-    for (let i = 0; i < 4; i++) bytes.push(m2Quant(rec.rightOri[i], -1, 1));
+    for (let i = 0; i < 3; i++) bytes.push(quantizeByte(rec.leftPos[i], -4, 4));
+    for (let i = 0; i < 4; i++) bytes.push(quantizeByte(rec.leftOri[i], -1, 1));
+    for (let i = 0; i < 3; i++) bytes.push(quantizeByte(rec.rightPos[i], -4, 4));
+    for (let i = 0; i < 4; i++) bytes.push(quantizeByte(rec.rightOri[i], -1, 1));
     let hash = 2166136261 >>> 0;
     for (const b of bytes) { hash ^= b; hash = Math.imul(hash, 16777619) >>> 0; }
     return hash & 0xffff;
@@ -251,7 +251,7 @@ export function installM5XR(): void {
     hands: HandPose[];
   }
   /** 行列化済みの手。pose が無効なとき gripMat/aimMat は null である。 */
-  interface HandPose extends M5Hand {
+  interface HandPose extends InputHand {
     gripMat: Float32Array | null;
     aimMat: Float32Array | null;
   }
@@ -259,7 +259,7 @@ export function installM5XR(): void {
   // pipe 由来の pose をアプリ空間の行列にする。無効・不正なときは null を返す
   // （`getPose` が null を返し、three はコントローラを出さない）。
   // 受信値は外部入力のため、有効旗・有限数・回転の長さを確認してから行列化する。
-  function poseToMat(p: M5Pose | null | undefined): Float32Array | null {
+  function poseToMat(p: ControllerPose | null | undefined): Float32Array | null {
     if (!p || p.valid !== true) return null;
     const pos = p.position, ori = p.orientation;
     if (!Array.isArray(pos) || !Array.isArray(ori) || pos.length < 3 || ori.length < 4) return null;
@@ -269,15 +269,15 @@ export function installM5XR(): void {
     if (!(len > 1e-6)) return null;
     return quatToMat([pos[0], pos[1], pos[2]], [ori[0] / len, ori[1] / len, ori[2] / len, ori[3] / len]);
   }
-  const NO_POSE: M5Pose = { valid: false, position: [0, 0, 0], orientation: [0, 0, 0, 0] };
+  const NO_POSE: ControllerPose = { valid: false, position: [0, 0, 0], orientation: [0, 0, 0, 0] };
 
   class XRFrame {
     session: XRSession;
     predictedDisplayTime: number;
     _d: FrameData;
     trackedAnchors = undefined;
-    /** このフレームを駆動した描画要求（M5 拡張。テストページの画素内 ID 埋め込み用）。 */
-    _m5Record: M5Record | null = null;
+    /** このフレームを駆動した描画要求（テストページの画素内 ID 埋め込み用）。 */
+    _xriftRecord: XrRecord | null = null;
     constructor(session: XRSession, d: FrameData) { this.session = session; this.predictedDisplayTime = d.time; this._d = d; }
     getViewerPose(ref: XRSpace): XRViewerPose | null {
       const d = this._d;
@@ -396,7 +396,7 @@ export function installM5XR(): void {
     fixedFoveation = 0;
     _canvas: HTMLCanvasElement;
     constructor(session: XRSession, gl: WebGLRenderingContext, _init: object = {}) {
-      if (!(session instanceof XRSession)) throw new TypeError('XRWebGLLayer: session is not an XRift M5 session');
+      if (!(session instanceof XRSession)) throw new TypeError('XRWebGLLayer: session is not an XRift session');
       const info = session._info;
       this._eyeW = info.width;
       this._eyeH = info.height;
@@ -413,18 +413,18 @@ export function installM5XR(): void {
 
   // ------------------------------------------------------------ 新ブリッジの購読
   // requestSession より前に届いた record/入力も捨てない（exe は起動時から送り続ける）。
-  let latestRecord: M5Record | null = null;
-  let latestInput: { left: M5Hand; right: M5Hand } | null = null;
+  let latestRecord: XrRecord | null = null;
+  let latestInput: { left: InputHand; right: InputHand } | null = null;
   // InputState のラッチ（その 1 秒間に押されたボタンの集合）。ページの HUD 表示用に
   // main 世界へ公開する（シム自体の入力駆動には使わない）。
   let latestLatch: { left: string; right: string } = { left: '-', right: '-' };
-  (window as unknown as { __m5latch?: { left: string; right: string } }).__m5latch = latestLatch;
+  (window as unknown as { __xriftLatch?: { left: string; right: string } }).__xriftLatch = latestLatch;
   // InputState の左右接続（HUD がセッション前でも接続を表示できるよう公開する）。
   // シム自体の入力駆動には使わない。
   let latestConn: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } =
     { left: false, right: false, leftProfile: '', rightProfile: '' };
-  (window as unknown as { __m5input?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__m5input = latestConn;
-  const recordWaiters: ((rec: M5Record) => void)[] = [];
+  (window as unknown as { __xriftInput?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__xriftInput = latestConn;
+  const recordWaiters: ((rec: XrRecord) => void)[] = [];
   B.onRecord((rec) => {
     latestRecord = rec;
     while (recordWaiters.length > 0) {
@@ -439,7 +439,7 @@ export function installM5XR(): void {
       left: typeof snap.latchLeft === 'string' ? snap.latchLeft : '-',
       right: typeof snap.latchRight === 'string' ? snap.latchRight : '-',
     };
-    (window as unknown as { __m5latch?: { left: string; right: string } }).__m5latch = latestLatch;
+    (window as unknown as { __xriftLatch?: { left: string; right: string } }).__xriftLatch = latestLatch;
     // 左右の接続・profile を HUD 用に公開する（欠けたら未接続扱い）。
     const handOf = (h: unknown): { connected: boolean; profile: string } => {
       if (h !== null && typeof h === 'object') {
@@ -454,17 +454,17 @@ export function installM5XR(): void {
     const l = handOf((snap as unknown as Record<string, unknown>).left);
     const r = handOf((snap as unknown as Record<string, unknown>).right);
     latestConn = { left: l.connected, right: r.connected, leftProfile: l.profile, rightProfile: r.profile };
-    (window as unknown as { __m5input?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__m5input = latestConn;
+    (window as unknown as { __xriftInput?: { left: boolean; right: boolean; leftProfile: string; rightProfile: string } }).__xriftInput = latestConn;
   });
-  function nextRecord(timeoutMs: number): Promise<M5Record> {
+  function nextRecord(timeoutMs: number): Promise<XrRecord> {
     if (latestRecord) return Promise.resolve(latestRecord);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const i = recordWaiters.indexOf(done);
         if (i >= 0) recordWaiters.splice(i, 1);
-        reject(new DOMException('M5: RenderRequest が来ません（exe が起動しているか確認してください）', 'NotSupportedError'));
+        reject(new DOMException('RenderRequest が来ません（exe が起動しているか確認してください）', 'NotSupportedError'));
       }, timeoutMs);
-      const done = (rec: M5Record): void => { clearTimeout(timer); resolve(rec); };
+      const done = (rec: XrRecord): void => { clearTimeout(timer); resolve(rec); };
       recordWaiters.push(done);
     });
   }
@@ -531,7 +531,7 @@ export function installM5XR(): void {
       this.enabledFeatures = enabledFeatures;
       // ADR: 購読解除の持ち方は closing 時の leak 防止のためであり、record 駆動自体は変えない。
       let alive = true;
-      const cb = (rec: M5Record): void => { if (alive) this._onRecord(rec); };
+      const cb = (rec: XrRecord): void => { if (alive) this._onRecord(rec); };
       B.onRecord(cb);
       this._unsubscribe = () => { alive = false; };
     }
@@ -600,15 +600,15 @@ export function installM5XR(): void {
     // overlay canvas を WebGL canvas に重ね、record の制御ブロックを 2D で描く。
     // 描くのは制御領域だけであり、全画面の clear はしない（負荷最小・残像なし。
     // リサイズで消えても record ごとに再描画するため直る）。戻り値は描いた値。
-    _drawM5Blocks(rec: M5Record, canvas: HTMLCanvasElement, eyeW: number, eyeH: number): { id16: number; tag: number } {
+    _drawControlBlocks(rec: XrRecord, canvas: HTMLCanvasElement, eyeW: number, eyeH: number): { id16: number; tag: number } {
       const targetW = eyeW * 2, targetH = eyeH;
       let ov = this._overlay;
       let ctx = this._overlayCtx;
       if (ov === null || ctx === null) {
         const el = document.createElement('canvas');
         const c = el.getContext('2d');
-        if (c === null) throw new Error('M5: overlay の 2d 文脈が取れません');
-        el.setAttribute('data-xrift-m5-blocks', '1');
+        if (c === null) throw new Error('overlay の 2d 文脈が取れません');
+        el.setAttribute('data-xrift-control-blocks', '1');
         el.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:2147483647;';
         document.documentElement.appendChild(el);
         this._overlay = el;
@@ -632,23 +632,23 @@ export function installM5XR(): void {
       if (st.width !== w) st.width = w;
       if (st.height !== h) st.height = h;
       const id16 = Number(BigInt(rec.renderId) & 0xffffn);
-      const tag = m2PoseTag(rec);
+      const tag = poseTag(rec);
       const block = (ox: number, value: number): void => {
         for (let bit = 0; bit < 16; bit++) {
           g.fillStyle = (((value >>> bit) & 1) === 1) ? '#fff' : '#000';
-          g.fillRect(ox + (bit % 8) * M2_CELL, M2_BY + Math.floor(bit / 8) * M2_CELL, M2_CELL, M2_CELL);
+          g.fillRect(ox + (bit % 8) * CONTROL_CELL, CONTROL_BY + Math.floor(bit / 8) * CONTROL_CELL, CONTROL_CELL, CONTROL_CELL);
         }
       };
-      block(M2_AX, id16);
-      block(M2_BX, tag);
+      block(CONTROL_AX, id16);
+      block(CONTROL_BX, tag);
       g.fillStyle = '#f0f';
-      g.fillRect(M2_MLX, M2_MY, M2_MS, M2_MS);
+      g.fillRect(CONTROL_MLX, CONTROL_MY, CONTROL_MS, CONTROL_MS);
       g.fillStyle = '#0ff';
-      g.fillRect(eyeW + M2_MDX, M2_MY, M2_MS, M2_MS);
+      g.fillRect(eyeW + CONTROL_MDX, CONTROL_MY, CONTROL_MS, CONTROL_MS);
       return { id16, tag };
     }
 
-    _onRecord(rec: M5Record): void {
+    _onRecord(rec: XrRecord): void {
       if (this._ended) return;
       const t0 = performance.now();
       const near = this.renderState.depthNear, far = this.renderState.depthFar;
@@ -663,7 +663,7 @@ export function installM5XR(): void {
       const inp = latestInput;
       const hands: HandPose[] = [0, 1].map((i) => {
         const h = inp ? (i === 0 ? inp.left : inp.right) : null;
-        const base: M5Hand = h ?? {
+        const base: InputHand = h ?? {
           connected: false, profile: '', trigger: 0, squeeze: 0,
           thumbstickClick: false, trackpadClick: false, primary: false, secondary: false, menu: false,
           thumbstick: [0, 0], trackpad: [0, 0], hasThumbstick: false, hasTrackpad: false,
@@ -673,7 +673,7 @@ export function installM5XR(): void {
       });
       this._captureOrigin(head);
       const frame = new XRFrame(this, { time: performance.now(), viewsValid: true, positionTracked: true, views, head, hands });
-      frame._m5Record = rec;
+      frame._xriftRecord = rec;
       this._inputs(hands, frame);
       const layer = this.renderState.baseLayer;
       if (layer) {
@@ -698,7 +698,7 @@ export function installM5XR(): void {
           canvas.style.width = `${targetW}px`;
           canvas.style.height = `${targetH}px`;
         }
-        // M2 制御ブロック（renderId/pose タグ・左右マーカー）を overlay に描く。
+        // 制御ブロック（renderId/pose タグ・左右マーカー）を overlay に描く。
         // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに
         // 使った record のタグに限る（painted 画像の内容とタグが同一 record に対応する）。
         // ページが rAF を呼ばなかった record ではタグを更新しない（描画していないため）。
@@ -708,12 +708,12 @@ export function installM5XR(): void {
         // 再入（コールバック内の requestAnimationFrame）で二重駆動しないよう先に立てる。
         if (cbs.length > 0) this._served = true;
         for (const cb of cbs) {
-          try { cb(t0, frame); } catch (err) { console.error('[XRift M5] XR frame callback error', err); }
+          try { cb(t0, frame); } catch (err) { console.error('[XRift XR] XR frame callback error', err); }
         }
         let stamp: { id16: number; tag: number } | null = null;
         if (cbs.length > 0) {
           try {
-            stamp = this._drawM5Blocks(rec, canvas, eyeW, eyeH);
+            stamp = this._drawControlBlocks(rec, canvas, eyeW, eyeH);
             // ADR: 初回の描画完了を main へ知らせる。main はこの通知まで Offer せず、
             // 旧内容（ブロック無し）の paint を送らない（起動時の不明ID棄却の防止）。
             // 1 セッション 1 回だけ送り、失敗・不在でも XR 駆動は変えない。
@@ -724,7 +724,7 @@ export function installM5XR(): void {
               } catch { /* 通知失敗時は無視 */ }
             }
           } catch (err) {
-            console.error('[XRift M5] block overlay failed', err);
+            console.error('[XRift XR] block overlay failed', err);
           }
         }
         // 最初の数回だけ、record と canvas の対応を記録する（窓側は main が出す）。
@@ -839,7 +839,7 @@ export function installM5XR(): void {
       // exe は main 起動時に既に動いているはずであり、ここでは最初の record を待つ。
       // 非装着でも RenderRequest の 1 件目が来れば解決する（準備後の解決）。
       // 1 秒経っても来ない場合は警告だけ出し、待ち自体は最大 20 秒続ける（動作は変えない）。
-      let rec: M5Record;
+      let rec: XrRecord;
       const warnTimer = setTimeout(() => {
         log('警告: VR開始から1秒経っても RenderRequest が来ない（exe の pace 停滞を確認）');
       }, 1000);
@@ -853,14 +853,14 @@ export function installM5XR(): void {
       clearTimeout(warnTimer);
       if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) {
         try { if (typeof B.sessionActive === 'function') B.sessionActive(false); } catch { /* 通知失敗時は無視 */ }
-        throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
+        throw new DOMException('RenderRequest の描画サイズが不正です', 'NotSupportedError');
       }
-      if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('M5: RenderRequest の描画サイズが不正です', 'NotSupportedError');
+      if (!(rec.reqWidth > 0) || !(rec.reqHeight > 0)) throw new DOMException('RenderRequest の描画サイズが不正です', 'NotSupportedError');
       const info: SessionInfo = {
         width: rec.reqWidth, height: rec.reqHeight,
-        backend: 'm5-osr', runtimeName: 'xrift_new', systemName: 'M5 OSR',
+        backend: 'osr', runtimeName: 'xrift_native', systemName: 'XRift OSR',
       };
-      log(`M5 OSR: ${info.width}x${info.height} per eye (conn=${rec.connEpoch} space=${rec.spaceEpoch})`);
+      log(`OSR: ${info.width}x${info.height} per eye (conn=${rec.connEpoch} space=${rec.spaceEpoch})`);
       const s = new XRSession(info, mode, [...new Set(enabled)]);
       this._active = s;
       return s;
@@ -884,5 +884,5 @@ export function installM5XR(): void {
   for (const C of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {
     if (C) (C.prototype as unknown as Record<string, unknown>).makeXRCompatible = makeXRCompatible;
   }
-  log('WebXR → M5 OSR bridge installed');
+  log('WebXR → OSR bridge installed');
 }

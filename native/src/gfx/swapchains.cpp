@@ -17,7 +17,7 @@ std::vector<vk::Format> PreferredSwapchainFormats() {
   };
 }
 
-std::vector<vk::Format> M2PreferredSwapchainFormats() {
+std::vector<vk::Format> XrPreferredSwapchainFormats() {
   return {
       vk::Format::eB8G8R8A8Unorm,
       vk::Format::eR8G8B8A8Unorm,

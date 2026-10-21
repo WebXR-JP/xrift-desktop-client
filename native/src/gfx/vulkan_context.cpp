@@ -104,7 +104,7 @@ VulkanContext::VulkanContext(const xr::Instance& xr,
 
   // 4. VkInstance を作る。
   vk::ApplicationInfo app_info{};
-  app_info.pApplicationName = "xrift_new";
+  app_info.pApplicationName = "xrift_native";
   app_info.applicationVersion = 1;
   app_info.pEngineName = "xrift";
   app_info.engineVersion = 1;

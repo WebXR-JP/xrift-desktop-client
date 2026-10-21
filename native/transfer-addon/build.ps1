@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# M1 転送アドオンのビルド（再現コマンド）。
+# 転送アドオンのビルド（再現コマンド）。
 # 前提: XRift-Client/node_modules に cmake-js と electron があること。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot          # native

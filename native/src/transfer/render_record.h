@@ -7,17 +7,17 @@
 
 #include "transfer/protocol.h"
 
-// M2 の描画レコード（exe が発行・保持する変更不能な要求台帳）。
+// 描画レコード（exe が発行・保持する変更不能な要求台帳）。
 // xrLocateViews の左右 pose/FOV・予測時刻・世代を renderId と結び付けて保持し、
 // 画像から復号した ID/pose 要約と照合する（DESIGN §7）。
-// XR/Vulkan に依存しない値層であり、--m2-selftest で HMD 無しに検証できる。
+// XR/Vulkan に依存しない値層であり、--selftest で HMD 無しに検証できる。
 
 namespace xrift::transfer {
 
 // 画像年齢の上限の既定値。受理から 500ms を超えたレコードは失効として棄却する。
 // 実行時は --record-ttl-ms で上書きできる（RenderLedger の保持値が正）。
 // 実測: 本番サイトで 350〜500ms の遅延のため、app 経由の通常運用は暫定 2s で渡す。
-// 既定値自体は M2 仕様の 500ms に保つ（変更時は README と selftest を更新する）。
+// 既定値自体は 500ms に保つ（変更時は README と selftest を更新する）。
 constexpr uint64_t kRenderRecordMaxAgeUs = 500000u;
 // 保持レコード数の上限。超えた古い分は失効扱いで捨てる（VRAM ではなく台帳の上限）。
 // 90Hz・2s で 180 件のため余裕を見た 256 である（既定 500ms では 45 件）。
@@ -31,7 +31,7 @@ constexpr float kPosQuantMax = 4.0f;
 constexpr float kOriQuantMin = -1.0f;
 constexpr float kOriQuantMax = 1.0f;
 
-// 0〜255 に丸める。JS 側（m2-codec.js・m2codec.ts・shim.ts・test.html）と同じ式を
+// 0〜255 に丸める。JS 側（control-codec.ts・shim.ts）と同じ式を
 // 倍精度で計算することが一致の条件である。単精度で計算すると .5 境界で 1 ずれる
 // 値があり、静止 pose のシミュレータでは毎フレーム不一致になり受理 0 になる
 // （実測: wantTag と復号 tag が割れ、倍精度の再計算 wantDbl と復号 tag が一致）。

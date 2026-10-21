@@ -1,7 +1,7 @@
-# transfer-addon（M1 転送用 N-API アドオン）
+# transfer-addon（転送用 N-API アドオン）
 
 Electron main が OSR `paint` で受けた共有テクスチャの NT ハンドルを、
-別 exe（`xrift_new.exe --transfer`）のプロセスへ複製する薄い層。
+別 exe（`xrift_native.exe --xr-transfer`）のプロセスへ複製する薄い層。
 `DuplicateHandle` の呼び出しだけを担い、GPU 操作はしない。
 
 ## 公開関数
@@ -29,5 +29,5 @@ Electron main が OSR `paint` で受けた共有テクスチャの NT ハンド�
 
 ## 制約
 
-- Windows のみ。Linux では FD 転送に差し替える（M5 までに決める）。
+- Windows のみ。Linux では FD 転送に差し替える（時期未定）。
 - Electron 44.9.0 用にビルドする。ランタイムが変わったら `--runtime-version` を更新する。

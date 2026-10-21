@@ -21,7 +21,7 @@ class Instance {
   XrSystemId systemId() const { return system_; }
   const XrInstanceProperties& instanceProperties() const { return instance_props_; }
   const XrSystemProperties& systemProperties() const { return system_props_; }
-  // XR_EXT_local_floor が利用可か。M4 の参照空間 local-floor 用に有効化する。
+  // XR_EXT_local_floor が利用可か。参照空間 local-floor 用に有効化する。
   bool hasLocalFloor() const { return has_local_floor_; }
   // XR_EXT_local_floor を有効化して生成したか。
   bool localFloorEnabled() const { return local_floor_enabled_; }

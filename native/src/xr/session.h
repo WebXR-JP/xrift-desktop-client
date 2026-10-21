@@ -9,7 +9,7 @@
 
 // Vk バインディング付き XrSession、参照空間、view 構成、状態遷移を担う。
 // イベントの受付自体は app 側が行い、状態変化は setState で受け取る。
-// M4: 参照空間の選択（local-floor→stage→local の後退と明示指定）と
+// 参照空間の選択（local-floor→stage→local の後退と明示指定）と
 // REFERENCE_SPACE_CHANGE_PENDING 後の空間作り直しを持つ。
 
 namespace xrift::xr {

@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <string>
 
-// M2 の XR 提出モード。XR セッションを開始し、フレームループで描画レコードを
+// XR 提出モード。XR セッションを開始し、フレームループで描画レコードを
 // 発行して RenderRequest を送り、受理した画像だけを左右 swapchain へ blit して
-// そのレコードの pose/FOV で xrEndFrame する（DESIGN §4・§7・§9・§11 M2）。
+// そのレコードの pose/FOV で xrEndFrame する（DESIGN §4・§7・§9・§11）。
 
 namespace xrift::transfer {
 
@@ -16,7 +16,7 @@ struct XrTransferOptions {
                                 // 実測: 本番サイトで 350〜500ms の遅延のため、
                                 // app 経由の通常運用は暫定 2000 で渡す。
   int seconds = 0;              // 正ならその秒数で打ち切る。0 は HMD 終了まで。
-  std::string space = "auto";   // 参照空間の要求（auto/local/stage/local-floor。M4）。
+  std::string space = "auto";   // 参照空間の要求（auto/local/stage/local-floor）。
 };
 
 // 固定の製品動作（引数では変えない）。

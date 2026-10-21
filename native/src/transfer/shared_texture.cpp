@@ -416,7 +416,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
                              vk::PipelineStageFlagBits::eBottomOfPipe, {}, nullptr, nullptr,
                              release);
 
-    // 自前イメージは GENERAL で駐める。M2 のサンプリング起点にする。
+    // 自前イメージは GENERAL で駐める。制御ブロック照合のサンプリング起点にする。
     vk::ImageMemoryBarrier own_park = own_to_dst;
     own_park.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
     own_park.dstAccessMask = vk::AccessFlagBits::eShaderRead;

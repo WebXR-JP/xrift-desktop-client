@@ -5,11 +5,11 @@
  * @packageDocumentation
  */
 
-/** 1 メッセージの固定長（バイト）。M5 で 256B 化した。 */
+/** 1 メッセージの固定長（バイト）。256B 固定である。 */
 export const MSG_LEN = 256;
 /** メッセージ先頭の識別子。 */
 export const MAGIC = 0x54465258;
-/** プロトコル版。M5 の 256B 化で 3 に上げた。 */
+/** プロトコル版。256B 化で 3 に上げた。 */
 export const VERSION = 3;
 
 export const TYPE_OFFER = 1;

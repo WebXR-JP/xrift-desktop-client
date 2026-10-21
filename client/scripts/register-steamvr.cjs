@@ -1,4 +1,4 @@
-// 新アプリ（M5）を SteamVR のライブラリに登録する。
+// 新アプリを SteamVR のライブラリに登録する。
 //
 //   node scripts/register-steamvr.cjs add     登録（SteamVR を起動しておくこと）
 //   node scripts/register-steamvr.cjs check   登録確認（IsApplicationInstalled を返す）
@@ -145,11 +145,11 @@ function writeManifest(manifestPath) {
         strings: {
           en_us: {
             name: 'XRift Client (new)',
-            description: 'XRift new app (M5): opens app.xrift.net in VR',
+            description: 'XRift Client: opens app.xrift.net in VR',
           },
           ja_jp: {
             name: 'XRift Client（新アプリ）',
-            description: 'XRift 新アプリ（M5）。app.xrift.net を VR で開く',
+            description: 'XRift Client（新アプリ）。app.xrift.net を VR で開く',
           },
         },
       },
@@ -177,11 +177,11 @@ function writePackagedManifest(manifestPath, binary) {
         strings: {
           en_us: {
             name: 'XRift Client (new)',
-            description: 'XRift new app (M5): opens app.xrift.net in VR',
+            description: 'XRift Client: opens app.xrift.net in VR',
           },
           ja_jp: {
             name: 'XRift Client（新アプリ）',
-            description: 'XRift 新アプリ（M5）。app.xrift.net を VR で開く',
+            description: 'XRift Client（新アプリ）。app.xrift.net を VR で開く',
           },
         },
       },

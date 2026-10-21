@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>XRift M5 test</title>
+<title>XRift XR test</title>
 <style>
   html,body{margin:0;height:100%;background:#111;overflow:hidden}
   canvas{display:block}
@@ -19,30 +19,30 @@
 <script type="module">
 import * as THREE from 'three'
 
-// M5 テストページ。XR 中はキャンバスサイズをシムが所有するため、ページ側では
+// XR 動作確認ページ。XR 中はキャンバスサイズをシムが所有するため、ページ側では
 // XR 提示中に setSize しない（競合防止）。
 const hud = document.getElementById('hud')
 const errBox = document.getElementById('err')
 const waiting = document.getElementById('waiting')
 window.addEventListener('error', (e) => {
-  console.log('[XRift M5] page error', e.message)
+  console.log('[XRift XR] page error', e.message)
   errBox.textContent += e.message + '\n'
 })
 window.addEventListener('unhandledrejection', (e) => {
-  console.log('[XRift M5] page rejection', (e.reason && e.reason.stack) || e.reason)
+  console.log('[XRift XR] page rejection', (e.reason && e.reason.stack) || e.reason)
 })
 const info = { frames: 0, presenting: false, lastRecord: null, session: null }
-window.__m5info = info
+window.__xriftInfo = info
 // 入力イベントの目視確認用（最新 6 件を HUD に残す）。
 const evLog = []
-window.__m5events = evLog
+window.__xriftEvents = evLog
 function noteEv(text) {
   evLog.push(`${new Date().toISOString().slice(11, 19)} ${text}`)
   if (evLog.length > 6) evLog.splice(0, evLog.length - 6)
-  console.log('[XRift M5] ev', text)
+  console.log('[XRift XR] ev', text)
 }
 function connText() {
-  const c = window.__m5input || { left: false, right: false, leftProfile: '', rightProfile: '' }
+  const c = window.__xriftInput || { left: false, right: false, leftProfile: '', rightProfile: '' }
   const side = (on, prof) => (on ? `接続${prof ? `(${prof})` : ''}` : '未接続')
   return `conn L:${side(c.left, c.leftProfile)} R:${side(c.right, c.rightProfile)}`
 }
@@ -92,7 +92,7 @@ function textPlate(text) {
   m.position.set(0, 1.35, -2.5)
   return m
 }
-scene.add(textPlate('XRift M5 test'))
+scene.add(textPlate('XRift XR test'))
 // 左右識別板（左=マゼンタ、右=シアン）。取り違えの目視確認用。
 function sidePlate(color, x) {
   const m = new THREE.Mesh(
@@ -104,7 +104,7 @@ function sidePlate(color, x) {
 }
 scene.add(sidePlate(0xff00ff, -1.2))
 scene.add(sidePlate(0x00ffff, 1.2))
-// M5: 左右コントローラの追従キューブ（左=マゼンタ、右=シアン）。
+// 左右コントローラの追従キューブ（左=マゼンタ、右=シアン）。
 // `gripSpace` の pose が来ていれば手に追従し、無効時は隠す。
 // レイ・モデルの代わりの実機確認用である。
 const ctlCubes = [0xff44ff, 0x44ffff].map((color) => {
@@ -132,7 +132,7 @@ function updateControllers(frame, srcs) {
     try {
       pose = frame.getPose(src.gripSpace, ctlRefSpace)
     } catch (e) {
-      console.log('[XRift M5] controller pose failed', e && e.message)
+      console.log('[XRift XR] controller pose failed', e && e.message)
     }
     if (!pose) { cube.visible = false; continue }
     cube.visible = true
@@ -169,19 +169,19 @@ renderer.setAnimationLoop((t, frame) => {
     if (xrSession) updateControllers(frame, xrSession.inputSources)
   }
   renderer.render(scene, cam)
-  // XR フレームでは受理用の画素内ブロックを刻む（M2 画像配置が正典）。
+  // XR フレームでは受理用の画素内ブロックを刻む（制御ブロック画像配置が正典）。
   // three の描画の直後・同一タスク内で行い、OSR の提出に載せる。
-  if (frame && frame._m5Record) {
+  if (frame && frame._xriftRecord) {
     try {
-      stampM5Blocks(frame._m5Record)
+      stampControlBlocks(frame._xriftRecord)
     } catch (e) {
-      console.log('[XRift M5] stamp failed', e && e.message)
+      console.log('[XRift XR] stamp failed', e && e.message)
     }
   }
   if (xrSession) {
     const src = xrSession.inputSources
     const gp = (i) => (src[i] ? src[i].gamepad : null)
-    const latch = window.__m5latch || { left: '-', right: '-' }
+    const latch = window.__xriftLatch || { left: '-', right: '-' }
     const waitNote = info.frames === 0 ? '\nXR 待機中（HMD を装着してください）' : ''
     const evNote = evLog.length > 0 ? `\nevents:\n${evLog.join('\n')}` : '\nevents: -'
     hud.textContent =
@@ -195,7 +195,7 @@ renderer.setAnimationLoop((t, frame) => {
       (info.lastStamp ? `stamp id=${info.lastStamp.renderId} id16=${info.lastStamp.id16} tag=${info.lastStamp.tag}` : 'stamp=-') +
       evNote
   } else {
-    const latch = window.__m5latch || { left: '-', right: '-' }
+    const latch = window.__xriftLatch || { left: '-', right: '-' }
     const evNote = evLog.length > 0 ? `\nevents:\n${evLog.join('\n')}` : ''
     hud.textContent = `frames=${info.frames} (no XR session yet)\n` +
       `XR 待機中（HMD を装着してください）\n${connText()}\nlatch L:${latch.left} R:${latch.right}${evNote}`
@@ -209,34 +209,34 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight)
 })
 
-// ---- M2 受理用の画素内ブロック（配置の正典は harness/electron/README.md） ----
+// ---- 受理用の画素内ブロック（配置の正典は native/src/transfer/xr_transfer_app.cpp） ----
 // 左半分に renderId 下位 16bit（64,64）と pose タグ（128,64）、
 // 左右マーカー（(160,8) マゼンタ、(halfW+160,8) シアン）を置く。
 // raw GL の scissor clear で刻むため three のトーンマッピングを迂回し、
 // 厳密な白黒が出る（復号はセル中心画素・しきい値 128）。
-function m5QuantizeByte(v, lo, hi) {
+function quantizeByte(v, lo, hi) {
   const t = ((v - lo) / (hi - lo)) * 255
   if (t < 0) return 0
   if (t > 255) return 255
   return Math.floor(t + 0.5)
 }
 // C++ の PoseTag と同じバイト列（計 30B）の FNV-1a 下位 16bit。
-// harness の m2-codec.js と同一式であること（変えたら受理されない）。
-function m5PoseTag(renderId, connEpoch, spaceEpoch, leftPos, leftOri, rightPos, rightOri) {
+// control-codec.ts と同一式であること（変えたら受理されない）。
+function poseTag(renderId, connEpoch, spaceEpoch, leftPos, leftOri, rightPos, rightOri) {
   const bytes = []
   let id = BigInt(renderId)
   for (let i = 0; i < 8; i++) { bytes.push(Number(id & 0xFFn)); id >>= 8n }
   for (let i = 0; i < 4; i++) bytes.push((connEpoch >>> (i * 8)) & 0xFF)
   for (let i = 0; i < 4; i++) bytes.push((spaceEpoch >>> (i * 8)) & 0xFF)
-  for (let i = 0; i < 3; i++) bytes.push(m5QuantizeByte(leftPos[i], -4, 4))
-  for (let i = 0; i < 4; i++) bytes.push(m5QuantizeByte(leftOri[i], -1, 1))
-  for (let i = 0; i < 3; i++) bytes.push(m5QuantizeByte(rightPos[i], -4, 4))
-  for (let i = 0; i < 4; i++) bytes.push(m5QuantizeByte(rightOri[i], -1, 1))
+  for (let i = 0; i < 3; i++) bytes.push(quantizeByte(leftPos[i], -4, 4))
+  for (let i = 0; i < 4; i++) bytes.push(quantizeByte(leftOri[i], -1, 1))
+  for (let i = 0; i < 3; i++) bytes.push(quantizeByte(rightPos[i], -4, 4))
+  for (let i = 0; i < 4; i++) bytes.push(quantizeByte(rightOri[i], -1, 1))
   let hash = 2166136261 >>> 0
   for (const b of bytes) { hash ^= b; hash = Math.imul(hash, 16777619) >>> 0 }
   return hash & 0xFFFF
 }
-function m5StampRect(gl, dbW, dbH, fbW, fbH, ox, oy, w, h, r, g, b) {
+function stampRect(gl, dbW, dbH, fbW, fbH, ox, oy, w, h, r, g, b) {
   const sx = dbW / fbW, sy = dbH / fbH
   const x = Math.round(ox * sx), y = Math.round(dbH - (oy + h) * sy)
   const ww = Math.max(1, Math.round(w * sx)), hh = Math.max(1, Math.round(h * sy))
@@ -245,7 +245,7 @@ function m5StampRect(gl, dbW, dbH, fbW, fbH, ox, oy, w, h, r, g, b) {
   gl.clearColor(r, g, b, 1)
   gl.clear(gl.COLOR_BUFFER_BIT)
 }
-function stampM5Blocks(rec) {
+function stampControlBlocks(rec) {
   const gl = renderer.getContext()
   const fbW = renderer.domElement.width, fbH = renderer.domElement.height
   const halfW = Math.floor(fbW / 2)
@@ -256,7 +256,7 @@ function stampM5Blocks(rec) {
   const prevColor = gl.getParameter(gl.COLOR_CLEAR_VALUE)
   try {
     const id16 = Number(BigInt(rec.renderId) & 0xFFFFn)
-    const tag = m5PoseTag(rec.renderId, rec.connEpoch >>> 0, rec.spaceEpoch >>> 0,
+    const tag = poseTag(rec.renderId, rec.connEpoch >>> 0, rec.spaceEpoch >>> 0,
       rec.leftPos, rec.leftOri, rec.rightPos, rec.rightOri)
     // ADR: OSR 共有テクスチャの WebGL 内容は bottom-up のまま渡される疑いが強い
     // （drawing buffer では正しく読めた画素を exe が 0x0000 と復号した。compositor は
@@ -268,15 +268,15 @@ function stampM5Blocks(rec) {
         const on = (((value >>> bit) & 1) === 1)
         const c = on ? 1 : 0
         const cx = ox + (bit % 8) * 4, cy = oy + Math.floor(bit / 8) * 4
-        m5StampRect(gl, dbW, dbH, fbW, fbH, cx, cy, 4, 4, c, c, c)
-        m5StampRect(gl, dbW, dbH, fbW, fbH, cx, fbH - cy - 4, 4, 4, c, c, c)
+        stampRect(gl, dbW, dbH, fbW, fbH, cx, cy, 4, 4, c, c, c)
+        stampRect(gl, dbW, dbH, fbW, fbH, cx, fbH - cy - 4, 4, 4, c, c, c)
       }
     }
     block(64, 64, id16)
     block(128, 64, tag)
     const marker = (ox, oy, r, g, b) => {
-      m5StampRect(gl, dbW, dbH, fbW, fbH, ox, oy, 32, 32, r, g, b)
-      m5StampRect(gl, dbW, dbH, fbW, fbH, ox, fbH - oy - 32, 32, 32, r, g, b)
+      stampRect(gl, dbW, dbH, fbW, fbH, ox, oy, 32, 32, r, g, b)
+      stampRect(gl, dbW, dbH, fbW, fbH, ox, fbH - oy - 32, 32, 32, r, g, b)
     }
     marker(160, 8, 1, 0, 1)
     marker(halfW + 160, 8, 0, 1, 1)
@@ -288,7 +288,7 @@ function stampM5Blocks(rec) {
       const sx = dbW / fbW, sy = dbH / fbH
       const px = new Uint8Array(4)
       gl.readPixels(Math.round(66 * sx), Math.round(dbH - 66 * sy), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
-      console.log(`[XRift M5] xr stamp #${info.stampLogs} id=${rec.renderId} id16=${id16} tag=${tag} canvas=${fbW}x${fbH} bit0=[${px[0]},${px[1]},${px[2]}]`)
+      console.log(`[XRift XR] xr stamp #${info.stampLogs} id=${rec.renderId} id16=${id16} tag=${tag} canvas=${fbW}x${fbH} bit0=[${px[0]},${px[1]},${px[2]}]`)
     }
   } finally {
     gl.scissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3])
@@ -297,9 +297,9 @@ function stampM5Blocks(rec) {
   }
 }
 
-console.log('[XRift M5] test page ready, xr=', typeof navigator.xr)
+console.log('[XRift XR] test page ready, xr=', typeof navigator.xr)
 try {
-  console.log('[XRift M5] supported:', await navigator.xr.isSessionSupported('immersive-vr'))
+  console.log('[XRift XR] supported:', await navigator.xr.isSessionSupported('immersive-vr'))
   xrSession = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] })
   info.session = true
   await renderer.xr.setSession(xrSession)
@@ -307,9 +307,9 @@ try {
   try {
     ctlRefSpace = await xrSession.requestReferenceSpace('local-floor')
   } catch (e) {
-    console.log('[XRift M5] controller refspace failed: ' + (e && e.message))
+    console.log('[XRift XR] controller refspace failed: ' + (e && e.message))
   }
-  console.log('[XRift M5] session started, layer',
+  console.log('[XRift XR] session started, layer',
     xrSession.renderState.baseLayer?.framebufferWidth, 'x', xrSession.renderState.baseLayer?.framebufferHeight)
   // 入力イベントの目視確認: select/squeeze のエッジと inputsourceschange を HUD に出す。
   // select では 0.8 / 120ms の pulse を打ち、実機で振動を確認できるようにする。
@@ -334,9 +334,9 @@ try {
     noteEv(`inputsourceschange +${e.added.length} -${e.removed.length} now:${xrSession.inputSources.length}(${names})`)
   })
   noteEv(`session started inputs=${xrSession.inputSources.length}`)
-  xrSession.addEventListener('end', () => { console.log('[XRift M5] session ended'); xrSession = null })
+  xrSession.addEventListener('end', () => { console.log('[XRift XR] session ended'); xrSession = null })
 } catch (e) {
-  console.log('[XRift M5] session failed: ' + (e && e.message))
+  console.log('[XRift XR] session failed: ' + (e && e.message))
   errBox.textContent = 'session failed: ' + (e && e.message)
 }
 </script>

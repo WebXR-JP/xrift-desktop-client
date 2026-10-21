@@ -6,7 +6,7 @@
 #include "transfer/protocol.h"
 #include "xr/input.h"
 
-// M4 の入力スナップショットを 256B の InputState（exe → main）に畳む。
+// 入力スナップショットを 256B の InputState（exe → main）に畳む。
 // コントローラ pose（左右の grip/aim。position xyz＋orientation xyzw）は
 // protocol.h の kInput* 配置に載せる。有効性は手 flags（bit1=grip・bit2=aim）が
 // 表す。無効時の値は 0 のままにし、受信側は読まない。

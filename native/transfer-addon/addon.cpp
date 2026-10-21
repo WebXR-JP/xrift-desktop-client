@@ -1,4 +1,4 @@
-// M1 転送用 N-API アドオン（C ABI、node_api.h のみ）。
+// 転送用 N-API アドオン（C ABI、node_api.h のみ）。
 // Electron main が OSR paint で受けた NT ハンドルを、別 exe のプロセスへ複製する。
 // 所有権の移動はしない。複製元のハンドルは閉じない。複製先プロセスのハンドルも閉じない
 // （OpenProcess の疑似でない実ハンドルだけを閉じる）。

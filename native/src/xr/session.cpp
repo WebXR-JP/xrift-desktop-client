@@ -77,7 +77,7 @@ Session::Session(const Instance& xr, const gfx::VulkanContext& vk, SpacePreferen
     CheckXr(xrCreateSession(xr.handle(), &info, &session_), "xrCreateSession");
 
     // 参照空間の選択。availability は xrEnumerateReferenceSpaces で確認する。
-    // 要求が不可なら落とさず後退し、理由をログに出す（M4 の仕様）。
+    // 要求が不可なら落とさず後退し、理由をログに出す（参照空間選択の仕様）。
     const std::vector<XrReferenceSpaceType> available = EnumerateSpaces();
     std::string available_names;
     for (XrReferenceSpaceType type : available) {

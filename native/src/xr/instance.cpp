@@ -13,7 +13,7 @@ namespace {
 
 // 必須のグラフィックス有効化拡張。
 constexpr const char* kVulkanEnableExtension = XR_KHR_VULKAN_ENABLE_EXTENSION_NAME;
-// M4 の local-floor 参照空間（XR_EXT_local_floor）の検出・有効化対象。
+// local-floor 参照空間（XR_EXT_local_floor）の検出・有効化対象。
 constexpr const char* kLocalFloorExtension = XR_EXT_LOCAL_FLOOR_EXTENSION_NAME;
 
 bool HasExtension(const XrExtensionProperties* list, uint32_t count, const char* name) {
@@ -55,9 +55,9 @@ Instance::Instance() {
     has_local_floor_ = HasExtension(extensions.data(), ext_count, kLocalFloorExtension);
 
     // 2. インスタンスを生成する。XR_EXT_local_floor があれば有効化する
-    // （M4 の local-floor 参照空間用。無ければ付けず、従来どおりの 1 拡張で作る）。
+    // （local-floor 参照空間用。無ければ付けず、従来どおりの 1 拡張で作る）。
     XrApplicationInfo app_info{};
-    std::snprintf(app_info.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "xrift_new");
+    std::snprintf(app_info.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "xrift_native");
     app_info.applicationVersion = 1;
     app_info.apiVersion = XR_API_VERSION_1_0;
     const char* enabled_all[] = {kVulkanEnableExtension, kLocalFloorExtension};

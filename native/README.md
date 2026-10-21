@@ -1,4 +1,4 @@
-# xrift_new（単体 exe のひな形）
+# xrift_native（単体 exe）
 
 OpenXR + Vulkan の単体 exe。Electron / Node に依存せず、HMD の両眼に単色クリアを出す。
 
@@ -19,7 +19,7 @@ OpenXR + Vulkan の単体 exe。Electron / Node に依存せず、HMD の両眼�
 Vulkan SDK のインストールは不要（`vulkan-1.lib` にリンクしない）。
 実行時は `vulkan.hpp` の動的ディスパッチャ（`vk::raii::Context`）が `vulkan-1.dll` を読み込む。
 ただし OpenXR-SDK-Source 側の configure は、インストール済みの Vulkan SDK があれば任意検出する
-（configure 時に `Found Vulkan: ...` と出ることがあるが、`xrift_new` 本体は SDK にリンクしない）。
+（configure 時に `Found Vulkan: ...` と出ることがあるが、`xrift_native` 本体は SDK にリンクしない）。
 
 ## ビルド
 
@@ -31,21 +31,21 @@ cmake --build --preset windows-vs-release
 ## 実行
 
 ```powershell
-build/windows/Release/xrift_new.exe --probe
-build/windows/Release/xrift_new.exe
+build/windows/Release/xrift_native.exe --probe
+build/windows/Release/xrift_native.exe
 ```
 
 `--probe` はインスタンスと Vulkan 初期化だけ行い、ランタイム名・system 名・GPU 名・
 推奨解像度・swapchain フォーマット候補を出して終了する。セッションは作らない。
 引数なしは通常のフレームループ。`--help` で使い方を表示する。
 
-## 転送モード（M1）
+## 転送モード
 
 Electron の OSR 共有テクスチャを別プロセスで受けて GPU 内コピーする。
 通常はハーネス（`harness/electron/run.ps1`）から起動する。単体では次の通り。
 
 ```powershell
-build/windows/Release/xrift_new.exe --transfer --pipe=\\.\pipe\<名前> [--verify|--no-verify] [--gpu-check|--no-gpu-check] [--seconds=N]
+build/windows/Release/xrift_native.exe --transfer --pipe=\\.\pipe\<名前> [--verify|--no-verify] [--gpu-check|--no-gpu-check] [--seconds=N]
   [--fail-after=N] [--inject-unconfirmed=N] [--delay-ms=N]
   [--mode=<vulkan|d3d-open-only|no-gpu>] [--mem-log=<path>]
 ```
@@ -88,7 +88,7 @@ build/windows/Release/xrift_new.exe --transfer --pipe=\\.\pipe\<名前> [--verif
   Desc 照合も行わない。妥当性は Offer の width/height/format と GPU 検査で担保する。
   `d3d-open-only` は D3D11 Open 経路の診断専用として残すが、長時間動かしてはならない。
 
-## 全画面 GPU 検査（M1b）
+## 全画面 GPU 検査
 
 CPU に画像を戻さず、import した共有テクスチャの全画素が同じフレームの正しい
 パターンであることを GPU 上で検証する。検出対象は破損・世代混在・ティアリング。
@@ -134,7 +134,7 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 
 ## ディレクトリ構成と各ファイルの責務
 
-- `CMakeLists.txt` … exe ターゲット `xrift_new` の定義
+- `CMakeLists.txt` … exe ターゲット `xrift_native` の定義
 - `CMakePresets.json` … `windows-vs` / `linux` と各ビルド preset
 - `cmake/Dependencies.cmake` … FetchContent による依存の取得定義
 - `src/main.cpp` … CLI（`--probe` / `--help`）と `XrApp` の起動
@@ -144,20 +144,20 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 - `src/common/xr_result.h` / `.cpp` … `XrResult` の文字列化と `CheckXr`
 - `src/xr/instance.h` / `.cpp` … `XrInstance` と system、拡張列挙と必須チェック
 - `src/xr/session.h` / `.cpp` … Vk バインディング付き session、参照空間、view 構成、状態遷移
-- `src/xr/input.h` / `.cpp` … M4 の入力アクション（セット `xrift`、12 アクション、
+- `src/xr/input.h` / `.cpp` … 入力アクション（セット `xrift`、12 アクション、
   profile 別 suggest、毎フレームの sync・スナップショット、haptics 適用）
 - `src/gfx/vulkan_context.h` / `.cpp` … OpenXR 要件からの `vk::raii::Instance` / `PhysicalDevice` / `Device` 生成
   （転送用の追加デバイス拡張を受け付ける。既存呼び出しの動きは不変）
 - `src/transfer/protocol.h` … 192 バイト固定の転送メッセージ（C++ と Node で同配置。
-  M2 で 64B→192B 化。M4 で HapticCommand・InputState の種別を追加。版は 2 のまま）
+  64B→192B 化で HapticCommand・InputState の種別を追加）
 - `src/transfer/pipe_client.h` / `.cpp` … 名前付きパイプのクライアント（5 秒リトライ、固定長送受信）
 - `src/transfer/shared_texture.h` / `.cpp` … 外部メモリ import、自前イメージへのコピー、部分検証
-- `src/transfer/gpu_check.h` / `.cpp` … M1b 全画面 GPU 検査（compute 提出と結果読み）
-- `shaders/check.comp` … M1b 検査の compute シェーダ正本（`.spv` は glslc 生成か同梱品を埋め込む）
+- `src/transfer/gpu_check.h` / `.cpp` … 全画面 GPU 検査（compute 提出と結果読み）
+- `shaders/check.comp` … 全画面 GPU 検査の compute シェーダ正本（`.spv` は glslc 生成か同梱品を埋め込む）
 - `cmake/SpvToHeader.cmake` … SPIR-V を C 配列ヘッダへ変換する生成器
 - `src/transfer/transfer_app.h` / `.cpp` … `--transfer` の受信ループと統計
 - `transfer-addon/` … NT ハンドル複製の N-API アドオン（cmake-js、本体 CMake とは分離）
-- `harness/electron/` … M1 検証ハーネス（借用台帳のパイプサーバ、動的パターン、起動手順）
+- `harness/electron/` … 旧検証ハーネス（借用台帳のパイプサーバ、動的パターン、起動手順）
 - `src/gfx/swapchains.h` / `.cpp` … 両眼の `XrSwapchain` とフォーマット選択（`vk::Format` 保持）
 - `src/gfx/clear_pass.h` / `.cpp` … acquire / wait / clear / release とコマンド・フェンス管理（`vk::raii` 所有）
 
@@ -190,7 +190,7 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 
 - 単色クリアのみ。シェーダ描画はない
 - 入力アクションは取得・haptics 適用まで実装済みだが、実機のコントローラ操作・
-  haptics の体感・追従は未検証（M4 の検証は HMD 非装着の構造確認まで。下の M4 節を参照）
+  haptics の体感・追従は未検証（入力の検証は HMD 非装着の構造確認まで。下の入力節を参照）
 - 投影行列未使用（pose / fov をレイヤに載せるだけ）
 - Windows のみ検証。Linux 対応は preset を用意した段階
 - 転送の既知の制約:
@@ -202,18 +202,18 @@ C:\VulkanSDK\<版>\Bin\glslc.exe --target-env=vulkan1.0 -O shaders/check.comp -o
 ## 次のステージ案
 
 - シェーダ描画（単色クリアの置き換え）
-- 実機での M4 確認（下のチェックリスト。コントローラ操作・haptics 体感・追従は未検証）
+- 実機での入力確認（下のチェックリスト。コントローラ操作・haptics 体感・追従は未検証）
 - Linux 対応（ビルド検証と動作確認）
 
-## 入力・haptics・参照空間・再接続（M4）
+## 入力・haptics・参照空間・再接続
 
-`--xr-transfer`（M2）を土台に、入力アクション・haptics・reference space 変更・
-HMD 脱着/再接続を実装する（DESIGN §10・§11 M4）。
+`--xr-transfer` を土台に、入力アクション・haptics・reference space 変更・
+HMD 脱着/再接続を実装する（DESIGN §10・§11）。
 実機のコントローラ操作・haptics の体感・追従は未検証であり、
 下の「実機装着時の確認項目」が終わるまで未検証と書く。
 
 ```powershell
-build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
+build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名前>
   [--render-scale=<0.2〜1.0>] [--record-ttl-ms=<ms>]
   [--space=<auto|local|stage|local-floor>] [--inject-session-restart=Ms]
   [--inject-space-change=Ms]
@@ -233,7 +233,7 @@ build/windows/Release/xrift_new.exe --xr-transfer --pipe=\\.\pipe\<名前>
   （空間作り直し・`spaceEpoch` 更新・旧レコード失効）を通すが、
   実イベントではないことをログに明記する
   （`模擬 space 変更を適用（実イベントではない…）`）。統計の `space変更` に計上する。
-- ハーネス側（`harness/electron/run.ps1 -M2`）:
+- ハーネス側（`harness/electron/run.ps1`）:
   `-Space`（exe の `--space` へ渡す）、`-HapticAtMs`（起動から Ms 後に
   HapticCommand を送る。既定 `'0'`=無効。カンマ区切りで複数時刻を指定できる。
   各送信は左手・振幅 0.8・300ms）、`-HapticRepeat`（5 秒間隔で N 回送る。
@@ -258,11 +258,11 @@ suggest 先は khr/simple、oculus/touch、valve/index、htc/vive、microsoft/mo
   main へは毎フレーム InputState（種別 5。予約先頭 2B に左右の押下ラッチ付き）を送り、
   ログは毎秒に抑える（接続状態、profile 名、押下中のボタン、trigger/squeeze 値、
   thumbstick、その 1 秒間に押された `latch=`）。
-- 押下エッジ: 状態が変化したフレームで `[M4エッジ]` を 1 行出す
+- 押下エッジ: 状態が変化したフレームで `[入力エッジ]` を 1 行出す
   （ボタン bit の press/release、trigger/squeeze の off->on/on->off、
   stick の idle->touch/touch->idle、pose 有効/無効の変化。変化が無ければ出さない）。
   1 秒周期のサマリでは短い押下を取りこぼすため、実機の取りこぼし診断は
-  `[M4エッジ]` と `latch=` で行う。実機での再計測手順は
+  `[入力エッジ]` と `latch=` で行う。実機での再計測手順は
   `harness/electron/README.md` の「実機での再計測手順」を参照。
 - inactive / 未接続 / 非対応の区別: 値とは別に active/supported の 2 段を持つ。
   supported=0 は非対応、supported=1 かつ active=0 は inactive、active=1 は有効値。
@@ -279,7 +279,7 @@ suggest 先は khr/simple、oculus/touch、valve/index、htc/vive、microsoft/mo
   `LOSS_PENDING` → 束を破棄し、新しい `connEpoch` で再生成する（1 秒周期・上限 30 回。
   ランタイム未復帰なら安全に終了し、統計を出す）。`EXITING` は再生成せず終了する。
   脱着は loss とは限らないため、focus/visible/`shouldRender` に従って提出だけ止める。
-- 終了統計（`M4統計`）: connEpoch、InputState 送信数、haptic 受信数、space 変更数、
+- 終了統計（`入力統計`）: connEpoch、InputState 送信数、haptic 受信数、space 変更数、
   再生成の成功/試行、入力 sync/失敗/snapshot/profile 変化、haptics 成功/未送信/失敗。
 
 ### HMD 非装着での検証手順（構造確認まで）
@@ -287,13 +287,13 @@ suggest 先は khr/simple、oculus/touch、valve/index、htc/vive、microsoft/mo
 ```powershell
 # 1. 配置と値層（HMD 不要）。
 node harness/electron/protocol-test.js
-build/windows/Release/xrift_new.exe --m2-selftest
-build/windows/Release/xrift_new.exe --probe
-# 2. XR 転送＋M4（HMD 非装着で可。SteamVR 起動中・HMD 未装着のまま行う）。
+build/windows/Release/xrift_native.exe --selftest
+build/windows/Release/xrift_native.exe --probe
+# 2. XR 転送＋入力（HMD 非装着で可。SteamVR 起動中・HMD 未装着のまま行う）。
 #    セッションは SYNCHRONIZED 止まり・入力は inactive のままである。
-.\harness\electron\run.ps1 -Seconds 10 -Width 2048 -Height 1024 -M2 -Space stage `
+.\harness\electron\run.ps1 -Seconds 10 -Width 2048 -Height 1024 -Space stage `
   -HapticAtMs 5000 -InjectSessionRestartMs 8000
-# 3. ハーネスの回帰（M1 経路が壊れていないこと）。
+# 3. ハーネスの回帰（旧経路が壊れていないこと）。
 .\harness\electron\fault-matrix.ps1
 ```
 

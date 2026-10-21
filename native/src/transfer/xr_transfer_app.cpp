@@ -19,7 +19,7 @@
 #include "common/xr_result.h"
 #include "gfx/swapchains.h"
 #include "transfer/input_state.h"
-#include "transfer/m2_blocks.h"
+#include "transfer/control_blocks.h"
 #include "transfer/pipe_client.h"
 #include "transfer/protocol.h"
 #include "transfer/render_record.h"
@@ -30,7 +30,7 @@
 namespace xrift::transfer {
 namespace {
 
-// M2 画像配置（tools/pages/xr-smoke.html の刻みと一致させること）。
+// 制御ブロック画像配置（tools/pages/xr-smoke.html の刻みと一致させること）。
 // アトラスは左右横並び（左半分=左眼、右半分=右眼）。来た値を正とするため、
 // 半分の境界は自前イメージの実寸 (ownW/2) で決める。奇数幅では左を floor に寄せる。
 constexpr uint32_t kBlockCell = 4;      // 1 セルの一辺。
@@ -104,7 +104,7 @@ EyeFov ToEyeFov(const XrFovf& f) {
   return e;
 }
 
-// host-visible な 1 バッファの確保。M2 の制御メタ readback（数 KB 以内）専用である。
+// host-visible な 1 バッファの確保。制御ブロック readback（数 KB 以内）専用である。
 // 画像全体の staging には使わない。
 void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
                         vk::raii::DeviceMemory* mem, vk::DeviceSize size) {
@@ -114,7 +114,7 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
   buf_info.size = size;
   buf_info.usage = vk::BufferUsageFlagBits::eTransferDst;
   buf_info.sharingMode = vk::SharingMode::eExclusive;
-  InvokeVk("vkCreateBuffer(M2)", [&] { *buf = vk::raii::Buffer(device, buf_info); });
+  InvokeVk("vkCreateBuffer(ctrl)", [&] { *buf = vk::raii::Buffer(device, buf_info); });
   const vk::MemoryRequirements req = buf->getMemoryRequirements();
   const vk::PhysicalDeviceMemoryProperties props = vk.physicalDevice().getMemoryProperties();
   int32_t index = -1;
@@ -128,52 +128,52 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
     }
   }
   if (index < 0) {
-    throw std::runtime_error("M2 ステージングの host-visible メモリタイプが無い");
+    throw std::runtime_error("制御ブロック用ステージングの host-visible メモリタイプが無い");
   }
   vk::MemoryAllocateInfo mem_info{};
   mem_info.sType = vk::StructureType::eMemoryAllocateInfo;
   mem_info.allocationSize = req.size;
   mem_info.memoryTypeIndex = static_cast<uint32_t>(index);
-  InvokeVk("vkAllocateMemory(M2)", [&] { *mem = vk::raii::DeviceMemory(device, mem_info); });
-  InvokeVk("vkBindBufferMemory(M2)", [&] { buf->bindMemory(**mem, 0); });
+  InvokeVk("vkAllocateMemory(ctrl)", [&] { *mem = vk::raii::DeviceMemory(device, mem_info); });
+  InvokeVk("vkBindBufferMemory(ctrl)", [&] { buf->bindMemory(**mem, 0); });
 }
 
-// M2 制御メタデータの readback。自前イメージからブロック A/B（各 32x32）だけを読み、
+// 制御ブロックの readback。自前イメージからブロック A/B（各 32x32）だけを読み、
 // renderId 下位 16bit と pose タグを復号する。画像全体は読まない
 // （DESIGN §1 の制御メタデータの例外。XR ループを readback 待ちで止めないよう最小限）。
-class M2BlockReader {
+class ControlBlockReader {
  public:
-  explicit M2BlockReader(const gfx::VulkanContext& vk)
+  explicit ControlBlockReader(const gfx::VulkanContext& vk)
       : device_(&vk.device()), queue_(&vk.queue()), qfi_(vk.queueFamilyIndex()) {
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
     pool_info.queueFamilyIndex = qfi_;
-    InvokeVk("vkCreateCommandPool(M2)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+    InvokeVk("vkCreateCommandPool(ctrl)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
     vk::CommandBufferAllocateInfo alloc{};
     alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
     alloc.commandPool = *pool_;
     alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = 1;
-    InvokeVk("vkAllocateCommandBuffers(M2)", [&] {
+    InvokeVk("vkAllocateCommandBuffers(ctrl)", [&] {
       vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
       cmd_ = std::move(bufs[0]);
     });
     vk::FenceCreateInfo fence_info{};
     fence_info.sType = vk::StructureType::eFenceCreateInfo;
-    InvokeVk("vkCreateFence(M2)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
+    InvokeVk("vkCreateFence(ctrl)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
     AllocateHostBuffer(vk, &stage_, &stageMem_, kStageSize);
   }
 
   // 自前イメージ（GENERAL 駐め）から 2 ブロックを読む。読み後に GENERAL へ戻す。
   // 自前イメージの不変条件（GENERAL 駐め）を壊さないことが呼び出し条件である。
   void Decode(vk::Image own, uint16_t* renderId16, uint16_t* poseTag) {
-    InvokeVk("vkResetFences(M2)", [&] { device_->resetFences(*fence_); });
-    InvokeVk("vkResetCommandBuffer(M2)", [&] { cmd_.reset(); });
+    InvokeVk("vkResetFences(ctrl)", [&] { device_->resetFences(*fence_); });
+    InvokeVk("vkResetCommandBuffer(ctrl)", [&] { cmd_.reset(); });
     vk::CommandBufferBeginInfo begin{};
     begin.sType = vk::StructureType::eCommandBufferBeginInfo;
     begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    InvokeVk("vkBeginCommandBuffer(M2)", [&] { cmd_.begin(begin); });
+    InvokeVk("vkBeginCommandBuffer(ctrl)", [&] { cmd_.begin(begin); });
 
     vk::ImageSubresourceRange range{};
     range.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -217,17 +217,17 @@ class M2BlockReader {
     cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                          vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, park);
 
-    InvokeVk("vkEndCommandBuffer(M2)", [&] { cmd_.end(); });
+    InvokeVk("vkEndCommandBuffer(ctrl)", [&] { cmd_.end(); });
     vk::CommandBuffer raw = *cmd_;
     vk::SubmitInfo submit{};
     submit.sType = vk::StructureType::eSubmitInfo;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &raw;
-    InvokeVk("vkQueueSubmit(M2)", [&] { queue_->submit(submit, *fence_); });
-    CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(M2)");
+    InvokeVk("vkQueueSubmit(ctrl)", [&] { queue_->submit(submit, *fence_); });
+    CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(ctrl)");
 
     void* mapped = nullptr;
-    InvokeVk("vkMapMemory(M2)", [&] { mapped = stageMem_.mapMemory(0, kStageSize); });
+    InvokeVk("vkMapMemory(ctrl)", [&] { mapped = stageMem_.mapMemory(0, kStageSize); });
     const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
     *renderId16 = DecodeBlock16(bytes);
     *poseTag = DecodeBlock16(bytes + kBlockBytes);
@@ -235,7 +235,7 @@ class M2BlockReader {
   }
 
  private:
-  static constexpr size_t kBlockBytes = kM2BlockPixels * kM2BlockPixels * 4;
+  static constexpr size_t kBlockBytes = kControlBlockPixels * kControlBlockPixels * 4;
   static constexpr size_t kStageSize = 2 * kBlockBytes;
 
 
@@ -505,7 +505,7 @@ class BlitPass {
   // 受理画像の片半分を各眼へ blit する。srcHalf: 0=左半分、1=右半分。
   // 色の扱い: 同一形式間の blit は複写・拡大であり、色空間の変換は行わない。
   // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（DESIGN §9 の未決事項。
-  // M2 では左右分離と pose 対応を優先し、色の最終確認は M5 まで持ち越す）。
+  // 左右分離と pose 対応を優先し、色の最終確認は持ち越す）。
   // blit 後に提出画像からマーカー 1 画素だけを読む（画像全体は読まない）。
   // 失敗時は例外にする（呼び出し側は layerCount=0 で終える）。
   Result Blit(uint32_t eye, vk::Image own, uint32_t ownW, uint32_t ownH, uint32_t srcHalf) {
@@ -700,7 +700,7 @@ struct XrStats {
   uint64_t verifyNg = 0;
   uint64_t firstUs = 0;
   uint64_t lastUs = 0;
-  // M4: 入力・haptics・空間・再生成の統計。
+  // 入力・haptics・空間・再生成の統計。
   uint64_t inputSent = 0;       // main へ送った InputState の件数。
   uint64_t hapticReceived = 0;  // main から受けた HapticCommand の件数。
   uint64_t spaceChanges = 0;    // spaceEpoch を進めた回数。
@@ -737,19 +737,19 @@ struct XrStats {
          static_cast<unsigned long long>(emptyFrames));
     Info("XR転送統計: 左右分離検証 ok=%llu ng=%llu",
          static_cast<unsigned long long>(verifyOk), static_cast<unsigned long long>(verifyNg));
-    Info("M4統計: connEpoch=%u InputState送信=%llu haptic受信=%llu space変更=%llu",
+    Info("入力統計: connEpoch=%u InputState送信=%llu haptic受信=%llu space変更=%llu",
          connEpoch, static_cast<unsigned long long>(inputSent),
          static_cast<unsigned long long>(hapticReceived),
          static_cast<unsigned long long>(spaceChanges));
-    Info("M4統計: セッション再生成 成功=%llu 試行=%llu",
+    Info("入力統計: セッション再生成 成功=%llu 試行=%llu",
          static_cast<unsigned long long>(restarts),
          static_cast<unsigned long long>(restartAttempts));
-    Info("M4統計: 入力 sync=%llu 失敗=%llu snapshot=%llu profile変化=%llu",
+    Info("入力統計: 入力 sync=%llu 失敗=%llu snapshot=%llu profile変化=%llu",
          static_cast<unsigned long long>(input.syncs),
          static_cast<unsigned long long>(input.syncFailed),
          static_cast<unsigned long long>(input.snapshots),
          static_cast<unsigned long long>(input.profileChanges));
-    Info("M4統計: haptics 成功=%llu 未送信(inactive等)=%llu 失敗=%llu",
+    Info("入力統計: haptics 成功=%llu 未送信(inactive等)=%llu 失敗=%llu",
          static_cast<unsigned long long>(input.hapticOk),
          static_cast<unsigned long long>(input.hapticInactive),
          static_cast<unsigned long long>(input.hapticFailed));
@@ -789,7 +789,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
   // セッション束（セッション・参照空間・swapchain・blit・入力空間）。
   // LOSS_PENDING ではこの束だけを破棄・再生成する。
-  // TransferSession（instance・Vulkan device）・M2BlockReader・PipeClient は保つ。
+  // TransferSession（instance・Vulkan device）・ControlBlockReader・PipeClient は保つ。
   // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（DESIGN §6・§10）。
   std::unique_ptr<xr::Session> session;
   std::unique_ptr<gfx::Swapchains> swapchains;
@@ -823,7 +823,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   try {
     swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
                                                    session->handle(), session->views(),
-                                                   gfx::M2PreferredSwapchainFormats());
+                                                   gfx::XrPreferredSwapchainFormats());
   } catch (const std::exception& e) {
     Error("swapchain の生成に失敗: %s", e.what());
     stats.Print(ledger.stats(), input.stats());
@@ -837,7 +837,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
   blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
-  M2BlockReader reader(transfer.Vulkan());
+  ControlBlockReader reader(transfer.Vulkan());
   HoldImage hold(transfer.Vulkan());
   // 接続失敗は例外で返る。統計とメッセージを残してから投げ直す
   // （呼び出し側は 1 に丸めて通常終了させる）。
@@ -880,7 +880,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   uint64_t lastResubmitLogUs = 0;
   bool session_running = false;
   bool quit = false;
-  // M4: セッション再生成の状態。LOSS_PENDING で束を破棄し、1 秒周期で再生成を試みる。
+  // セッション再生成の状態。LOSS_PENDING で束を破棄し、1 秒周期で再生成を試みる。
   // 試行上限（30 回≒30 秒）を超えたらランタイム未復帰として安全に終了する（統計出力）。
   // 上限 30・間隔 1 秒はいずれも意図的な値であり、仮置きではない。
   bool needs_rebuild = false;
@@ -892,9 +892,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 時刻 0 を渡すと受け付けないランタイムがある（実測: SteamVR は
   // XR_ERROR_TIME_INVALID）ため、running 中のフレーム時刻を使う。
   XrTime last_display_time = 0;
-  // M4 の毎秒入力ログの前回出力時刻。0 は未出力である。
+  // 毎秒入力ログの前回出力時刻。0 は未出力である。
   uint64_t last_input_log_us = 0;
-  // M4計測: 押下エッジ用の前フレームと 1 秒ラッチ（左右のボタン bit）。
+  // 入力計測: 押下エッジ用の前フレームと 1 秒ラッチ（左右のボタン bit）。
   // ラッチは 1 秒サマリで 0 へ戻す。製品経路の buttons 欄は変えない。
   xr::InputSnapshot prev_snapshot{};
   bool have_prev_snapshot = false;
@@ -972,7 +972,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     try {
       swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
                                                      session->handle(), session->views(),
-                                                     gfx::M2PreferredSwapchainFormats());
+                                                     gfx::XrPreferredSwapchainFormats());
       blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
     } catch (const std::exception& e) {
       Warn("再生成後の swapchain 生成に失敗（%s）: %s", why, e.what());
@@ -1082,7 +1082,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 中間画像の受理は行わない（最新優先の方針。破棄数は統計に出る）。
   // shouldRender が false のフレーム（SYNCHRONIZED 等）でも毎フレーム呼ぶこと。
   // 受信・ACK は描画可否と無関係に進め、止めるのは提出だけである。
-  // M4: 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにする。
+  // 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにする。
   auto drain_offers = [&]() {
     TransferMessage msg{};
     bool have_last = false;
@@ -1116,7 +1116,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         break;
       }
-      // M4: main → exe の HapticCommand は Offer とは別扱いにする。
+      // main → exe の HapticCommand は Offer とは別扱いにする。
       // producer 生存の証拠には数えず、借用台帳にも触れない。
       // セッションが無い・実行中でない場合は inactive として記録する（例外にしない）。
       if (msg.magic == kMagic && msg.version == kVersion && msg.type == kTypeHapticCommand) {
@@ -1194,7 +1194,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     try {
       reader.Decode(own, &id16, &tag);
     } catch (const std::exception& e) {
-      Warn("M2 ブロック readback に失敗: %s", e.what());
+      Warn("制御ブロック readback に失敗: %s", e.what());
       return;
     }
     const RenderRecord* hit = nullptr;
@@ -1208,7 +1208,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         const RenderRecord* cand = nullptr;
         uint16_t want = 0;
         if (ledger.LookupById16(id16, &cand, &want) && cand != nullptr) {
-          Info("M2 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳 renderId=%llu"
+          Info("XR 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳 renderId=%llu"
                " wantTag=0x%04x conn=%u space=%u（台帳現世代 conn=%u space=%u）/ ledger最新=%llu",
                static_cast<unsigned long long>(mismatchLogCount),
                RejectReasonName(reason), id16, tag,
@@ -1216,7 +1216,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
                cand->spaceEpoch, ledger.connEpoch(), ledger.spaceEpoch(),
                static_cast<unsigned long long>(ledger.latestRenderId()));
         } else {
-          Info("M2 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳にid16一致なし"
+          Info("XR 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳にid16一致なし"
                "（現世代 conn=%u space=%u）/ ledger最新=%llu",
                static_cast<unsigned long long>(mismatchLogCount),
                RejectReasonName(reason), id16, tag, ledger.connEpoch(), ledger.spaceEpoch(),
@@ -1224,7 +1224,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         ++mismatchLogCount;
       }
-      Info("M2 棄却: %s（id16=0x%04x tag=0x%04x）", RejectReasonName(reason), id16, tag);
+      Info("XR 棄却: %s（id16=0x%04x tag=0x%04x）", RejectReasonName(reason), id16, tag);
       return;
     }
     freshRecord = *hit;
@@ -1246,7 +1246,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     if (quit) {
       break;
     }
-    // M4: loss 後の再生成の再試行（1 秒周期）。上限を超えたらランタイム未復帰として
+    // loss 後の再生成の再試行（1 秒周期）。上限を超えたらランタイム未復帰として
     // 安全に終了する（統計出力。非ゼロにはしない。こちらの破損ではないため）。
     if (needs_rebuild && !session && rebuild_attempts_left > 0 &&
         NowUs() - last_rebuild_try_us >= kRebuildRetryIntervalUs) {
@@ -1259,7 +1259,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         break;
       }
     }
-    // M4: 参照空間変更の適用は running 中のフレーム時刻が要るため、
+    // 参照空間変更の適用は running 中のフレーム時刻が要るため、
     // xrWaitFrame の後（running 側）で行う。実行中でない間は受付だけ保ち、
     // 適用は開始後の最初のフレームまで待つ。
     if (!session_running || !session) {
@@ -1289,7 +1289,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     CheckXr(xrWaitFrame(session->handle(), &wait_info, &frame_state), "xrWaitFrame");
     last_display_time = frame_state.predictedDisplayTime;
-    // M4: 参照空間変更の適用（新しい原点で locate できる確認が取れてから世代を進める）。
+    // 参照空間変更の適用（新しい原点で locate できる確認が取れてから世代を進める）。
     // 当フレームの予測表示時刻を使う（時刻 0 を渡すと受け付けないランタイムがある）。
     apply_pending_space();
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
@@ -1373,7 +1373,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       paceOutstanding = false;
     }
     ledger.SweepExpired(NowUs());
-    // M4: 入力の取得と main への送信。FOCUSED 時に sync し、それ以外は inactive の
+    // 入力の取得と main への送信。FOCUSED 時に sync し、それ以外は inactive の
     // スナップショットとして出す（「0」と「未対応」を区別できる形。毎フレーム送信し、
     // ログは毎秒に抑える）。脱着時は focus を失うため提出だけ止め、受信・送信は続ける。
     if (!quit) {
@@ -1381,12 +1381,12 @@ int RunXrTransfer(const XrTransferOptions& options) {
       input.Sync(session->handle(), focused);
       const xr::InputSnapshot snapshot = input.Snapshot(
           session->handle(), session->space(), frame_state.predictedDisplayTime, focused, frame_no);
-      // M4計測: 押下エッジの記録。1 秒周期のスナップショットでは短い押下を
+      // 入力計測: 押下エッジの記録。1 秒周期のスナップショットでは短い押下を
       // 取りこぼすため、状態が変化したフレームで 1 行出す（変化が無ければ出さない）。
       if (have_prev_snapshot) {
         const std::string edge = xr::InputManager::DescribeEdges(prev_snapshot, snapshot);
         if (!edge.empty()) {
-          Info("[M4エッジ] frame=%llu %s", static_cast<unsigned long long>(frame_no),
+          Info("[入力エッジ] frame=%llu %s", static_cast<unsigned long long>(frame_no),
                edge.c_str());
         }
       }
@@ -1403,7 +1403,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       }
       if (NowUs() - last_input_log_us >= 1000000u) {
         last_input_log_us = NowUs();
-        Info("[M4入力] %s",
+        Info("[入力] %s",
              xr::InputManager::SummarizeWithLatch(snapshot, input_latch[0], input_latch[1])
                  .c_str());
         input_latch[0] = input_latch[1] = 0;
@@ -1480,7 +1480,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       if (age <= ledger.maxAgeUs()) {
         try {
           submit_image(transfer.OwnImage(), freshW, freshH, freshRecord);
-          Info("M2 提出: renderId=%llu 年齢=%lluus（画像対応レコードの pose/FOV）",
+          Info("XR 提出: renderId=%llu 年齢=%lluus（画像対応レコードの pose/FOV）",
                static_cast<unsigned long long>(freshRecord.renderId),
                static_cast<unsigned long long>(age));
           submit_layer = true;
@@ -1504,7 +1504,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         const uint64_t now = NowUs();
         if (stats.resubmits <= 3 || now - lastResubmitLogUs >= 1000000u) {
           lastResubmitLogUs = now;
-          Info("M2 再提出: renderId=%llu 年齢=%lluus（最終受理の pose/FOV のまま）",
+          Info("XR 再提出: renderId=%llu 年齢=%lluus（最終受理の pose/FOV のまま）",
                static_cast<unsigned long long>(holdRecord.renderId),
                static_cast<unsigned long long>(age));
         }
@@ -1534,7 +1534,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
 
   stats.Print(ledger.stats(), input.stats());
-  Info("M2 中間破棄: %llu（最新優先のため Done のみ返した件数）",
+  Info("XR 中間破棄: %llu（最新優先のため Done のみ返した件数）",
        static_cast<unsigned long long>(droppedIntermediate));
   if (stats.submitLayers == 0 && stats.resubmits == 0) {
     Warn("提出層 0 のまま終了した（受理画像が無い。ページ側の描画を確認すること）");

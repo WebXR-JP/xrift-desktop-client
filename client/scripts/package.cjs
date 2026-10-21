@@ -1,11 +1,11 @@
-// 新アプリ（M5）の配布パッケージを作る: client/dist-package/XRiftClient-win32-x64/
+// 新アプリの配布パッケージを作る: client/dist-package/XRiftClient-win32-x64/
 //
 //   npm run package            client のビルド + パッケージ
 //
 // root の node_modules の @electron/packager を使う（client 自体に依存は無い）。
 // 同梱物: client/dist、client/pages、client/package.json（本体）、
-//   tools/pages（検証ページ。self-test が resources/tools/pages から読む）、
-//   xrift_new.exe + xrift_transfer_addon.node（extraResource → resources/ 直下）、
+//   tools/pages（検証ページ。selftest が resources/tools/pages から読む）、
+//   xrift_native.exe + xrift_transfer_addon.node（extraResource → resources/ 直下）、
 //   three.module.js + three.core.js（→ resources/node_modules/three/build/。pages の importmap 解決用）。
 // main は packagedResource() で resources/ 直下から解決する（開発時は従来パス）。
 'use strict';
@@ -18,7 +18,7 @@ const clientDir = join(__dirname, '..');
 const repoRoot = join(clientDir, '..');
 const pkg = require(join(clientDir, 'package.json'));
 
-const EXE_SRC = join(repoRoot, 'native', 'build', 'windows', 'Release', 'xrift_new.exe');
+const EXE_SRC = join(repoRoot, 'native', 'build', 'windows', 'Release', 'xrift_native.exe');
 const ADDON_SRC = join(repoRoot, 'native', 'transfer-addon', 'build', 'Release', 'xrift_transfer_addon.node');
 
 function fail(msg) {
@@ -100,7 +100,7 @@ async function main() {
   }
   // 検証ページ（tools/pages）の同梱。packager の dir は client 配下のため
   // ignore 保持では含められず、ここで resources/tools/pages へ写す。
-  // self-test が mirror-input.html を resources 解決で読む（開発時は repo 直下）。
+  // selftest が mirror-input.html を resources 解決で読む（開発時は repo 直下）。
   const toolsPagesSrc = join(repoRoot, 'tools', 'pages');
   const toolsPagesDst = join(resources, 'tools', 'pages');
   if (!existsSync(toolsPagesSrc)) {
@@ -130,7 +130,7 @@ async function main() {
   };
   walk(appOut);
   console.log(`[package] 合計 ${(total / 1024 / 1024).toFixed(1)}MB`);
-  console.log(`[package] 起動確認: "${join(appOut, 'XRiftClient.exe')}" --self-test`);
+  console.log(`[package] 起動確認: "${join(appOut, 'XRiftClient.exe')}" --selftest`);
 }
 
 main().catch((e) => {

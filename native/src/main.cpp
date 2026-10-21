@@ -13,21 +13,21 @@ namespace {
 
 void PrintHelp(const char* argv0) {
   std::printf(
-      "使い方: %s [--probe] [--xr-transfer --pipe=<名前>] [--m2-selftest] [--help]\n"
+      "使い方: %s [--probe] [--xr-transfer --pipe=<名前>] [--selftest] [--help]\n"
       "  引数なし  HMD に両眼クリア色を表示する\n"
       "  --probe   インスタンスと Vulkan 初期化だけ行い環境情報を出す（セッションは作らない）\n"
       "  --xr-transfer --pipe=\\\\.\\pipe\\<名前> [--render-scale=<0.2〜1.0>]\n"
       "            [--record-ttl-ms=<ms>] [--seconds=N] [--space=<auto|local|stage|local-floor>]\n"
-      "            M2 の XR 提出モード。XR セッションを開始し、pose/FOV の描画レコードを\n"
+      "            XR 提出モード。XR セッションを開始し、pose/FOV の描画レコードを\n"
       "            発行して RenderRequest を送り、受理画像だけを左右 swapchain へ blit する。\n"
       "            --render-scale は既定 0.5。--record-ttl-ms は描画レコードの失効上限\n"
       "            （既定 500。実測: 本番サイトで 350〜500ms の遅延のため app 経由は暫定 2000）。\n"
       "            --space は参照空間の要求（既定 auto=local-floor→stage→local の後退。\n"
       "            不可なら落とさず後退し、理由をログに出す）\n"
-      "            入力は毎秒サマリ（[M4入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
-      "            状態変化のフレームで [M4エッジ] を出す。haptics 受信は XrResult を\n"
+      "            入力は毎秒サマリ（[入力]。その 1 秒間に押されたラッチ付き）に加え、\n"
+      "            状態変化のフレームで [入力エッジ] を出す。haptics 受信は XrResult を\n"
       "            ログに残す\n"
-      "  --m2-selftest  M2 の値層（配置・pose タグ・受理/棄却）を HMD 無しに検証する\n"
+      "  --selftest  転送の値層（配置・pose タグ・受理/棄却）を HMD 無しに検証する\n"
       "  --help    この表示\n",
       argv0);
 }
@@ -46,8 +46,8 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--probe") == 0) {
     return xrift::Probe();
   }
-  if (argc >= 2 && std::strcmp(argv[1], "--m2-selftest") == 0) {
-    return xrift::transfer::RunM2SelfTest();
+  if (argc >= 2 && std::strcmp(argv[1], "--selftest") == 0) {
+    return xrift::transfer::RunTransferSelfTest();
   }
   if (argc >= 2 && std::strcmp(argv[1], "--xr-transfer") == 0) {
     xrift::transfer::XrTransferOptions opts{};

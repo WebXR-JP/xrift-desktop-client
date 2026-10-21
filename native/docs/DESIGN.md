@@ -1,7 +1,7 @@
 # native 設計
 
-- 別プロセス `xrift_new.exe` で OpenXR + Vulkan を動かし、Electron からは GPU 内コピーのみでフレームを受け取る
-- 本番 TypeScript の作り直しは M5。M1〜M4 の Electron 側は検証ハーネス
+- 別プロセス `xrift_native.exe` で OpenXR + Vulkan を動かし、Electron からは GPU 内コピーのみでフレームを受け取る
+- 本番 TypeScript は `client/` にある。旧検証用の Electron 側は検証ハーネス
 - 実機で確定した事実だけを土台にし、未検証は未検証と書く
 
 ## 1. 目的と前提
@@ -23,7 +23,7 @@ flowchart LR
     P[OSR pool<br>Chromium 管理]
   end
   subgraph OS
-    X[xrift_new.exe<br>OpenXR + Vulkan]
+    X[xrift_native.exe<br>OpenXR + Vulkan]
     H[HMD]
   end
   X -- pose/FOV + 描画要求<br>世代付き --> R
@@ -59,7 +59,7 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-  participant X as xrift_new.exe
+  participant X as xrift_native.exe
   participant R as レンダラ WebGPU
   participant M as main プロセス
   participant P as OSR pool
@@ -194,14 +194,14 @@ stateDiagram-v2
 
 | 段階 | 作るもの | 動く証拠 | 未達なら何を疑うか |
 |---|---|---|---|
-| M1 | 別 exe・XR 指定 GPU への import、コピー、返却 | 実解像度横並び・90Hz で 10 分、全画面動的パターンの GPU 検査で破損・世代混在 0 件 | import 条件・GPU 選択・ハンドル複製 |
-| M2 | pose/FOV と画像の厳密な対応、両眼提出 | 正常照合に加え、不明 ID・失効レコード・旧 space 世代の画像注入をすべて棄却し、左右分離が正しく、pose 付け替え無し | 世代管理・左右分離・提出側の時計 |
-| M3 | 滞留制限、借用管理、正常終了・障害時停止 | §6 の①〜③を障害注入（consumer 強制終了・ACK 消失・producer 先死・device lost）で再現し、期待状態（隔離 or 返却済み）と観測結果が一致、高負荷でも枯渇なし | 上限値・返却タイミング・異常検知 |
-| M4 | 入力、haptics、reference space 変更、HMD 脱着・再接続・終了 | 無効化（inactive/unsupported）と停止・復帰・再接続が期待どおりで、loss 後に新世代で再生成できる | アクション束縛・空間世代・状態遷移 |
-| M5 | 本番 TypeScript の再実装・接続 | 実解像度で画像年齢・再投影率・色・操作の観測結果が基準内 | 実解像度性能・色・遅延 |
+| 転送 | 別 exe・XR 指定 GPU への import、コピー、返却 | 実解像度横並び・90Hz で 10 分、全画面動的パターンの GPU 検査で破損・世代混在 0 件 | import 条件・GPU 選択・ハンドル複製 |
+| 対応付け・提出 | pose/FOV と画像の厳密な対応、両眼提出 | 正常照合に加え、不明 ID・失効レコード・旧 space 世代の画像注入をすべて棄却し、左右分離が正しく、pose 付け替え無し | 世代管理・左右分離・提出側の時計 |
+| 借用管理・停止 | 滞留制限、借用管理、正常終了・障害時停止 | §6 の①〜③を障害注入（consumer 強制終了・ACK 消失・producer 先死・device lost）で再現し、期待状態（隔離 or 返却済み）と観測結果が一致、高負荷でも枯渇なし | 上限値・返却タイミング・異常検知 |
+| 入力・空間・再接続 | 入力、haptics、reference space 変更、HMD 脱着・再接続・終了 | 無効化（inactive/unsupported）と停止・復帰・再接続が期待どおりで、loss 後に新世代で再生成できる | アクション束縛・空間世代・状態遷移 |
+| TS 統合 | 本番 TypeScript の統合・接続 | 実解像度で画像年齢・再投影率・色・操作の観測結果が基準内 | 実解像度性能・色・遅延 |
 
-- M1〜M4 の Electron 側は検証ハーネス。本番 TS の作り直しは M5 で行う
-- 「ネイティブ完成」= M1〜M4 をハーネスで検証済み、かつ同期の安全性（§8）を説明できる状態。実アプリとしての完成（M5）とは区別する
+- 旧段階の Electron 側は検証ハーネス。本番 TS は `client/` に統合済み
+- 「ネイティブ完成」= 転送〜入力・再接続をハーネスで検証済み、かつ同期の安全性（§8）を説明できる状態。実アプリとしての完成とは区別する
 - 512² の 89fps は VR レイテンシの合格証拠ではない。実解像度で測り直す
 
 ## 12. リスク上位 3
@@ -213,7 +213,7 @@ stateDiagram-v2
 ## 13. 未決事項
 
 - 同期破綻時の方針: パッチ保守・製品化停止・頻度次第で許容のどれか
-- 画像年齢上限・再投影率・性能合格値: 計測後に決めるが、M4 の完成判定までに固定する。
+- 画像年齢上限・再投影率・性能合格値: 計測後に決めるが、入力・再接続の完成判定までに固定する。
   現時点の実測は本番サイトで 350〜500ms の遅延のため TTL は暫定 2s（app が `--record-ttl-ms=2000` を渡す）
 - 色の最終確認: 二重符号化の有無は要判断
 - 追加 controller profile の保証範囲、Linux の輸送実装は後決めでよい
@@ -225,7 +225,7 @@ stateDiagram-v2
 - Electron 44.9.0 の OSR 共有テクスチャで paint 120/120。実測 88〜89fps、paint 通知間隔 p50 11ms・p95 13ms（VR レイテンシではない）
 - `handle.ntHandle` を main プロセスで取得。N-API アドオンが開けて画素一致
 - 同一プロセス・同一 GPU・RTX 3090 での直接 import に成功。LUID 一致を確認
-- 別 exe への複製と XR 指定 GPU での import は未検証（M1 の検証対象）
+- 別 exe への複製と XR 指定 GPU での import は未検証（転送の検証対象）
 - ひな形 exe が SteamVR/OpenXR + RTX 3090 + PICO 4 で両眼クリアまで動作（§3⑥の通り完成証拠ではない）
 - ランタイム指定の物理デバイスを使う方針で動いた
 
@@ -240,4 +240,4 @@ stateDiagram-v2
     したがって Electron/OSR/ミラーは原因ではない
   - 約 300MB は 7144×1786×2眼×3バッファ ≒ 306MB（スワップチェーン 1 組）とほぼ一致する
 - 原因候補: SteamVR コンポジタのアプリ別キャッシュ、またはクライアント終了時の解放遅延。
-  回避策: 起動を繰り返したら SteamVR を再起動すること。深追いは未実施（M5 完了を優先）
+  回避策: 起動を繰り返したら SteamVR を再起動すること。深追いは未実施
