@@ -33,6 +33,10 @@ class VulkanContext {
   uint32_t queueFamilyIndex() const { return queue_family_index_; }
   const std::string& gpuName() const { return gpu_name_; }
 
+  // OpenXR セッション生成用の Vk バインディングを組み立てる。
+  // ハンドルの所有はこの VulkanContext に残り、返却は値（ローカルコピー）である。
+  XrGraphicsBindingVulkanKHR xrGraphicsBinding() const;
+
  private:
   // 破棄順の担保: メンバは宣言順に構築され、逆順に破棄される。
   // 生成順 (context → instance → device) に対し、破棄は (device → instance → context) となる。

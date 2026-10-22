@@ -870,7 +870,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
   XrStats stats{};
   stats.connEpoch = conn_epoch;
   try {
-    session = std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan(), space_pref);
+    session = std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan().xrGraphicsBinding(),
+                                            space_pref);
   } catch (const std::exception& e) {
     Error("XR セッションの生成に失敗: %s", e.what());
     // 生成失敗時も統計（空）とメッセージは残す。以後の RAII 破棄は
@@ -1046,8 +1047,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
     ledger.AdvanceConnEpoch(conn_epoch);
     stats.connEpoch = conn_epoch;
     try {
-      session =
-          std::make_unique<xr::Session>(transfer.XrInstance(), transfer.Vulkan(), space_pref);
+      session = std::make_unique<xr::Session>(transfer.XrInstance(),
+                                                 transfer.Vulkan().xrGraphicsBinding(), space_pref);
     } catch (const std::exception& e) {
       Warn("セッション再生成に失敗（%s）: %s", why, e.what());
       return false;

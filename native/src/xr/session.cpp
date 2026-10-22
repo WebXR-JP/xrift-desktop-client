@@ -57,20 +57,11 @@ const char* SpaceTypeName(XrReferenceSpaceType type) {
   }
 }
 
-Session::Session(const Instance& xr, const gfx::VulkanContext& vk, SpacePreference pref)
+Session::Session(const Instance& xr, XrGraphicsBindingVulkanKHR binding, SpacePreference pref)
     : instance_(xr.handle()), pref_(pref) {
   // コンストラクタが例外で抜けるとデストラクタは呼ばれないため、生成済みハンドルは
   // ここで破棄する。Destroy() は冪等であり、部分構築状態でも安全に呼べる。
   try {
-    // OpenXR との境界は生ハンドルで行う。vk::raii からの変換は vulkan.hpp の仕様に従い、
-    // operator* で取り出した C++ ハンドルを static_cast で C ハンドルに変換する。
-    XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
-    binding.instance = static_cast<VkInstance>(*vk.instance());
-    binding.physicalDevice = static_cast<VkPhysicalDevice>(*vk.physicalDevice());
-    binding.device = static_cast<VkDevice>(*vk.device());
-    binding.queueFamilyIndex = vk.queueFamilyIndex();
-    binding.queueIndex = 0;
-
     XrSessionCreateInfo info{XR_TYPE_SESSION_CREATE_INFO};
     info.next = &binding;
     info.systemId = xr.systemId();

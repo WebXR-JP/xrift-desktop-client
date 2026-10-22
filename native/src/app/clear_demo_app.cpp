@@ -57,7 +57,7 @@ XrApp::~XrApp() { Shutdown(); }
 int XrApp::Run() {
   instance_ = std::make_unique<xr::Instance>();
   vulkan_ = std::make_unique<gfx::VulkanContext>(*instance_);
-  session_ = std::make_unique<xr::Session>(*instance_, *vulkan_);
+  session_ = std::make_unique<xr::Session>(*instance_, vulkan_->xrGraphicsBinding());
   swapchains_ = std::make_unique<gfx::Swapchains>(instance_->handle(), session_->handle(),
                                                  session_->views());
   clear_pass_ = std::make_unique<gfx::ClearPass>(vulkan_->device(), vulkan_->queueFamilyIndex(),

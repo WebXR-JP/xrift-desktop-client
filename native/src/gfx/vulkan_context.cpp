@@ -223,4 +223,16 @@ VulkanContext::~VulkanContext() {
   // queue_ と physical_device_ は非所有のため実処理はなく、device_ → instance_ の順が保たれる。
 }
 
+XrGraphicsBindingVulkanKHR VulkanContext::xrGraphicsBinding() const {
+  // OpenXR との境界は生ハンドルで行う。vk::raii からの変換は vulkan.hpp の仕様に従い、
+  // operator* で取り出した C++ ハンドルを static_cast で C ハンドルに変換する。
+  XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+  binding.instance = static_cast<VkInstance>(*instance_);
+  binding.physicalDevice = static_cast<VkPhysicalDevice>(*physical_device_);
+  binding.device = static_cast<VkDevice>(*device_);
+  binding.queueFamilyIndex = queue_family_index_;
+  binding.queueIndex = 0;
+  return binding;
+}
+
 }  // namespace xrift::gfx

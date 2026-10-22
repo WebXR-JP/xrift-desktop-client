@@ -4,7 +4,6 @@
 #include <vector>
 
 #include "common/xr_vulkan.h"
-#include "gfx/vulkan_context.h"
 #include "xr/instance.h"
 
 // Vk バインディング付き XrSession、参照空間、view 構成、状態遷移を担う。
@@ -29,7 +28,7 @@ const char* SpaceTypeName(XrReferenceSpaceType type);
 
 class Session {
  public:
-  Session(const Instance& xr, const gfx::VulkanContext& vk,
+  Session(const Instance& xr, XrGraphicsBindingVulkanKHR binding,
           SpacePreference pref = SpacePreference::Local);
   ~Session();
 
