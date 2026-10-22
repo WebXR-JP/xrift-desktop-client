@@ -11,7 +11,7 @@ include(cmake/Dependencies.cmake)
 
 add_executable(xrift_native
   src/main.cpp
-  src/app.cpp
+  src/app/clear_demo_app.cpp
   src/common/log.cpp
   src/common/xr_result.cpp
   src/xr/instance.cpp
@@ -22,7 +22,7 @@ add_executable(xrift_native
   src/gfx/clear_pass.cpp
   src/transfer/pipe_client.cpp
   src/transfer/shared_texture.cpp
-  src/transfer/xr_transfer_app.cpp
+  src/app/xr_transfer_app.cpp
   ../tools/selftest/native/transfer_selftest.cpp
 )
 

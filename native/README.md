@@ -57,7 +57,8 @@ native/build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名
 | パス | 責務 |
 |---|---|
 | `src/main.cpp` | CLI（`--probe`・`--xr-transfer`・`--selftest`・`--help`）と起動 |
-| `src/app.cpp`・`src/xr/` | ライフサイクル・セッション・入力アクション |
+| `src/app/` | 実行モードの組み立て（clear_demo_app / xr_transfer_app） |
+| `src/xr/` | ライフサイクル・セッション・入力アクション |
 | `src/gfx/` | Vulkan 生成・swapchain・クリア描画 |
 | `src/transfer/` | パイプ・共有テクスチャ import・照合・`--xr-transfer` 受信ループと統計 |
 | `src/common/` | ログ・`XrResult` 文字列化 |

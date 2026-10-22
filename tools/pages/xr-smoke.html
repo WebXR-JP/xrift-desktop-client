@@ -209,7 +209,7 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight)
 })
 
-// ---- 受理用の画素内ブロック（配置の正典は native/src/transfer/xr_transfer_app.cpp） ----
+// ---- 受理用の画素内ブロック（配置の正典は native/src/app/xr_transfer_app.cpp） ----
 // 左半分に renderId 下位 16bit（64,64）と pose タグ（128,64）、
 // 左右マーカー（(160,8) マゼンタ、(halfW+160,8) シアン）を置く。
 // raw GL の scissor clear で刻むため three のトーンマッピングを迂回し、

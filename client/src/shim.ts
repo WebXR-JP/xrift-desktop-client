@@ -67,7 +67,7 @@ export function installXRiftXR(): void {
 
   // ------------------------------------------------------------ 制御ブロック
   // exe が画像から ID/pose を読むための画素内メタ。配置の正典は
-  // `native/src/transfer/xr_transfer_app.cpp` の kBlockOrg*（A=(64,64)、
+  // `native/src/app/xr_transfer_app.cpp` の kBlockOrg*（A=(64,64)、
   // B=(128,64)、マーカーは左 (160,8)・右 (右半分起点+160,8)、各 32x32）である。
   // DOM の overlay canvas に 2D で描き、Chromium の合成で OSR 共有テクスチャに載せる。
   // 描くのはページの描画コールバックを呼び終えた後であり、そのフレームに使った

@@ -70,7 +70,7 @@ flowchart LR
 
 ## quick exit
 
-- exe の `--xr-transfer` の通常出口は、統計出力と明示 teardown（セッション終了・パイプ・統計 flush）の後に `std::_Exit(code)` で終わる（`native/src/main.cpp`、`xr_transfer_app.cpp` の `quick_exit`）。
+- exe の `--xr-transfer` の通常出口は、統計出力と明示 teardown（セッション終了・パイプ・統計 flush）の後に `std::_Exit(code)` で終わる（`native/src/main.cpp`、`app/xr_transfer_app.cpp` の `quick_exit`）。
 - 理由：統計出力後の残り RAII 破棄で非決定的クラッシュ（実測 0xC0000005）が起きるためである。必要な後始末は `_Exit` 前に済ませ、残りの破棄を飛ばすことで終了コードを確定させる。
 
 ## 計測

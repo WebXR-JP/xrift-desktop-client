@@ -1,4 +1,4 @@
-#include "transfer/xr_transfer_app.h"
+#include "app/xr_transfer_app.h"
 
 #ifdef _WIN32
 
@@ -1791,7 +1791,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
 #include <string>
 
 #include "common/log.h"
-#include "transfer/xr_transfer_app.h"
+#include "app/xr_transfer_app.h"
 
 namespace xrift::transfer {
 

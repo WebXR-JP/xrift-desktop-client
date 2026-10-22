@@ -4,9 +4,9 @@
 #include <exception>
 #include <string>
 
-#include "app.h"
+#include "app/clear_demo_app.h"
 #include "common/log.h"
-#include "transfer/xr_transfer_app.h"
+#include "app/xr_transfer_app.h"
 #include "transfer_selftest.h"
 
 namespace {
