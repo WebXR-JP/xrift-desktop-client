@@ -61,4 +61,4 @@ pnpm --dir client run package     # 配布物（client/dist-package/）を作る
 - Windows のみ検証。Linux 対応は将来対応。
 - SteamVR の VRAM が XR セッション 1 回あたり約 300MB 増え、SteamVR 再起動で解放される（詳細は `docs/architecture.md`）。
 - exe の通常出口は統計と明示 teardown の後に `_Exit` で終わる（終了コード確定のため。詳細は `docs/architecture.md` の「quick exit」）。
-- 手の pose（grip/targetRay）は未対応。出力色の最終確認は未決（HMD 実機で行う）。
+- 手の pose（grip/aim）は対応済みであり、`gripSpace`/`targetRaySpace` の `getPose` が返す。未接続・locate 失敗・値不正は null になる。出力色の最終確認は未決（HMD 実機で行う）。

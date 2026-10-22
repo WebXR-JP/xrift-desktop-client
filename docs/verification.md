@@ -64,5 +64,5 @@ npx electron client --url=<絶対パス>/tools/pages/xr-smoke.html --seconds=15
 
 - HMD 非装着では XR セッションが FOCUSED に届かず、提出（blit）の検証はできない（blit=0 は正常）。
 - 出力色の最終確認（二重符号化の有無）は未決である。HMD 実機で行う。
-- 手の pose（grip/targetRay）は未対応である。
+- 手の pose（grip/aim）の実機での追従・three.js 上での表示は実機確認が必要である（実装は対応済み。未接続・locate 失敗・値不正は null）。
 - 実機のコントローラ操作・haptics の体感・追従、再センタリング後の `spaceEpoch` 進行、HMD 脱着・再接続の復帰は、実機があるときに確認する（項目は `native/README.md` の「実機装着時にしか確認できない項目」を参照）。

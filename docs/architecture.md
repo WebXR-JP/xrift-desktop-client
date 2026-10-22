@@ -59,18 +59,18 @@ flowchart LR
 
 - exe は OpenXR アクション（左右 grip/aim pose、trigger、squeeze、thumbstick＋click、primary/secondary、menu）を取得し、毎フレーム `InputState` を main へ送る。main は renderer へ中継する（`native/src/xr/input.cpp`、`client/src/main.ts`）。
 - renderer からの haptics 要求は main が `HapticCommand` として exe へ中継し、exe が `xrApplyHapticFeedback` を呼ぶ。結果は `XrResult` でログと統計に残す。非対応・inactive の未送信と呼出し失敗は区別する。
-- 手の pose（grip/targetRay）は未対応であり、`InputState` が pose を運ばないためシムの `getPose` は `null` を返す。ボタン・軸・振動は有効である。
+- 手の pose（grip/aim の 2 種）は対応済みであり、`InputState` が運び、シムは `gripSpace`/`targetRaySpace` の `getPose` で返す。未接続・locate 失敗・値不正は null になる。ボタン・軸・振動は有効である。
 
 ## space とセッション復帰
 
 - 参照空間は `--space=<auto|local|stage|local-floor>` で要求する（既定 `auto`）。`auto` は local-floor→stage→local の順で後退する。明示指定が不可でも落とさず後退し、理由をログに出す。
 - `REFERENCE_SPACE_CHANGE_PENDING` を受けたら次フレームで空間を作り直し、新しい原点で locate を確認してから `spaceEpoch` を進め、旧世代のレコードを失効させる。
-- 脱着は loss とは限らないため、focus/visibility/`shouldRender` に従って提出だけ止めて復帰する。
+- 脱着は loss とは限らないため束は保ち、`shouldRender` が偽の間は新規受理画像の提出を止めて復帰する。Offer の受信・ACK・入力送信は続け、hold の再提出は `shouldRender` に関わらず行う。最初の 1 枚が来る前だけ空フレームにする。
 - `STOPPING` → `xrEndSession`（束は保持し `READY` で再開）。`LOSS_PENDING` → 束を破棄し、新しい `connEpoch` で再生成する（1 秒周期・上限 30 回。ランタイム未復帰なら統計を出して安全に終了）。`EXITING` は再生成せず終了する。
 
 ## quick exit
 
-- exe の `--xr-transfer` の通常出口は、統計出力と明示 teardown（セッション終了・パイプ・統計 flush）の後に `std::_Exit(code)` で終わる（`native/src/main.cpp`、`app/xr_transfer_app.cpp` の `quick_exit`）。
+- exe の `--xr-transfer` の通常出口は、統計出力の後に `blit.reset()` → `swapchains.reset()` → `session.reset()`（`xrDestroySession` を含む束の破棄）を行い、`quick_exit` で `std::_Exit(code)` する（`native/src/main.cpp`、`native/src/app/xr_transfer_app.cpp`）。パイプや TransferSession などの残り RAII は明示破棄せず `_Exit` で省略し、OS に回収させる。`xrEndSession` はここでは呼ばない（STOPPING イベント経路の `End` に任せる）。
 - 理由：統計出力後の残り RAII 破棄で非決定的クラッシュ（実測 0xC0000005）が起きるためである。必要な後始末は `_Exit` 前に済ませ、残りの破棄を飛ばすことで終了コードを確定させる。
 
 ## 計測
