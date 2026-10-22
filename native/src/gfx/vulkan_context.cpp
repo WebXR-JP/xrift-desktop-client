@@ -22,19 +22,6 @@ void CheckVk(vk::Result result, const char* what) {
   throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
 }
 
-// 例外 (vk::SystemError) を投げる raii 呼び出しを、従来の CheckVk と同じ粒度に揃える。
-// 型は std::runtime_error、文面は "<what> に失敗 (VkResult=<名前>)" とする。
-template <typename F>
-void InvokeVk(const char* what, F&& f) {
-  try {
-    f();
-  } catch (const vk::SystemError& e) {
-    const vk::Result result = static_cast<vk::Result>(e.code().value());
-    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
-                             ")");
-  }
-}
-
 // ランタイムが返す拡張名一覧を string の配列に分解する。
 // 区切りは NUL と空白のどちらも受け付ける。仕様上は空白区切りであり、
 // SteamVR は 1 回の呼び出しで空白区切りの複数名を返すことを実測で確認した。
@@ -120,7 +107,7 @@ VulkanContext::VulkanContext(const xr::Instance& xr,
   instance_info.pApplicationInfo = &app_info;
   instance_info.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());
   instance_info.ppEnabledExtensionNames = instance_exts.data();
-  InvokeVk("vkCreateInstance", [&] { instance_ = vk::raii::Instance(context_, instance_info); });
+  instance_ = vk::raii::Instance(context_, instance_info);
 
   // 5. ランタイムに物理デバイスを選ばせる。境界は生ハンドルで行い、所有は raii に巻き直す。
   VkPhysicalDevice chosen = VK_NULL_HANDLE;
@@ -222,8 +209,8 @@ VulkanContext::VulkanContext(const xr::Instance& xr,
   device_info.enabledExtensionCount = static_cast<uint32_t>(device_exts.size());
   device_info.ppEnabledExtensionNames = device_exts.data();
   device_info.pEnabledFeatures = &features;
-  InvokeVk("vkCreateDevice", [&] { device_ = vk::raii::Device(physical_device_, device_info); });
-  InvokeVk("vkGetDeviceQueue", [&] { queue_ = device_.getQueue(graphics_family, 0); });
+  device_ = vk::raii::Device(physical_device_, device_info);
+  queue_ = device_.getQueue(graphics_family, 0);
 
   // 8. GPU 名を保持する。
   const vk::PhysicalDeviceProperties props = physical_device_.getProperties();

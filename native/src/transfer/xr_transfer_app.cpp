@@ -88,17 +88,6 @@ void CheckVk(vk::Result result, const char* what) {
   throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
 }
 
-template <typename F>
-void InvokeVk(const char* what, F&& f) {
-  try {
-    f();
-  } catch (const vk::SystemError& e) {
-    const vk::Result result = static_cast<vk::Result>(e.code().value());
-    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
-                             ")");
-  }
-}
-
 bool IsMagenta(uint8_t b, uint8_t g, uint8_t r) { return r > 200 && b > 200 && g < 80; }
 bool IsCyan(uint8_t b, uint8_t g, uint8_t r) { return g > 200 && b > 200 && r < 80; }
 
@@ -133,7 +122,7 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
   buf_info.size = size;
   buf_info.usage = vk::BufferUsageFlagBits::eTransferDst;
   buf_info.sharingMode = vk::SharingMode::eExclusive;
-  InvokeVk("vkCreateBuffer(ctrl)", [&] { *buf = vk::raii::Buffer(device, buf_info); });
+  *buf = vk::raii::Buffer(device, buf_info);
   const vk::MemoryRequirements req = buf->getMemoryRequirements();
   const vk::PhysicalDeviceMemoryProperties props = vk.physicalDevice().getMemoryProperties();
   int32_t index = -1;
@@ -153,8 +142,8 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
   mem_info.sType = vk::StructureType::eMemoryAllocateInfo;
   mem_info.allocationSize = req.size;
   mem_info.memoryTypeIndex = static_cast<uint32_t>(index);
-  InvokeVk("vkAllocateMemory(ctrl)", [&] { *mem = vk::raii::DeviceMemory(device, mem_info); });
-  InvokeVk("vkBindBufferMemory(ctrl)", [&] { buf->bindMemory(**mem, 0); });
+  *mem = vk::raii::DeviceMemory(device, mem_info);
+  buf->bindMemory(**mem, 0);
 }
 
 // 制御ブロックの readback。自前イメージからブロック A/B（各 32x32）だけを読み、
@@ -168,31 +157,29 @@ class ControlBlockReader {
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
     pool_info.queueFamilyIndex = qfi_;
-    InvokeVk("vkCreateCommandPool(ctrl)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+    pool_ = vk::raii::CommandPool(*device_, pool_info);
     vk::CommandBufferAllocateInfo alloc{};
     alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
     alloc.commandPool = *pool_;
     alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = 1;
-    InvokeVk("vkAllocateCommandBuffers(ctrl)", [&] {
-      vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
-      cmd_ = std::move(bufs[0]);
-    });
+    vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
+    cmd_ = std::move(bufs[0]);
     vk::FenceCreateInfo fence_info{};
     fence_info.sType = vk::StructureType::eFenceCreateInfo;
-    InvokeVk("vkCreateFence(ctrl)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
+    fence_ = vk::raii::Fence(*device_, fence_info);
     AllocateHostBuffer(vk, &stage_, &stageMem_, kStageSize);
   }
 
   // 自前イメージ（GENERAL 駐め）から 2 ブロックを読む。読み後に GENERAL へ戻す。
   // 自前イメージの不変条件（GENERAL 駐め）を壊さないことが呼び出し条件である。
   void Decode(vk::Image own, uint16_t* renderId16, uint16_t* poseTag) {
-    InvokeVk("vkResetFences(ctrl)", [&] { device_->resetFences(*fence_); });
-    InvokeVk("vkResetCommandBuffer(ctrl)", [&] { cmd_.reset(); });
+    device_->resetFences(*fence_);
+    cmd_.reset();
     vk::CommandBufferBeginInfo begin{};
     begin.sType = vk::StructureType::eCommandBufferBeginInfo;
     begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    InvokeVk("vkBeginCommandBuffer(ctrl)", [&] { cmd_.begin(begin); });
+    cmd_.begin(begin);
 
     vk::ImageSubresourceRange range{};
     range.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -236,17 +223,17 @@ class ControlBlockReader {
     cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                          vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, park);
 
-    InvokeVk("vkEndCommandBuffer(ctrl)", [&] { cmd_.end(); });
+    cmd_.end();
     vk::CommandBuffer raw = *cmd_;
     vk::SubmitInfo submit{};
     submit.sType = vk::StructureType::eSubmitInfo;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &raw;
-    InvokeVk("vkQueueSubmit(ctrl)", [&] { queue_->submit(submit, *fence_); });
+    queue_->submit(submit, *fence_);
     CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(ctrl)");
 
     void* mapped = nullptr;
-    InvokeVk("vkMapMemory(ctrl)", [&] { mapped = stageMem_.mapMemory(0, kStageSize); });
+    mapped = stageMem_.mapMemory(0, kStageSize);
     const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
     *renderId16 = DecodeBlock16(bytes);
     *poseTag = DecodeBlock16(bytes + kBlockBytes);
@@ -285,19 +272,17 @@ class HoldImage {
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
     pool_info.queueFamilyIndex = qfi_;
-    InvokeVk("vkCreateCommandPool(hold)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+    pool_ = vk::raii::CommandPool(*device_, pool_info);
     vk::CommandBufferAllocateInfo alloc{};
     alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
     alloc.commandPool = *pool_;
     alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = 1;
-    InvokeVk("vkAllocateCommandBuffers(hold)", [&] {
-      vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
-      cmd_ = std::move(bufs[0]);
-    });
+    vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
+    cmd_ = std::move(bufs[0]);
     vk::FenceCreateInfo fence_info{};
     fence_info.sType = vk::StructureType::eFenceCreateInfo;
-    InvokeVk("vkCreateFence(hold)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
+    fence_ = vk::raii::Fence(*device_, fence_info);
   }
 
   ~HoldImage() {}
@@ -322,12 +307,12 @@ class HoldImage {
       throw std::runtime_error("hold 複製の元画像・寸法が無効です");
     }
     Ensure(w, h);
-    InvokeVk("vkResetFences(hold)", [&] { device_->resetFences(*fence_); });
-    InvokeVk("vkResetCommandBuffer(hold)", [&] { cmd_.reset(); });
+    device_->resetFences(*fence_);
+    cmd_.reset();
     vk::CommandBufferBeginInfo begin{};
     begin.sType = vk::StructureType::eCommandBufferBeginInfo;
     begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    InvokeVk("vkBeginCommandBuffer(hold)", [&] { cmd_.begin(begin); });
+    cmd_.begin(begin);
 
     vk::ImageSubresourceRange range{};
     range.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -384,7 +369,7 @@ class HoldImage {
     cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                          vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, parks);
 
-    InvokeVk("vkEndCommandBuffer(hold)", [&] { cmd_.end(); });
+    cmd_.end();
     vk::CommandBuffer raw = *cmd_;
     vk::SubmitInfo submit{};
     submit.sType = vk::StructureType::eSubmitInfo;
@@ -429,7 +414,7 @@ class HoldImage {
     info.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.initialLayout = vk::ImageLayout::eUndefined;
-    InvokeVk("vkCreateImage(hold)", [&] { image_ = vk::raii::Image(*device_, info); });
+    image_ = vk::raii::Image(*device_, info);
     const vk::MemoryRequirements req = image_.getMemoryRequirements();
     // メモリ種別の選択は自前イメージと同じ基準（deviceLocal 優先）である。
     const vk::PhysicalDeviceMemoryProperties props = physical_->getMemoryProperties();
@@ -457,8 +442,8 @@ class HoldImage {
     alloc.sType = vk::StructureType::eMemoryAllocateInfo;
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = static_cast<uint32_t>(index);
-    InvokeVk("vkAllocateMemory(hold)", [&] { memory_ = vk::raii::DeviceMemory(*device_, alloc); });
-    InvokeVk("vkBindImageMemory(hold)", [&] { image_.bindMemory(*memory_, 0); });
+    memory_ = vk::raii::DeviceMemory(*device_, alloc);
+    image_.bindMemory(*memory_, 0);
     width_ = w;
     height_ = h;
   }
@@ -489,21 +474,19 @@ class BlitPass {
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
     pool_info.queueFamilyIndex = vk.queueFamilyIndex();
-    InvokeVk("vkCreateCommandPool(blit)", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+    pool_ = vk::raii::CommandPool(*device_, pool_info);
     vk::CommandBufferAllocateInfo alloc{};
     alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
     alloc.commandPool = *pool_;
     alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = 2;
-    InvokeVk("vkAllocateCommandBuffers(blit)", [&] {
-      vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
-      cmds_.push_back(std::move(bufs[0]));
-      cmds_.push_back(std::move(bufs[1]));
-    });
+    vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
+    cmds_.push_back(std::move(bufs[0]));
+    cmds_.push_back(std::move(bufs[1]));
     vk::FenceCreateInfo fence_info{};
     fence_info.sType = vk::StructureType::eFenceCreateInfo;
     fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
-    InvokeVk("vkCreateFence(blit)", [&] { fence_ = vk::raii::Fence(*device_, fence_info); });
+    fence_ = vk::raii::Fence(*device_, fence_info);
     AllocateHostBuffer(vk, &stage_, &stageMem_, kStageSize);
     for (uint32_t e = 0; e < swapchains.eyeCount(); ++e) {
       EyeRes res;
@@ -547,13 +530,13 @@ class BlitPass {
     const vk::Image dst = res.images[image_index];
 
     CheckVk(device_->waitForFences(*fence_, vk::True, UINT64_MAX), "vkWaitForFences(blit)");
-    InvokeVk("vkResetFences(blit)", [&] { device_->resetFences(*fence_); });
+    device_->resetFences(*fence_);
     vk::raii::CommandBuffer& cmd = cmds_[eye & 1u];
-    InvokeVk("vkResetCommandBuffer(blit)", [&] { cmd.reset(); });
+    cmd.reset();
     vk::CommandBufferBeginInfo begin{};
     begin.sType = vk::StructureType::eCommandBufferBeginInfo;
     begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    InvokeVk("vkBeginCommandBuffer(blit)", [&] { cmd.begin(begin); });
+    cmd.begin(begin);
 
     vk::ImageSubresourceRange range{};
     range.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -656,18 +639,18 @@ class BlitPass {
                           to_present);
     }
 
-    InvokeVk("vkEndCommandBuffer(blit)", [&] { cmd.end(); });
+    cmd.end();
     vk::CommandBuffer raw = *cmd;
     vk::SubmitInfo submit{};
     submit.sType = vk::StructureType::eSubmitInfo;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &raw;
-    InvokeVk("vkQueueSubmit(blit)", [&] { queue_->submit(submit, *fence_); });
+    queue_->submit(submit, *fence_);
     CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(blit 完了)");
 
     {
       void* mapped = nullptr;
-      InvokeVk("vkMapMemory(blit)", [&] { mapped = stageMem_.mapMemory(0, kStageSize); });
+      mapped = stageMem_.mapMemory(0, kStageSize);
       const uint8_t* p = static_cast<const uint8_t*>(mapped);
       // 左眼にマゼンタ、右眼にシアンが来ていること。逆なら失敗として数える。
       out.markerOk = (eye == 0) ? IsMagenta(p[0], p[1], p[2]) : IsCyan(p[0], p[1], p[2]);

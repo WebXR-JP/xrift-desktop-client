@@ -17,19 +17,6 @@ void CheckVk(vk::Result result, const char* what) {
   throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
 }
 
-// 例外 (vk::SystemError) を投げる raii 呼び出しを、従来の CheckVk と同じ粒度に揃える。
-// 型は std::runtime_error、文面は "<what> に失敗 (VkResult=<名前>)" とする。
-template <typename F>
-void InvokeVk(const char* what, F&& f) {
-  try {
-    f();
-  } catch (const vk::SystemError& e) {
-    const vk::Result result = static_cast<vk::Result>(e.code().value());
-    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
-                             ")");
-  }
-}
-
 }  // namespace
 
 ClearPass::ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
@@ -39,7 +26,7 @@ ClearPass::ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
   pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
   pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
   pool_info.queueFamilyIndex = queueFamilyIndex;
-  InvokeVk("vkCreateCommandPool", [&] { pool_ = vk::raii::CommandPool(*device_, pool_info); });
+  pool_ = vk::raii::CommandPool(*device_, pool_info);
 
   const uint32_t eyes = swapchains.eyeCount();
   eyes_.reserve(eyes);
@@ -58,12 +45,10 @@ ClearPass::ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
     alloc.level = vk::CommandBufferLevel::ePrimary;
     alloc.commandBufferCount = images;
     res.commands.reserve(images);
-    InvokeVk("vkAllocateCommandBuffers", [&] {
-      vk::raii::CommandBuffers allocated = device_->allocateCommandBuffers(alloc);
-      for (vk::raii::CommandBuffer& cmd : allocated) {
-        res.commands.push_back(std::move(cmd));
-      }
-    });
+    vk::raii::CommandBuffers allocated = device_->allocateCommandBuffers(alloc);
+    for (vk::raii::CommandBuffer& cmd : allocated) {
+      res.commands.push_back(std::move(cmd));
+    }
     vk::FenceCreateInfo fence_info{};
     fence_info.sType = vk::StructureType::eFenceCreateInfo;
     // 初回の待機を素通りさせるため、生成時は signaled にする。
@@ -71,7 +56,7 @@ ClearPass::ClearPass(const vk::raii::Device& device, uint32_t queueFamilyIndex,
     res.fences.reserve(images);
     for (uint32_t i = 0; i < images; ++i) {
       vk::raii::Fence fence{nullptr};
-      InvokeVk("vkCreateFence", [&] { fence = vk::raii::Fence(*device_, fence_info); });
+      fence = vk::raii::Fence(*device_, fence_info);
       res.fences.push_back(std::move(fence));
     }
     eyes_.push_back(std::move(res));
@@ -112,13 +97,13 @@ void ClearPass::Draw(uint32_t eye) {
   vk::raii::Fence& fence = res.fences[image_index];
   vk::raii::CommandBuffer& cmd = res.commands[image_index];
   CheckVk(device_->waitForFences(*fence, vk::True, UINT64_MAX), "vkWaitForFences");
-  InvokeVk("vkResetFences", [&] { device_->resetFences(*fence); });
-  InvokeVk("vkResetCommandBuffer", [&] { cmd.reset(); });
+  device_->resetFences(*fence);
+  cmd.reset();
 
   vk::CommandBufferBeginInfo begin{};
   begin.sType = vk::StructureType::eCommandBufferBeginInfo;
   begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-  InvokeVk("vkBeginCommandBuffer", [&] { cmd.begin(begin); });
+  cmd.begin(begin);
 
   vk::ImageSubresourceRange range{};
   range.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -157,13 +142,13 @@ void ClearPass::Draw(uint32_t eye) {
                       vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
                       to_present);
 
-  InvokeVk("vkEndCommandBuffer", [&] { cmd.end(); });
+  cmd.end();
   vk::CommandBuffer raw_cmd = *cmd;
   vk::SubmitInfo submit{};
   submit.sType = vk::StructureType::eSubmitInfo;
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &raw_cmd;
-  InvokeVk("vkQueueSubmit", [&] { queue_->submit(submit, *fence); });
+  queue_->submit(submit, *fence);
   CheckVk(device_->waitForFences(*fence, vk::True, UINT64_MAX), "vkWaitForFences(描画完了)");
 
   XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};

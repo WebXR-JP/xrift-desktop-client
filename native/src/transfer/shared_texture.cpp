@@ -39,18 +39,6 @@ void CheckVk(vk::Result result, const char* what) {
   throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
 }
 
-// 例外 (vk::SystemError) を投げる raii 呼び出しを従来の CheckVk と同じ粒度に揃える。
-template <typename F>
-void InvokeVk(const char* what, F&& f) {
-  try {
-    f();
-  } catch (const vk::SystemError& e) {
-    const vk::Result result = static_cast<vk::Result>(e.code().value());
-    throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) +
-                             ")");
-  }
-}
-
 // GPU 完了を確認できない失敗（フェンス待ち失敗・device lost・waitIdle 失敗）の合図。
 // timeout は返却許可ではないため、呼び出し側は Done を送らず新規受付を止める。
 // submit 前の失敗（GPU は触っていない）や完了確認済みの失敗とは区別する。
@@ -112,21 +100,19 @@ TransferSession::TransferSession() : vulkan_(instance_, RequiredExtensionList())
   pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
   pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
   pool_info.queueFamilyIndex = vulkan_.queueFamilyIndex();
-  InvokeVk("vkCreateCommandPool", [&] { pool_ = vk::raii::CommandPool(device, pool_info); });
+  pool_ = vk::raii::CommandPool(device, pool_info);
 
   vk::CommandBufferAllocateInfo alloc{};
   alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
   alloc.commandPool = *pool_;
   alloc.level = vk::CommandBufferLevel::ePrimary;
   alloc.commandBufferCount = 1;
-  InvokeVk("vkAllocateCommandBuffers", [&] {
-    vk::raii::CommandBuffers buffers = device.allocateCommandBuffers(alloc);
-    copyCmd_ = std::move(buffers[0]);
-  });
+  vk::raii::CommandBuffers buffers = device.allocateCommandBuffers(alloc);
+  copyCmd_ = std::move(buffers[0]);
 
   vk::FenceCreateInfo fence_info{};
   fence_info.sType = vk::StructureType::eFenceCreateInfo;
-  InvokeVk("vkCreateFence", [&] { fence_ = vk::raii::Fence(device, fence_info); });
+  fence_ = vk::raii::Fence(device, fence_info);
 
   Info("転送セッション開始: GPU=%s", vulkan_.gpuName().c_str());
 }
@@ -182,7 +168,7 @@ void TransferSession::EnsureOwnImage(uint32_t width, uint32_t height) {
                vk::ImageUsageFlagBits::eSampled;
   info.sharingMode = vk::SharingMode::eExclusive;
   info.initialLayout = vk::ImageLayout::eUndefined;
-  InvokeVk("vkCreateImage(自前)", [&] { ownImage_ = vk::raii::Image(device, info); });
+  ownImage_ = vk::raii::Image(device, info);
 
   // 所要量の問い合わせは 1.0 系の vkGetImageMemoryRequirements を使う。
   // DeviceImageMemoryRequirements 経由（1.3 / maintenance4 相当）は使わない。
@@ -213,9 +199,8 @@ void TransferSession::EnsureOwnImage(uint32_t width, uint32_t height) {
   alloc.sType = vk::StructureType::eMemoryAllocateInfo;
   alloc.allocationSize = req.size;
   alloc.memoryTypeIndex = static_cast<uint32_t>(index);
-  InvokeVk("vkAllocateMemory(自前)", [&] { ownMemory_ = vk::raii::DeviceMemory(device, alloc); });
-  InvokeVk("vkBindImageMemory(自前)",
-           [&] { ownImage_.bindMemory(*ownMemory_, 0); });
+  ownMemory_ = vk::raii::DeviceMemory(device, alloc);
+  ownImage_.bindMemory(*ownMemory_, 0);
   ownWidth_ = width;
   ownHeight_ = height;
   ownDefined_ = false;
@@ -259,7 +244,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     image_info.sharingMode = vk::SharingMode::eExclusive;
     image_info.initialLayout = vk::ImageLayout::eUndefined;
     vk::raii::Image import_image{nullptr};
-    InvokeVk("vkCreateImage(import)", [&] { import_image = vk::raii::Image(device, image_info); });
+    import_image = vk::raii::Image(device, image_info);
 
     // 3. 外部形式の対応確認とメモリ所要量の取得。
     vk::PhysicalDeviceExternalImageFormatInfo external_format{};
@@ -277,11 +262,9 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     using FormatChain = vk::StructureChain<vk::ImageFormatProperties2,
                                            vk::ExternalImageFormatProperties>;
     FormatChain chain{};
-    InvokeVk("vkGetPhysicalDeviceImageFormatProperties2", [&] {
-      chain = vulkan_.physicalDevice()
-                  .getImageFormatProperties2<vk::ImageFormatProperties2,
-                                             vk::ExternalImageFormatProperties>(format_info);
-    });
+    chain = vulkan_.physicalDevice()
+                .getImageFormatProperties2<vk::ImageFormatProperties2,
+                                           vk::ExternalImageFormatProperties>(format_info);
     const vk::ExternalMemoryFeatureFlags features =
         chain.get<vk::ExternalImageFormatProperties>().externalMemoryProperties.externalMemoryFeatures;
     const bool dedicated_only =
@@ -325,10 +308,8 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     alloc.memoryTypeIndex = static_cast<uint32_t>(index);
     alloc.pNext = dedicated_only ? static_cast<void*>(&dedicated) : static_cast<void*>(&import_info);
     vk::raii::DeviceMemory import_memory{nullptr};
-    InvokeVk("vkAllocateMemory(import)",
-             [&] { import_memory = vk::raii::DeviceMemory(device, alloc); });
-    InvokeVk("vkBindImageMemory(import)",
-             [&] { import_image.bindMemory(*import_memory, 0); });
+    import_memory = vk::raii::DeviceMemory(device, alloc);
+    import_image.bindMemory(*import_memory, 0);
 
     // import 資源は submit 以降の失敗（完了未確認）に備えて保留メンバへ移す。
     // 以降は非所有の表示ハンドル経由で参照し、破棄は「フェンス完了を確認できた」か
@@ -341,12 +322,12 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
 
     // 5. 自前イメージの用意とコピー。完了はフェンスで待ち、完了後に ACK する。
     EnsureOwnImage(width, height);
-    InvokeVk("vkResetFences", [&] { device.resetFences(*fence_); });
-    InvokeVk("vkResetCommandBuffer", [&] { copyCmd_.reset(); });
+    device.resetFences(*fence_);
+    copyCmd_.reset();
     vk::CommandBufferBeginInfo begin{};
     begin.sType = vk::StructureType::eCommandBufferBeginInfo;
     begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    InvokeVk("vkBeginCommandBuffer", [&] { copyCmd_.begin(begin); });
+    copyCmd_.begin(begin);
 
     const vk::ImageSubresourceRange range = FullColorRange();
     const uint32_t qfi = vulkan_.queueFamilyIndex();
@@ -426,7 +407,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
                              vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr,
                              own_park);
 
-    InvokeVk("vkEndCommandBuffer", [&] { copyCmd_.end(); });
+    copyCmd_.end();
     vk::CommandBuffer raw_copy = *copyCmd_;
     vk::SubmitInfo submit{};
     submit.sType = vk::StructureType::eSubmitInfo;
