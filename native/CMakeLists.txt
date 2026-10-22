@@ -22,6 +22,7 @@ add_executable(xrift_native
   src/gfx/clear_pass.cpp
   src/gfx/hold_image.cpp
   src/ipc/pipe_client.cpp
+  src/transfer/control_block_reader.cpp
   src/transfer/shared_texture.cpp
   src/app/xr_transfer_app.cpp
   ../tools/selftest/native/transfer_selftest.cpp

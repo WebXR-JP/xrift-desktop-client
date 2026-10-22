@@ -23,6 +23,7 @@
 #include "ipc/control_blocks.h"
 #include "ipc/pipe_client.h"
 #include "ipc/protocol.h"
+#include "transfer/control_block_reader.h"
 #include "transfer/render_record.h"
 #include "transfer/shared_texture.h"
 #include "xr/input.h"
@@ -134,114 +135,6 @@ void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
   *mem = vk::raii::DeviceMemory(device, mem_info);
   buf->bindMemory(**mem, 0);
 }
-
-// 制御ブロックの readback。自前イメージからブロック A/B（各 32x32）だけを読み、
-// renderId 下位 16bit と pose タグを復号する。画像全体は読まない
-// （docs/architecture.md「経路」の制御メタデータの例外。XR ループを readback 待ちで止めないよう最小限）。
-class ControlBlockReader {
- public:
-  explicit ControlBlockReader(const gfx::VulkanContext& vk)
-      : device_(&vk.device()), queue_(&vk.queue()), qfi_(vk.queueFamilyIndex()) {
-    vk::CommandPoolCreateInfo pool_info{};
-    pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
-    pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-    pool_info.queueFamilyIndex = qfi_;
-    pool_ = vk::raii::CommandPool(*device_, pool_info);
-    vk::CommandBufferAllocateInfo alloc{};
-    alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
-    alloc.commandPool = *pool_;
-    alloc.level = vk::CommandBufferLevel::ePrimary;
-    alloc.commandBufferCount = 1;
-    vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
-    cmd_ = std::move(bufs[0]);
-    vk::FenceCreateInfo fence_info{};
-    fence_info.sType = vk::StructureType::eFenceCreateInfo;
-    fence_ = vk::raii::Fence(*device_, fence_info);
-    AllocateHostBuffer(vk, &stage_, &stageMem_, kStageSize);
-  }
-
-  // 自前イメージ（GENERAL 駐め）から 2 ブロックを読む。読み後に GENERAL へ戻す。
-  // 自前イメージの不変条件（GENERAL 駐め）を壊さないことが呼び出し条件である。
-  void Decode(vk::Image own, uint16_t* renderId16, uint16_t* poseTag) {
-    device_->resetFences(*fence_);
-    cmd_.reset();
-    vk::CommandBufferBeginInfo begin{};
-    begin.sType = vk::StructureType::eCommandBufferBeginInfo;
-    begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    cmd_.begin(begin);
-
-    vk::ImageSubresourceRange range{};
-    range.aspectMask = vk::ImageAspectFlagBits::eColor;
-    range.levelCount = 1;
-    range.layerCount = 1;
-    vk::ImageMemoryBarrier to_src{};
-    to_src.sType = vk::StructureType::eImageMemoryBarrier;
-    to_src.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-    to_src.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-    to_src.oldLayout = vk::ImageLayout::eGeneral;
-    to_src.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-    to_src.image = own;
-    to_src.subresourceRange = range;
-    cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                         vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_src);
-    const uint32_t org_x[2] = {kControlBlockOrgAX, kControlBlockOrgBX};
-    for (int i = 0; i < 2; ++i) {
-      vk::BufferImageCopy region{};
-      region.bufferOffset = static_cast<vk::DeviceSize>(i * kControlBlockBytes);
-      region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-      region.imageSubresource.layerCount = 1;
-      region.imageOffset = vk::Offset3D{static_cast<int32_t>(org_x[i]),
-                                       static_cast<int32_t>(kControlBlockOrgY), 0};
-      region.imageExtent = vk::Extent3D{kControlBlockPixels, kControlBlockPixels, 1};
-      cmd_.copyImageToBuffer(own, vk::ImageLayout::eTransferSrcOptimal, *stage_, region);
-    }
-    vk::BufferMemoryBarrier host{};
-    host.sType = vk::StructureType::eBufferMemoryBarrier;
-    host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-    host.dstAccessMask = vk::AccessFlagBits::eHostRead;
-    host.buffer = *stage_;
-    host.offset = 0;
-    host.size = kStageSize;
-    cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                         {}, nullptr, host, nullptr);
-    vk::ImageMemoryBarrier park = to_src;
-    park.srcAccessMask = vk::AccessFlagBits::eTransferRead;
-    park.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-    park.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
-    park.newLayout = vk::ImageLayout::eGeneral;
-    cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                         vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, park);
-
-    cmd_.end();
-    vk::CommandBuffer raw = *cmd_;
-    vk::SubmitInfo submit{};
-    submit.sType = vk::StructureType::eSubmitInfo;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &raw;
-    queue_->submit(submit, *fence_);
-    CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(ctrl)");
-
-    void* mapped = nullptr;
-    mapped = stageMem_.mapMemory(0, kStageSize);
-    const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
-    *renderId16 = DecodeBlock16(bytes);
-    *poseTag = DecodeBlock16(bytes + kControlBlockBytes);
-    stageMem_.unmapMemory();
-  }
-
- private:
-  static constexpr size_t kStageSize = 2 * kControlBlockBytes;
-
-
-  const vk::raii::Device* device_;
-  const vk::raii::Queue* queue_;
-  uint32_t qfi_ = 0;
-  vk::raii::CommandPool pool_{nullptr};
-  vk::raii::CommandBuffer cmd_{nullptr};
-  vk::raii::Fence fence_{nullptr};
-  vk::raii::Buffer stage_{nullptr};
-  vk::raii::DeviceMemory stageMem_{nullptr};
-};
 
 // 受理画像の提出パス。acquire → blit → マーカー確認 → release を 1 眼単位で行う。
 class BlitPass {
