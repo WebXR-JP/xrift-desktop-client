@@ -26,6 +26,7 @@ add_executable(xrift_native
   src/transfer/control_block_reader.cpp
   src/transfer/shared_texture.cpp
   src/app/xr_transfer_app.cpp
+  src/app/xr_transfer_metrics.cpp
   ../tools/selftest/native/transfer_selftest.cpp
 )
 
