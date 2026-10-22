@@ -5,6 +5,7 @@
 #include <string>
 
 #include "app/clear_demo_app.h"
+#include "app/probe.h"
 #include "common/log.h"
 #include "app/xr_transfer_app.h"
 #include "transfer_selftest.h"

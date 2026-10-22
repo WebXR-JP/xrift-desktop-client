@@ -12,6 +12,7 @@ include(cmake/Dependencies.cmake)
 add_executable(xrift_native
   src/main.cpp
   src/app/clear_demo_app.cpp
+  src/app/probe.cpp
   src/common/log.cpp
   src/common/xr_result.cpp
   src/xr/instance.cpp
