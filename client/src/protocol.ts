@@ -1,5 +1,5 @@
 /**
- * パイププロトコルの配置と復号。配置は `native/src/transfer/protocol.h` が正本であり、
+ * パイププロトコルの配置と復号。配置は `native/src/ipc/protocol.h` が正本であり、
  * ここは main プロセス側の読み取り専用の写しである。配置を変えたら両方を同時に更新する。
  *
  * @packageDocumentation

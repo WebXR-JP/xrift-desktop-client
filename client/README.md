@@ -7,9 +7,9 @@
 | ファイル | 責務 |
 |---|---|
 | `src/main.ts` | パイプサーバ・借用台帳・exe の spawn・ミラー・入力転送 |
-| `src/protocol.ts` | パイプ配置の読み取り専用の写し（正本は `native/src/transfer/protocol.h`） |
+| `src/protocol.ts` | パイプ配置の読み取り専用の写し（正本は `native/src/ipc/protocol.h`） |
 | `src/preload.ts` | `window.__xriftXR` だけを公開し、シムを注入する。Node の機能は渡さない |
-| `src/control-codec.ts` | 制御ブロックのコーデック（正本は C++ の `render_record.h`・`control_blocks.h`） |
+| `src/control-codec.ts` | 制御ブロックのコーデック（正本は C++ の `native/src/transfer/render_record.h`・`native/src/ipc/control_blocks.h`） |
 | `src/shim.ts` | WebXR シム。`present` は無い（OSR の paint が提出を駆動する）。制御ブロックはページの描画コールバックを呼び終えた後に overlay canvas へ描く |
 | `src/mirror-input.ts`・`src/control-preload.ts` | 入力境界・コントロール用ブリッジ |
 | `pages/control.html`・`pages/mirror-map.js` | ミラー表示（レターボックス往復の正本は `mirror-map.js`） |

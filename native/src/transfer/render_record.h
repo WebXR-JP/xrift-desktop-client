@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <deque>
 
-#include "transfer/protocol.h"
+#include "ipc/protocol.h"
 
 // 描画レコード（exe が発行・保持する変更不能な要求台帳）。
 // xrLocateViews の左右 pose/FOV・予測時刻・世代を renderId と結び付けて保持し、

@@ -27,7 +27,7 @@ flowchart LR
 1. exe が pose/FOV と描画要求（`RenderRequest`）を発行し、接続世代・空間世代・描画 ID を変更不能なレコードとして保持する（`native/src/transfer/render_record.h`）。
 2. レンダラは要求された record を描き、実際に使った record の ID を画像の予約領域（制御ブロック）に描く。描画コールバックを呼び終えた後に overlay canvas へ描くため、painted 画像の内容とタグは同一 record に対応する。rAF を呼ばなかった record では更新しない（`client/src/shim.ts`）。
 3. main は OSR `paint` の共有テクスチャを借用台帳に登録し、NT ハンドルを transfer-addon（`DuplicateHandle` のみ。GPU 操作なし）で exe プロセスへ複製して Offer する（`client/src/main.ts`、`native/transfer-addon/addon.cpp`）。
-4. exe は Vulkan で外部メモリ import し、自前リングイメージへ GPU コピーする。コピー後の同一画像から制御ブロックを GPU で検査し、renderId/pose タグを保持レコードと照合する。不明 ID・checksum 不一致・失効・space 世代不一致・年齢超過は破棄する（`native/src/transfer/shared_texture.cpp`、`control_blocks.h`）。
+4. exe は Vulkan で外部メモリ import し、自前リングイメージへ GPU コピーする。コピー後の同一画像から制御ブロックを GPU で検査し、renderId/pose タグを保持レコードと照合する。不明 ID・checksum 不一致・失効・space 世代不一致・年齢超過は破棄する（`native/src/transfer/shared_texture.cpp`、`native/src/ipc/control_blocks.h`）。
 5. 受理画像だけを左右に分離して XR swapchain へ blit し、`xrEndFrame` で提出する。main は提出に関与しない。
 
 ## 借用の所有権と release 遅延

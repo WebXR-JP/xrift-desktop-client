@@ -42,7 +42,7 @@ native/build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名
 
 ## プロトコルの要点
 
-- 転送メッセージは 256 バイト固定（正本は `src/transfer/protocol.h`。TS 側の写しは `client/src/protocol.ts`）。
+- 転送メッセージは 256 バイト固定（正本は `src/ipc/protocol.h`。TS 側の写しは `client/src/protocol.ts`）。
 - 種別：`Offer`（複製ハンドル＋実サイズ）→ `Done`（GPU 完了確認）、`RenderRequest`（pose/FOV＋描画要求）、`InputState`（毎フレーム）、`HapticCommand`（main→exe）。
 - main は借用台帳を持ち、`release()` は main だけが呼ぶ。exe は借用中の複製だけ扱い、所有権は取らない。
 - 受領した複製ハンドルは import 成否に関わらず exe が閉じる。元の Electron 側は閉じない。
@@ -57,10 +57,11 @@ native/build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名
 | パス | 責務 |
 |---|---|
 | `src/main.cpp` | CLI（`--probe`・`--xr-transfer`・`--selftest`・`--help`）と起動 |
-| `src/app/` | 実行モードの組み立て（clear_demo_app / xr_transfer_app） |
+| `src/app/` | 実行モードの組み立て（clear_demo_app / xr_transfer_app）・入力メッセージ変換（`input_message.h`） |
 | `src/xr/` | ライフサイクル・セッション・入力アクション |
 | `src/gfx/` | Vulkan 生成・swapchain・クリア描画 |
-| `src/transfer/` | パイプ・共有テクスチャ import・照合・`--xr-transfer` 受信ループと統計 |
+| `src/ipc/` | 256B wire 契約（`protocol.h`）・制御ブロック配置（`control_blocks.h`）・名前付きパイプ（`pipe_client`） |
+| `src/transfer/` | GPU import（`TransferSession`）・受理台帳（`render_record.h`） |
 | `src/common/` | ログ・`XrResult` 文字列化 |
 | `transfer-addon/` | NT ハンドル複製の N-API アドオン（cmake-js。本体 CMake とは分離） |
 | `cmake/Dependencies.cmake` | FetchContent の取得定義 |

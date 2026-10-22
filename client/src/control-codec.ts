@@ -2,7 +2,7 @@
  * 制御ブロックのコーデック。
  *
  * 正典は C++ 側（`native/src/transfer/render_record.h` の量子化・`PoseTag`、
- * `native/src/transfer/control_blocks.h` のブロック符号化）であり、このモジュールは
+ * `native/src/ipc/control_blocks.h` のブロック符号化）であり、このモジュールは
  * その写しである。計算結果を変えたら exe が受理しないため、式を変えるときは
  * C++・ここ・`./shim.ts` 内の同等品を同時に更新し、
  * `tools/test/client/control-codec.test.cjs` のベクトルで一致を確認する。

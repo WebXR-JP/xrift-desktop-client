@@ -20,7 +20,7 @@ add_executable(xrift_native
   src/gfx/vulkan_context.cpp
   src/gfx/swapchains.cpp
   src/gfx/clear_pass.cpp
-  src/transfer/pipe_client.cpp
+  src/ipc/pipe_client.cpp
   src/transfer/shared_texture.cpp
   src/app/xr_transfer_app.cpp
   ../tools/selftest/native/transfer_selftest.cpp

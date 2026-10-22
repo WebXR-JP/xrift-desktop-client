@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "transfer/protocol.h"
+#include "ipc/protocol.h"
 #include "xr/input.h"
 
 // 入力スナップショットを 256B の InputState（exe → main）に畳む。

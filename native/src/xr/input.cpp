@@ -8,7 +8,7 @@
 
 #include "common/log.h"
 #include "common/xr_result.h"
-#include "transfer/protocol.h"
+#include "ipc/protocol.h"
 
 namespace xrift::xr {
 namespace {

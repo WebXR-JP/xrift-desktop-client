@@ -4,9 +4,9 @@
 #include <cstdio>
 #include <string>
 
-#include "transfer/input_state.h"
-#include "transfer/control_blocks.h"
-#include "transfer/protocol.h"
+#include "app/input_message.h"
+#include "ipc/control_blocks.h"
+#include "ipc/protocol.h"
 #include "transfer/render_record.h"
 #include "xr/input.h"
 

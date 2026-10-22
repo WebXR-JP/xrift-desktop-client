@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "transfer/protocol.h"
+#include "ipc/protocol.h"
 
 // 名前付きパイプのクライアント側。main プロセスがサーバ、exe が接続する。
 // 受信はブロッキングでよい（受信ループは専用スレッド相当の main スレッドで行う）。
