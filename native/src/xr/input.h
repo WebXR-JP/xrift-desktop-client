@@ -68,6 +68,24 @@ struct InputStats {
 constexpr float kInputEdgeAnalogEps = 0.0005f;  // 0 判定の不感帯（取得ノイズの跳ね抑え）。
 constexpr float kInputEdgeStickThreshold = 0.2f;  // stick 有効域の境目（仕様値）。
 
+// interaction profile の XR 側分類。wire 形式の数値 ID ではなく
+// ランタイムが返す profile 名の分類であり、xr 層の中で閉じる。
+// wire 側の ProfileIdFromName（ipc 側の protocol.h）と対になる表である。片方の顔ぶれを
+// 変えたら両方を変えること。wire の数値 ID への変換は app 側の input_message.h が担う。
+enum class ControllerProfile : uint8_t {
+  None,      // 空（未取得・未装着）。
+  Unknown,   // 一覧に無い profile。
+  Simple,    // simple_controller。
+  Oculus,    // touch_controller。
+  Pico4,     // pico4_controller。
+  PicoNeo3,  // pico_neo3_controller。
+  PicoUltra,  // pico_ultra_controller_bd。
+  PicoG3,    // pico_g3_controller。
+  Index,     // index_controller。
+  Vive,      // vive_controller。
+  Motion,    // motion_controller。
+};
+
 // 入力アクションの一式。XrInstance に束縛される（action set・action）。
 // grip/aim の空間だけが XrSession に束縛されるため、セッション再生成時は
 // DetachSpaces→AttachSpaces で作り直す（action 自体は作り直さない）。
@@ -134,8 +152,8 @@ class InputManager {
   bool QueryBool(XrSession session, XrAction action, XrPath sub, InputButton* out, bool focused,
                  uint8_t supported);
   // 現在の profile に対する束縛の有無。suggest 表と一致させること。
-  // profileId は transfer::ProfileIdFromName の値域（0=未取得、255=未知）を使う。
-  uint8_t SupportMask(uint8_t profileId, XrAction action) const;
+  // None・Unknown は束縛不明のため 1 を返し、取得呼び出しの結果で判断する。
+  uint8_t SupportMask(ControllerProfile profile, XrAction action) const;
 
   XrInstance instance_ = XR_NULL_HANDLE;
   XrActionSet action_set_ = XR_NULL_HANDLE;

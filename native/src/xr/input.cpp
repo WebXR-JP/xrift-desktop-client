@@ -8,7 +8,6 @@
 
 #include "common/log.h"
 #include "common/xr_result.h"
-#include "ipc/protocol.h"
 
 namespace xrift::xr {
 namespace {
@@ -45,6 +44,59 @@ XrAction MakeAction(XrActionSet set, const char* name, const char* localized,
   XrAction action = XR_NULL_HANDLE;
   CheckXr(xrCreateAction(set, &info, &action), name);
   return action;
+}
+
+// interaction profile 名の分類。wire 側の ProfileIdFromName（ipc 側の protocol.h）と
+// 対になる表であり、同じ名前一覧・同じ末尾一致で判定する。片方の顔ぶれを変えたら
+// 両方を変えること。wire の数値 ID には触れず、xr 層の SupportMask 判定だけに使う。
+ControllerProfile ClassifyProfile(const std::string& path) {
+  if (path.empty()) {
+    return ControllerProfile::None;
+  }
+  // 最終節の比較で十分である（suggest 表の顔ぶれは最終節が重複しない）。
+  // 将来 profile を足して最終節が衝突したら、ここを完全一致に戻すこと。
+  const char* name = path.c_str();
+  const char* tail = name;
+  for (const char* p = name; *p != '\0'; ++p) {
+    if (*p == '/') {
+      tail = p + 1;
+    }
+  }
+  auto eq = [](const char* a, const char* b) {
+    while (*a != '\0' && *a == *b) {
+      ++a;
+      ++b;
+    }
+    return *a == *b;
+  };
+  if (eq(tail, "simple_controller")) {
+    return ControllerProfile::Simple;
+  }
+  if (eq(tail, "touch_controller")) {
+    return ControllerProfile::Oculus;
+  }
+  if (eq(tail, "index_controller")) {
+    return ControllerProfile::Index;
+  }
+  if (eq(tail, "vive_controller")) {
+    return ControllerProfile::Vive;
+  }
+  if (eq(tail, "motion_controller")) {
+    return ControllerProfile::Motion;
+  }
+  if (eq(tail, "pico4_controller")) {
+    return ControllerProfile::Pico4;
+  }
+  if (eq(tail, "pico_neo3_controller")) {
+    return ControllerProfile::PicoNeo3;
+  }
+  if (eq(tail, "pico_ultra_controller_bd")) {
+    return ControllerProfile::PicoUltra;
+  }
+  if (eq(tail, "pico_g3_controller")) {
+    return ControllerProfile::PicoG3;
+  }
+  return ControllerProfile::Unknown;
 }
 
 }  // namespace
@@ -297,21 +349,21 @@ bool InputManager::QueryProfile(XrSession session, int hand, std::string* out) {
   return true;
 }
 
-uint8_t InputManager::SupportMask(uint8_t profileId, XrAction action) const {
+uint8_t InputManager::SupportMask(ControllerProfile profile, XrAction action) const {
   // suggest 表と一致させる。未知・未取得の profile は束縛の有無が分からないため
   // 取得呼び出しの結果（PATH_UNSUPPORTED か否か）で判断する（呼び出し側で処理）。
-  if (profileId == transfer::kProfileNone || profileId == transfer::kProfileOther) {
+  if (profile == ControllerProfile::None || profile == ControllerProfile::Unknown) {
     return 1;
   }
-  const bool simple = profileId == transfer::kProfileSimple;
-  const bool oculus = profileId == transfer::kProfileOculus;
-  const bool pico_full = profileId == transfer::kProfilePico4 ||
-                         profileId == transfer::kProfilePicoNeo3 ||
-                         profileId == transfer::kProfilePicoUltra;
-  const bool pico_g3 = profileId == transfer::kProfilePicoG3;
-  const bool index = profileId == transfer::kProfileIndex;
-  const bool vive = profileId == transfer::kProfileVive;
-  const bool motion = profileId == transfer::kProfileMotion;
+  const bool simple = profile == ControllerProfile::Simple;
+  const bool oculus = profile == ControllerProfile::Oculus;
+  const bool pico_full = profile == ControllerProfile::Pico4 ||
+                         profile == ControllerProfile::PicoNeo3 ||
+                         profile == ControllerProfile::PicoUltra;
+  const bool pico_g3 = profile == ControllerProfile::PicoG3;
+  const bool index = profile == ControllerProfile::Index;
+  const bool vive = profile == ControllerProfile::Vive;
+  const bool motion = profile == ControllerProfile::Motion;
   if (action == grip_pose_ || action == aim_pose_ || action == haptic_) {
     return 1;
   }
@@ -448,7 +500,7 @@ InputSnapshot InputManager::Snapshot(XrSession session, XrSpace appSpace, XrTime
         ++stats_.profileChanges;
       }
     }
-    const uint8_t profile_id = transfer::ProfileIdFromName(hand.profile.c_str());
+    const ControllerProfile classified = ClassifyProfile(hand.profile);
     // pose の locate。失敗・無効は未接続側に倒す（例外にしない）。
     auto locate = [&](XrSpace space, XrPosef* pose, bool* valid) {
       *valid = false;
@@ -471,23 +523,23 @@ InputSnapshot InputManager::Snapshot(XrSession session, XrSpace appSpace, XrTime
     hand.connected = hand.gripValid || hand.aimValid;
 
     hand.trigger = QueryFloat(session, trigger_, hand_paths_[i], &hand.triggerState, focused,
-                              SupportMask(profile_id, trigger_));
+                              SupportMask(classified, trigger_));
     hand.squeeze = QueryFloat(session, squeeze_, hand_paths_[i], &hand.squeezeState, focused,
-                              SupportMask(profile_id, squeeze_));
+                              SupportMask(classified, squeeze_));
     QueryVec2(session, thumbstick_, hand_paths_[i], hand.thumbstick, &hand.thumbstickState,
-              focused, SupportMask(profile_id, thumbstick_));
+              focused, SupportMask(classified, thumbstick_));
     QueryVec2(session, trackpad_, hand_paths_[i], hand.trackpad, &hand.trackpadState, focused,
-              SupportMask(profile_id, trackpad_));
+              SupportMask(classified, trackpad_));
     QueryBool(session, thumbstick_click_, hand_paths_[i], &hand.thumbstickClick, focused,
-              SupportMask(profile_id, thumbstick_click_));
+              SupportMask(classified, thumbstick_click_));
     QueryBool(session, trackpad_click_, hand_paths_[i], &hand.trackpadClick, focused,
-              SupportMask(profile_id, trackpad_click_));
+              SupportMask(classified, trackpad_click_));
     QueryBool(session, primary_, hand_paths_[i], &hand.primary, focused,
-              SupportMask(profile_id, primary_));
+              SupportMask(classified, primary_));
     QueryBool(session, secondary_, hand_paths_[i], &hand.secondary, focused,
-              SupportMask(profile_id, secondary_));
+              SupportMask(classified, secondary_));
     QueryBool(session, menu_, hand_paths_[i], &hand.menu, focused,
-              SupportMask(profile_id, menu_));
+              SupportMask(classified, menu_));
   }
   return snapshot;
 }
