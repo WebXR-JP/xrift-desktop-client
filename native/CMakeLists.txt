@@ -20,6 +20,7 @@ add_executable(xrift_native
   src/gfx/vulkan_context.cpp
   src/gfx/swapchains.cpp
   src/gfx/clear_pass.cpp
+  src/gfx/blit_pass.cpp
   src/gfx/hold_image.cpp
   src/ipc/pipe_client.cpp
   src/transfer/control_block_reader.cpp

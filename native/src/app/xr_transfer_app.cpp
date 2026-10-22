@@ -17,8 +17,9 @@
 
 #include "common/log.h"
 #include "common/xr_result.h"
-#include "gfx/swapchains.h"
+#include "gfx/blit_pass.h"
 #include "gfx/hold_image.h"
+#include "gfx/swapchains.h"
 #include "app/input_message.h"
 #include "ipc/control_blocks.h"
 #include "ipc/pipe_client.h"
@@ -71,16 +72,6 @@ uint64_t NowQpcUs() {
   return static_cast<uint64_t>(us);
 }
 
-void CheckVk(vk::Result result, const char* what) {
-  if (result == vk::Result::eSuccess) {
-    return;
-  }
-  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
-}
-
-bool IsMagenta(uint8_t b, uint8_t g, uint8_t r) { return r > 200 && b > 200 && g < 80; }
-bool IsCyan(uint8_t b, uint8_t g, uint8_t r) { return g > 200 && b > 200 && r < 80; }
-
 EyePose ToEyePose(const XrPosef& p) {
   EyePose e{};
   e.position[0] = p.position.x;
@@ -102,259 +93,22 @@ EyeFov ToEyeFov(const XrFovf& f) {
   return e;
 }
 
-// host-visible な 1 バッファの確保。制御ブロック readback（数 KB 以内）専用である。
-// 画像全体の staging には使わない。
-void AllocateHostBuffer(const gfx::VulkanContext& vk, vk::raii::Buffer* buf,
-                        vk::raii::DeviceMemory* mem, vk::DeviceSize size) {
-  const vk::raii::Device& device = vk.device();
-  vk::BufferCreateInfo buf_info{};
-  buf_info.sType = vk::StructureType::eBufferCreateInfo;
-  buf_info.size = size;
-  buf_info.usage = vk::BufferUsageFlagBits::eTransferDst;
-  buf_info.sharingMode = vk::SharingMode::eExclusive;
-  *buf = vk::raii::Buffer(device, buf_info);
-  const vk::MemoryRequirements req = buf->getMemoryRequirements();
-  const vk::PhysicalDeviceMemoryProperties props = vk.physicalDevice().getMemoryProperties();
-  int32_t index = -1;
-  for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-    const vk::MemoryPropertyFlags flags =
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-    if ((req.memoryTypeBits & (1u << i)) != 0u &&
-        (props.memoryTypes[i].propertyFlags & flags) == flags) {
-      index = static_cast<int32_t>(i);
-      break;
-    }
-  }
-  if (index < 0) {
-    throw std::runtime_error("制御ブロック用ステージングの host-visible メモリタイプが無い");
-  }
-  vk::MemoryAllocateInfo mem_info{};
-  mem_info.sType = vk::StructureType::eMemoryAllocateInfo;
-  mem_info.allocationSize = req.size;
-  mem_info.memoryTypeIndex = static_cast<uint32_t>(index);
-  *mem = vk::raii::DeviceMemory(device, mem_info);
-  buf->bindMemory(**mem, 0);
+// マーカー契約の組み立て。ipc/control_blocks.h の配置定数から作り、
+// gfx::BlitPass へ値で渡す（gfx 側に ipc を漏らさない）。
+gfx::MarkerLayout MakeMarkerLayout() {
+  gfx::MarkerLayout layout{};
+  layout.left.x = kMarkerLeftX;
+  layout.left.y = kMarkerY;
+  layout.left.size = kMarkerSize;
+  // 従来の判定（r>200 && b>200 && g<80）と同値の範囲にする。
+  layout.left.color = gfx::MarkerColor{201, 255, 0, 79, 201, 255};
+  layout.right.x = kMarkerRightDx;
+  layout.right.y = kMarkerY;
+  layout.right.size = kMarkerSize;
+  // 従来の判定（g>200 && b>200 && r<80）と同値の範囲にする。
+  layout.right.color = gfx::MarkerColor{0, 79, 201, 255, 201, 255};
+  return layout;
 }
-
-// 受理画像の提出パス。acquire → blit → マーカー確認 → release を 1 眼単位で行う。
-class BlitPass {
- public:
-  BlitPass(const gfx::VulkanContext& vk, const gfx::Swapchains& swapchains)
-      : device_(&vk.device()), queue_(&vk.queue()) {
-    vk::CommandPoolCreateInfo pool_info{};
-    pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
-    pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-    pool_info.queueFamilyIndex = vk.queueFamilyIndex();
-    pool_ = vk::raii::CommandPool(*device_, pool_info);
-    vk::CommandBufferAllocateInfo alloc{};
-    alloc.sType = vk::StructureType::eCommandBufferAllocateInfo;
-    alloc.commandPool = *pool_;
-    alloc.level = vk::CommandBufferLevel::ePrimary;
-    alloc.commandBufferCount = 2;
-    vk::raii::CommandBuffers bufs = device_->allocateCommandBuffers(alloc);
-    cmds_.push_back(std::move(bufs[0]));
-    cmds_.push_back(std::move(bufs[1]));
-    vk::FenceCreateInfo fence_info{};
-    fence_info.sType = vk::StructureType::eFenceCreateInfo;
-    fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
-    fence_ = vk::raii::Fence(*device_, fence_info);
-    AllocateHostBuffer(vk, &stage_, &stageMem_, kStageSize);
-    for (uint32_t e = 0; e < swapchains.eyeCount(); ++e) {
-      EyeRes res;
-      res.swapchain = swapchains.handle(e);
-      res.extent = swapchains.extent(e);
-      for (uint32_t i = 0; i < swapchains.imageCount(e); ++i) {
-        res.images.push_back(swapchains.image(e, i));
-      }
-      eyes_.push_back(std::move(res));
-    }
-  }
-
-  struct Result {
-    uint64_t blitUs = 0;
-    bool markerOk = false;  // 左眼=マゼンタ、右眼=シアンの確認結果。
-  };
-
-  // 受理画像の片半分を各眼へ blit する。srcHalf: 0=左半分、1=右半分。
-  // 色の扱い: 同一形式間の blit は複写・拡大であり、色空間の変換は行わない。
-  // swapchain が sRGB 形式の場合、二重符号化の疑いが残る（docs/architecture.md「既知の挙動」の未決事項。
-  // 左右分離と pose 対応を優先し、色の最終確認は持ち越す）。
-  // blit 後に提出画像からマーカー 1 画素だけを読む（画像全体は読まない）。
-  // 失敗時は例外にする（呼び出し側は layerCount=0 で終える）。
-  Result Blit(uint32_t eye, vk::Image own, uint32_t ownW, uint32_t ownH, uint32_t srcHalf) {
-    Result out{};
-    const uint64_t t0 = NowUs();
-    if (eye >= eyes_.size()) {
-      throw std::out_of_range("眼番号が範囲外です");
-    }
-    EyeRes& res = eyes_[eye];
-
-    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    uint32_t image_index = 0;
-    CheckXr(xrAcquireSwapchainImage(res.swapchain, &acquire, &image_index), "xrAcquireSwapchainImage");
-    XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait_info.timeout = XR_INFINITE_DURATION;
-    CheckXr(xrWaitSwapchainImage(res.swapchain, &wait_info), "xrWaitSwapchainImage");
-    if (image_index >= res.images.size()) {
-      throw std::runtime_error("swapchain 画像番号が範囲外です");
-    }
-    const vk::Image dst = res.images[image_index];
-
-    CheckVk(device_->waitForFences(*fence_, vk::True, UINT64_MAX), "vkWaitForFences(blit)");
-    device_->resetFences(*fence_);
-    vk::raii::CommandBuffer& cmd = cmds_[eye & 1u];
-    cmd.reset();
-    vk::CommandBufferBeginInfo begin{};
-    begin.sType = vk::StructureType::eCommandBufferBeginInfo;
-    begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-    cmd.begin(begin);
-
-    vk::ImageSubresourceRange range{};
-    range.aspectMask = vk::ImageAspectFlagBits::eColor;
-    range.levelCount = 1;
-    range.layerCount = 1;
-
-    vk::ImageMemoryBarrier src_to{};
-    src_to.sType = vk::StructureType::eImageMemoryBarrier;
-    src_to.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-    src_to.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-    src_to.oldLayout = vk::ImageLayout::eGeneral;
-    src_to.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-    src_to.image = own;
-    src_to.subresourceRange = range;
-    vk::ImageMemoryBarrier dst_to{};
-    dst_to.sType = vk::StructureType::eImageMemoryBarrier;
-    dst_to.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-    dst_to.oldLayout = vk::ImageLayout::eUndefined;
-    dst_to.newLayout = vk::ImageLayout::eTransferDstOptimal;
-    dst_to.image = dst;
-    dst_to.subresourceRange = range;
-    std::array<vk::ImageMemoryBarrier, 2> to_blit{src_to, dst_to};
-    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
-                        {}, nullptr, nullptr, to_blit);
-
-    // 半分の境界は「来た値を正」とする。自前イメージ実寸の半分であり、要求値は使わない。
-    // 奇数幅では左半分を floor に寄せる（右に 1 列余る。左右のずれは 1 画素以内）。
-    const uint32_t half = ownW / 2;
-    const uint32_t x0 = (srcHalf == 0) ? 0 : half;
-    const uint32_t x1 = (srcHalf == 0) ? half : ownW;
-    const uint32_t halfW = (x1 > x0) ? (x1 - x0) : 1;
-    vk::ImageBlit blit{};
-    blit.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-    blit.srcSubresource.layerCount = 1;
-    blit.srcOffsets[0] = vk::Offset3D{static_cast<int32_t>(x0), 0, 0};
-    blit.srcOffsets[1] = vk::Offset3D{static_cast<int32_t>(x1), static_cast<int32_t>(ownH), 1};
-    blit.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-    blit.dstSubresource.layerCount = 1;
-    blit.dstOffsets[0] = vk::Offset3D{0, 0, 0};
-    blit.dstOffsets[1] = vk::Offset3D{static_cast<int32_t>(res.extent.width),
-                                      static_cast<int32_t>(res.extent.height), 1};
-    // 線形フィルタで拡大する。縮小方向には使わない（renderScale ≤ 1 かつ swapchain は
-    // 推奨サイズのため、通常は拡大になる）。
-    cmd.blitImage(own, vk::ImageLayout::eTransferSrcOptimal, dst,
-                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
-
-    vk::ImageMemoryBarrier src_park = src_to;
-    src_park.srcAccessMask = vk::AccessFlagBits::eTransferRead;
-    src_park.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-    src_park.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
-    src_park.newLayout = vk::ImageLayout::eGeneral;
-    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                        vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, src_park);
-
-    // マーカー画素の dst 座標。半分内での相対位置を保って拡大する。
-    // 左眼マーカー中心の半分内相対 x は 176、右眼も右半分起点で 176 である。
-    const uint32_t mx = (srcHalf == 0) ? (kMarkerLeftX + kMarkerSize / 2)
-                                       : (kMarkerRightDx + kMarkerSize / 2);
-    const uint32_t my = kMarkerY + kMarkerSize / 2;
-    uint32_t sx = mx * res.extent.width / halfW;
-    uint32_t sy = my * res.extent.height / (ownH > 0 ? ownH : 1);
-    if (sx >= res.extent.width) {
-      sx = res.extent.width - 1;
-    }
-    if (sy >= res.extent.height) {
-      sy = res.extent.height - 1;
-    }
-    {
-      // 提出画像から 1 画素だけ読む。コンポジタ渡しのレイアウトに戻してから終える。
-      vk::ImageMemoryBarrier to_src = dst_to;
-      to_src.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-      to_src.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-      to_src.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-      to_src.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                          vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_src);
-      vk::BufferImageCopy region{};
-      region.bufferOffset = 0;
-      region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-      region.imageSubresource.layerCount = 1;
-      region.imageOffset = vk::Offset3D{static_cast<int32_t>(sx), static_cast<int32_t>(sy), 0};
-      region.imageExtent = vk::Extent3D{1, 1, 1};
-      cmd.copyImageToBuffer(dst, vk::ImageLayout::eTransferSrcOptimal, *stage_, region);
-      vk::BufferMemoryBarrier host{};
-      host.sType = vk::StructureType::eBufferMemoryBarrier;
-      host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-      host.dstAccessMask = vk::AccessFlagBits::eHostRead;
-      host.buffer = *stage_;
-      host.offset = 0;
-      host.size = kStageSize;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                          {}, nullptr, host, nullptr);
-      vk::ImageMemoryBarrier to_present = to_src;
-      to_present.srcAccessMask = vk::AccessFlagBits::eTransferRead;
-      to_present.dstAccessMask = {};
-      to_present.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
-      to_present.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                          vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr,
-                          to_present);
-    }
-
-    cmd.end();
-    vk::CommandBuffer raw = *cmd;
-    vk::SubmitInfo submit{};
-    submit.sType = vk::StructureType::eSubmitInfo;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &raw;
-    queue_->submit(submit, *fence_);
-    CheckVk(device_->waitForFences(*fence_, vk::True, 2000000000u), "vkWaitForFences(blit 完了)");
-
-    {
-      void* mapped = nullptr;
-      mapped = stageMem_.mapMemory(0, kStageSize);
-      const uint8_t* p = static_cast<const uint8_t*>(mapped);
-      // 左眼にマゼンタ、右眼にシアンが来ていること。逆なら失敗として数える。
-      out.markerOk = (eye == 0) ? IsMagenta(p[0], p[1], p[2]) : IsCyan(p[0], p[1], p[2]);
-      if (!out.markerOk) {
-        Warn("左右分離検証: 眼 %u のマーカー不一致 (B=%u G=%u R=%u)", eye, p[0], p[1], p[2]);
-      }
-      stageMem_.unmapMemory();
-    }
-
-    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    CheckXr(xrReleaseSwapchainImage(res.swapchain, &release), "xrReleaseSwapchainImage");
-    out.blitUs = NowUs() - t0;
-    return out;
-  }
-
- private:
-  struct EyeRes {
-    XrSwapchain swapchain = XR_NULL_HANDLE;
-    vk::Extent2D extent{0, 0};
-    std::vector<vk::Image> images;  // XR 所有の非所有ビュー。破棄しない。
-  };
-
-  static constexpr vk::DeviceSize kStageSize = 4;  // マーカー 1 画素。
-
-  const vk::raii::Device* device_;
-  const vk::raii::Queue* queue_;
-  vk::raii::CommandPool pool_{nullptr};
-  std::vector<vk::raii::CommandBuffer> cmds_;
-  vk::raii::Fence fence_{nullptr};
-  vk::raii::Buffer stage_{nullptr};
-  vk::raii::DeviceMemory stageMem_{nullptr};
-  std::vector<EyeRes> eyes_;
-};
 
 struct XrStats {
   uint64_t frames = 0;
@@ -534,7 +288,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 再生成のたびに connEpoch を進め、旧世代のレコードを失効させる（docs/architecture.md「借用の所有権と release 遅延」「space とセッション復帰」）。
   std::unique_ptr<xr::Session> session;
   std::unique_ptr<gfx::Swapchains> swapchains;
-  std::unique_ptr<BlitPass> blit;
+  std::unique_ptr<gfx::BlitPass> blit;
   xr::InputManager input;
   uint32_t conn_epoch = 1;
   RenderLedger ledger(conn_epoch, 1, options.recordTtlMs * 1000u);
@@ -578,7 +332,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   } else {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
-  blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
+  blit = std::make_unique<gfx::BlitPass>(transfer.Vulkan(), *swapchains, MakeMarkerLayout());
   ControlBlockReader reader(transfer.Vulkan());
   gfx::HoldImage hold(transfer.Vulkan());
   // 接続失敗は例外で返る。統計とメッセージを残してから投げ直す
@@ -733,7 +487,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
       swapchains = std::make_unique<gfx::Swapchains>(transfer.XrInstance().handle(),
                                                      session->handle(), session->views(),
                                                      gfx::XrPreferredSwapchainFormats());
-      blit = std::make_unique<BlitPass>(transfer.Vulkan(), *swapchains);
+      blit = std::make_unique<gfx::BlitPass>(transfer.Vulkan(), *swapchains, MakeMarkerLayout());
     } catch (const std::exception& e) {
       Warn("再生成後の swapchain 生成に失敗（%s）: %s", why, e.what());
       session.reset();
@@ -1218,8 +972,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
     // 失敗時は例外にする（呼び出し側は空フレームで終える）。
     auto submit_image = [&](vk::Image src, uint32_t srcW, uint32_t srcH,
                             const RenderRecord& rec) {
-      const BlitPass::Result r0 = blit->Blit(0, src, srcW, srcH, 0);
-      const BlitPass::Result r1 = blit->Blit(1, src, srcW, srcH, 1);
+      const gfx::BlitPass::Result r0 = blit->Blit(0, src, srcW, srcH, 0);
+      const gfx::BlitPass::Result r1 = blit->Blit(1, src, srcW, srcH, 1);
       const uint64_t blit_us = r0.blitUs + r1.blitUs;
       ++stats.blits;
       stats.blitUsTotal += blit_us;
