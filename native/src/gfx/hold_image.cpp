@@ -8,17 +8,6 @@
 #include "gfx/vulkan_context.h"
 
 namespace xrift::gfx {
-namespace {
-
-// vk::Result を返す呼び出しの検査。成功以外は vk::to_string 付きの例外にする。
-void CheckVk(vk::Result result, const char* what) {
-  if (result == vk::Result::eSuccess) {
-    return;
-  }
-  throw std::runtime_error(std::string(what) + " に失敗 (VkResult=" + vk::to_string(result) + ")");
-}
-
-}  // namespace
 
 // 最後に受理したアトラスの exe 所有の複製を保つ層（gpu 側の保持専用）。
 // 新規受理が無いフレームでも同じ画像を出し直すため（黒フレーム防止）。

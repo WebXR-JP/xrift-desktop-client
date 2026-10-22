@@ -1,8 +1,7 @@
 /**
  * 制御ブロックのコーデック。
  *
- * 正典は C++ 側（`native/src/transfer/render_record.h` の量子化・`PoseTag`、
- * `native/src/ipc/control_blocks.h` のブロック符号化）であり、このモジュールは
+ * 正典は C++ 側（`native/src/ipc/control_blocks.h` の量子化・`PoseTag`・ブロック符号化）であり、このモジュールは
  * その写しである。計算結果を変えたら exe が受理しないため、式を変えるときは
  * C++・ここ・`./shim.ts` 内の同等品を同時に更新し、
  * `tools/test/client/control-codec.test.cjs` のベクトルで一致を確認する。
@@ -16,7 +15,7 @@ export const CONTROL_BLOCK_PIXELS = 32;
 export const CONTROL_BLOCK_CELL = 4;
 /** ブロック A（renderId 下位 16bit）の左上 x（アトラス座標）。 */
 export const CONTROL_BLOCK_ORG_AX = 64;
-/** ブロック B（pose タグ 16bit）の左上 x（アトラス座標）。64 ではなく 128（`xr_transfer_app.cpp` の `kBlockOrgBX`）。 */
+/** ブロック B（pose タグ 16bit）の左上 x（アトラス座標）。64 ではなく 128（`native/src/ipc/control_blocks.h` の `kControlBlockOrgBX`）。 */
 export const CONTROL_BLOCK_ORG_BX = 128;
 /** 両ブロックの左上 y（アトラス座標）。 */
 export const CONTROL_BLOCK_ORG_Y = 64;

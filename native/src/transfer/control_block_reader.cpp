@@ -1,12 +1,10 @@
 #include "transfer/control_block_reader.h"
 
-#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-#include "common/xr_result.h"
 #include "gfx/vulkan_context.h"
 #include "ipc/control_blocks.h"
 

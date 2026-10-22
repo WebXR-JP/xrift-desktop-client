@@ -3,7 +3,6 @@
 #include <vector>
 
 #include "common/log.h"
-#include "common/xr_result.h"
 #include "gfx/swapchains.h"
 #include "gfx/vulkan_context.h"
 #include "xr/instance.h"

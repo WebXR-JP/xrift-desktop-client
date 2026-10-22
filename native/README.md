@@ -57,11 +57,11 @@ native/build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名
 | パス | 責務 |
 |---|---|
 | `src/main.cpp` | CLI（`--probe`・`--xr-transfer`・`--selftest`・`--help`）と起動 |
-| `src/app/` | 実行モードの組み立て（clear_demo_app / xr_transfer_app）・入力メッセージ変換（`input_message.h`） |
-| `src/xr/` | ライフサイクル・セッション・入力アクション |
-| `src/gfx/` | Vulkan 生成・swapchain・クリア描画 |
-| `src/ipc/` | 256B wire 契約（`protocol.h`）・制御ブロック配置（`control_blocks.h`）・名前付きパイプ（`pipe_client`） |
-| `src/transfer/` | GPU import（`TransferSession`）・受理台帳（`render_record.h`） |
+| `src/app/` | 実行モード（clear_demo_app / xr_transfer_app）・`probe`・入力メッセージ変換（`input_message.h`）・計測（`xr_transfer_metrics`） |
+| `src/xr/` | instance・session・input |
+| `src/gfx/` | Vulkan context・swapchain・clear pass・blit pass・hold image |
+| `src/ipc/` | 256B wire 契約（`protocol.h`）・制御ブロック配置・PoseTag（`control_blocks.h`）・名前付きパイプ（`pipe_client`） |
+| `src/transfer/` | GPU import（`TransferSession`）・受理台帳（`render_record.h`）・制御ブロック readback（`control_block_reader`） |
 | `src/common/` | ログ・`XrResult` 文字列化 |
 | `transfer-addon/` | NT ハンドル複製の N-API アドオン（cmake-js。本体 CMake とは分離） |
 | `cmake/Dependencies.cmake` | FetchContent の取得定義 |
