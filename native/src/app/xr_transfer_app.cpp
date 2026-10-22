@@ -30,18 +30,6 @@
 namespace xrift::transfer {
 namespace {
 
-// 制御ブロック画像配置（tools/pages/xr-smoke.html の刻みと一致させること）。
-// アトラスは左右横並び（左半分=左眼、右半分=右眼）。来た値を正とするため、
-// 半分の境界は自前イメージの実寸 (ownW/2) で決める。奇数幅では左を floor に寄せる。
-constexpr uint32_t kBlockCell = 4;      // 1 セルの一辺。
-constexpr uint32_t kBlockOrgAX = 64;    // ブロック A（renderId 下位 16bit）の左上 x。
-constexpr uint32_t kBlockOrgBX = 128;   // ブロック B（pose タグ 16bit）の左上 x。
-constexpr uint32_t kBlockOrgY = 64;     // 両ブロックの左上 y。
-constexpr uint32_t kBlockSize = 32;     // ブロックの一辺。
-constexpr uint32_t kMarkerSize = 32;    // 眼マーカーの一辺。
-constexpr uint32_t kMarkerLeftX = 160;  // 左マーカー（マゼンタ）の左上 x（アトラス座標）。
-constexpr uint32_t kMarkerRightDx = 160;  // 右マーカー（シアン）の左上 x（右半分起点から）。
-constexpr uint32_t kMarkerY = 8;          // 両マーカーの左上 y（予約ブロックと重ねない）。
 // Offer 受信ポーリングの待ち上限（1ms は意図的な値であり、仮置きではない）。
 // XR ループを止めないよう 1 フレームの待ちが 1ms 程度に収まることを保証する。
 // ReceiveWithDeadline の期限切れは「その回の受信を打ち切る」意味であり、
@@ -195,15 +183,15 @@ class ControlBlockReader {
     to_src.subresourceRange = range;
     cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                          vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_src);
-    const uint32_t org_x[2] = {kBlockOrgAX, kBlockOrgBX};
+    const uint32_t org_x[2] = {kControlBlockOrgAX, kControlBlockOrgBX};
     for (int i = 0; i < 2; ++i) {
       vk::BufferImageCopy region{};
-      region.bufferOffset = static_cast<vk::DeviceSize>(i * kBlockBytes);
+      region.bufferOffset = static_cast<vk::DeviceSize>(i * kControlBlockBytes);
       region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
       region.imageSubresource.layerCount = 1;
       region.imageOffset = vk::Offset3D{static_cast<int32_t>(org_x[i]),
-                                       static_cast<int32_t>(kBlockOrgY), 0};
-      region.imageExtent = vk::Extent3D{kBlockSize, kBlockSize, 1};
+                                       static_cast<int32_t>(kControlBlockOrgY), 0};
+      region.imageExtent = vk::Extent3D{kControlBlockPixels, kControlBlockPixels, 1};
       cmd_.copyImageToBuffer(own, vk::ImageLayout::eTransferSrcOptimal, *stage_, region);
     }
     vk::BufferMemoryBarrier host{};
@@ -236,13 +224,12 @@ class ControlBlockReader {
     mapped = stageMem_.mapMemory(0, kStageSize);
     const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
     *renderId16 = DecodeBlock16(bytes);
-    *poseTag = DecodeBlock16(bytes + kBlockBytes);
+    *poseTag = DecodeBlock16(bytes + kControlBlockBytes);
     stageMem_.unmapMemory();
   }
 
  private:
-  static constexpr size_t kBlockBytes = kControlBlockPixels * kControlBlockPixels * 4;
-  static constexpr size_t kStageSize = 2 * kBlockBytes;
+  static constexpr size_t kStageSize = 2 * kControlBlockBytes;
 
 
   const vk::raii::Device* device_;

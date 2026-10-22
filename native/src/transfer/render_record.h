@@ -1,11 +1,10 @@
 #pragma once
 
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <deque>
 
-#include "ipc/protocol.h"
+#include "ipc/control_blocks.h"
 
 // 描画レコード（exe が発行・保持する変更不能な要求台帳）。
 // xrLocateViews の左右 pose/FOV・予測時刻・世代を renderId と結び付けて保持し、
@@ -22,64 +21,6 @@ constexpr uint64_t kRenderRecordMaxAgeUs = 500000u;
 // 保持レコード数の上限。超えた古い分は失効扱いで捨てる（VRAM ではなく台帳の上限）。
 // 90Hz・2s で 180 件のため余裕を見た 256 である（既定 500ms では 45 件）。
 constexpr size_t kRenderRecordCapacity = 256;
-
-// 位置の量子化範囲。LOCAL 空間の頭部移動（±4m）を 8bit に写像する。
-// 範囲外は端に寄せる（破棄しない。照合は両側が同じ関数を通るため一致する）。
-constexpr float kPosQuantMin = -4.0f;
-constexpr float kPosQuantMax = 4.0f;
-// 姿勢の量子化範囲。正規化クォータニオン成分（±1）を 8bit に写像する。
-constexpr float kOriQuantMin = -1.0f;
-constexpr float kOriQuantMax = 1.0f;
-
-// 0〜255 に丸める。JS 側（control-codec.ts・shim.ts）と同じ式を
-// 倍精度で計算することが一致の条件である。単精度で計算すると .5 境界で 1 ずれる
-// 値があり、静止 pose のシミュレータでは毎フレーム不一致になり受理 0 になる
-// （実測: wantTag と復号 tag が割れ、倍精度の再計算 wantDbl と復号 tag が一致）。
-// 入力は float32 由来の正確な double のため、有限値では JS と bit 一致する。
-inline uint8_t QuantizeByte(float v, float lo, float hi) {
-  const double t = (static_cast<double>(v) - static_cast<double>(lo)) /
-                   (static_cast<double>(hi) - static_cast<double>(lo)) * 255.0;
-  if (!(t >= 0.0)) {
-    return 0;
-  }
-  if (!(t <= 255.0)) {
-    return 255;
-  }
-  return static_cast<uint8_t>(std::floor(t + 0.5));
-}
-
-inline uint8_t QuantizePos(float v) { return QuantizeByte(v, kPosQuantMin, kPosQuantMax); }
-inline uint8_t QuantizeOri(float v) { return QuantizeByte(v, kOriQuantMin, kOriQuantMax); }
-
-// pose 要約タグ。量子化した pose + 世代 + renderId 全体を FNV-1a で畳み、下位 16bit を取る。
-// 画像のブロック B（32x32・16 セル）に載る値であり、JS 側も同じバイト列で計算する。
-// バイト列（計 30B）: renderId LE 8B, connEpoch LE 4B, spaceEpoch LE 4B,
-// 左 pos 3B, 左 ori 4B, 右 pos 3B, 右 ori 4B。
-inline uint16_t PoseTag(uint64_t renderId, uint32_t connEpoch, uint32_t spaceEpoch,
-                        const EyePose& left, const EyePose& right) {
-  uint8_t bytes[30];
-  for (int i = 0; i < 8; ++i) {
-    bytes[i] = static_cast<uint8_t>((renderId >> (i * 8)) & 0xFFu);
-  }
-  for (int i = 0; i < 4; ++i) {
-    bytes[8 + i] = static_cast<uint8_t>((connEpoch >> (i * 8)) & 0xFFu);
-    bytes[12 + i] = static_cast<uint8_t>((spaceEpoch >> (i * 8)) & 0xFFu);
-  }
-  for (int i = 0; i < 3; ++i) {
-    bytes[16 + i] = QuantizePos(left.position[i]);
-    bytes[23 + i] = QuantizePos(right.position[i]);
-  }
-  for (int i = 0; i < 4; ++i) {
-    bytes[19 + i] = QuantizeOri(left.orientation[i]);
-    bytes[26 + i] = QuantizeOri(right.orientation[i]);
-  }
-  uint32_t hash = 2166136261u;
-  for (uint8_t b : bytes) {
-    hash ^= b;
-    hash *= 16777619u;
-  }
-  return static_cast<uint16_t>(hash & 0xFFFFu);
-}
 
 // 棄却理由。統計の内訳用であり、線路上には出さない。
 enum class RejectReason : uint8_t {
