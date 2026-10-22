@@ -17,22 +17,22 @@
 // 短い押下を取りこぼさないための計測用であり、旧復号器は予約域を読まないため
 // 読み飛ばす（版は上げない）。製品経路の buttons 欄の配置は変えない。
 
-namespace xrift::transfer {
+namespace xrift::app {
 
-inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, uint32_t connEpoch,
+inline ipc::TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, uint32_t connEpoch,
                                              uint32_t spaceEpoch, uint8_t latch0 = 0,
                                              uint8_t latch1 = 0) {
-  TransferMessage m{};
-  m.magic = kMagic;
-  m.version = kVersion;
-  m.type = kTypeInputState;
+  ipc::TransferMessage m{};
+  m.magic = ipc::kMagic;
+  m.version = ipc::kVersion;
+  m.type = ipc::kTypeInputState;
   m.renderId = snapshot.frameNo;
   m.connEpoch = connEpoch;
   m.spaceEpoch = spaceEpoch;
   uint8_t* base = reinterpret_cast<uint8_t*>(&m);
   for (int i = 0; i < 2; ++i) {
     const xr::HandInput& hand = snapshot.hands[i];
-    uint8_t* h = base + kInputHand0 + static_cast<size_t>(i) * kInputHandStride;
+    uint8_t* h = base + ipc::kInputHand0 + static_cast<size_t>(i) * ipc::kInputHandStride;
     uint8_t flags = 0;
     if (hand.connected) {
       flags |= 1u << 0;
@@ -43,18 +43,18 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
     if (hand.aimValid) {
       flags |= 1u << 2;
     }
-    h[kInputHandFlags] = flags;
-    h[kInputHandProfile] = ProfileIdFromName(hand.profile.c_str());
+    h[ipc::kInputHandFlags] = flags;
+    h[ipc::kInputHandProfile] = ipc::ProfileIdFromName(hand.profile.c_str());
     const auto active_value = [](xr::FieldState s) { return s == xr::FieldState::Active ? 1 : 0; };
     const auto supported_value = [](xr::FieldState s) {
       return s == xr::FieldState::Unsupported ? 0 : 1;
     };
-    h[kInputHandTrigger] = QuantizeUnitFloat(hand.trigger);
-    h[kInputHandSqueeze] = QuantizeUnitFloat(hand.squeeze);
-    h[kInputHandStickX] = QuantizeStick(hand.thumbstick[0]);
-    h[kInputHandStickY] = QuantizeStick(hand.thumbstick[1]);
-    h[kInputHandPadX] = QuantizeStick(hand.trackpad[0]);
-    h[kInputHandPadY] = QuantizeStick(hand.trackpad[1]);
+    h[ipc::kInputHandTrigger] = ipc::QuantizeUnitFloat(hand.trigger);
+    h[ipc::kInputHandSqueeze] = ipc::QuantizeUnitFloat(hand.squeeze);
+    h[ipc::kInputHandStickX] = ipc::QuantizeStick(hand.thumbstick[0]);
+    h[ipc::kInputHandStickY] = ipc::QuantizeStick(hand.thumbstick[1]);
+    h[ipc::kInputHandPadX] = ipc::QuantizeStick(hand.trackpad[0]);
+    h[ipc::kInputHandPadY] = ipc::QuantizeStick(hand.trackpad[1]);
     uint8_t buttons = 0;
     uint8_t btn_active = 0;
     uint8_t btn_supported = 0;
@@ -71,23 +71,23 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
         btn_supported |= static_cast<uint8_t>(1u << b);
       }
     }
-    h[kInputHandButtons] = buttons;
-    h[kInputHandBtnActive] = btn_active;
-    h[kInputHandFloatActive] = static_cast<uint8_t>((active_value(hand.triggerState) << 0) |
+    h[ipc::kInputHandButtons] = buttons;
+    h[ipc::kInputHandBtnActive] = btn_active;
+    h[ipc::kInputHandFloatActive] = static_cast<uint8_t>((active_value(hand.triggerState) << 0) |
                                                     (active_value(hand.squeezeState) << 1));
-    h[kInputHandVecActive] = static_cast<uint8_t>((active_value(hand.thumbstickState) << 0) |
+    h[ipc::kInputHandVecActive] = static_cast<uint8_t>((active_value(hand.thumbstickState) << 0) |
                                                    (active_value(hand.trackpadState) << 1));
-    h[kInputHandBtnSupported] = btn_supported;
-    h[kInputHandAnalogSupported] =
+    h[ipc::kInputHandBtnSupported] = btn_supported;
+    h[ipc::kInputHandAnalogSupported] =
         static_cast<uint8_t>((supported_value(hand.triggerState) << 0) |
                              (supported_value(hand.squeezeState) << 1) |
                              (supported_value(hand.thumbstickState) << 2) |
                              (supported_value(hand.trackpadState) << 3));
     // コントローラ pose。XrPosef（position xyz＋orientation xyzw）をそのまま載せる。
     // 有効性は上の flags が表す。無効時の値は 0 のままにし、受信側は読まない。
-    const size_t grip_off = (i == 0) ? kInputGripLeft : kInputGripRight;
-    const size_t aim_off = (i == 0) ? kInputAimLeft : kInputAimRight;
-    ControllerPose grip{};
+    const size_t grip_off = (i == 0) ? ipc::kInputGripLeft : ipc::kInputGripRight;
+    const size_t aim_off = (i == 0) ? ipc::kInputAimLeft : ipc::kInputAimRight;
+    ipc::ControllerPose grip{};
     grip.position[0] = hand.grip.position.x;
     grip.position[1] = hand.grip.position.y;
     grip.position[2] = hand.grip.position.z;
@@ -95,7 +95,7 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
     grip.orientation[1] = hand.grip.orientation.y;
     grip.orientation[2] = hand.grip.orientation.z;
     grip.orientation[3] = hand.grip.orientation.w;
-    ControllerPose aim{};
+    ipc::ControllerPose aim{};
     aim.position[0] = hand.aim.position.x;
     aim.position[1] = hand.aim.position.y;
     aim.position[2] = hand.aim.position.z;
@@ -104,10 +104,10 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
     aim.orientation[2] = hand.aim.orientation.z;
     aim.orientation[3] = hand.aim.orientation.w;
     if (hand.gripValid) {
-      WriteInputPose(&m, grip_off, grip);
+      ipc::WriteInputPose(&m, grip_off, grip);
     }
     if (hand.aimValid) {
-      WriteInputPose(&m, aim_off, aim);
+      ipc::WriteInputPose(&m, aim_off, aim);
     }
   }
   // 押下ラッチ（計測用）。buttons 欄と同じ bit 割付けであり、旧復号器は読まない。
@@ -116,4 +116,4 @@ inline TransferMessage MakeInputStateMessage(const xr::InputSnapshot& snapshot, 
   return m;
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app

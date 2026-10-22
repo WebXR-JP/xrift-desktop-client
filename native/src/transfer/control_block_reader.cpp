@@ -100,15 +100,15 @@ void ControlBlockReader::Decode(vk::Image own, uint16_t* renderId16, uint16_t* p
   to_src.subresourceRange = range;
   cmd_.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                        vk::PipelineStageFlagBits::eTransfer, {}, nullptr, nullptr, to_src);
-  const uint32_t org_x[2] = {kControlBlockOrgAX, kControlBlockOrgBX};
+  const uint32_t org_x[2] = {ipc::kControlBlockOrgAX, ipc::kControlBlockOrgBX};
   for (int i = 0; i < 2; ++i) {
     vk::BufferImageCopy region{};
-    region.bufferOffset = static_cast<vk::DeviceSize>(i * kControlBlockBytes);
+    region.bufferOffset = static_cast<vk::DeviceSize>(i * ipc::kControlBlockBytes);
     region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
     region.imageSubresource.layerCount = 1;
     region.imageOffset = vk::Offset3D{static_cast<int32_t>(org_x[i]),
-                                     static_cast<int32_t>(kControlBlockOrgY), 0};
-    region.imageExtent = vk::Extent3D{kControlBlockPixels, kControlBlockPixels, 1};
+                                     static_cast<int32_t>(ipc::kControlBlockOrgY), 0};
+    region.imageExtent = vk::Extent3D{ipc::kControlBlockPixels, ipc::kControlBlockPixels, 1};
     cmd_.copyImageToBuffer(own, vk::ImageLayout::eTransferSrcOptimal, *stage_, region);
   }
   vk::BufferMemoryBarrier host{};
@@ -140,8 +140,8 @@ void ControlBlockReader::Decode(vk::Image own, uint16_t* renderId16, uint16_t* p
   void* mapped = nullptr;
   mapped = stageMem_.mapMemory(0, kStageSize);
   const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
-  *renderId16 = DecodeBlock16(bytes);
-  *poseTag = DecodeBlock16(bytes + kControlBlockBytes);
+  *renderId16 = ipc::DecodeBlock16(bytes);
+  *poseTag = ipc::DecodeBlock16(bytes + ipc::kControlBlockBytes);
   stageMem_.unmapMemory();
 }
 

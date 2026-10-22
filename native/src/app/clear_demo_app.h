@@ -14,7 +14,7 @@
 // フレームループと --probe を束ねる。各初期化の糊付けだけを行い、
 // 描画や状態遷移の実体は gfx/xr 側のクラスに置く。
 
-namespace xrift {
+namespace xrift::app {
 
 class XrApp {
  public:
@@ -48,4 +48,4 @@ class XrApp {
   bool quit_ = false;
 };
 
-}  // namespace xrift
+}  // namespace xrift::app

@@ -11,7 +11,7 @@
 #include <string>
 #include <thread>
 
-namespace xrift::transfer {
+namespace xrift::ipc {
 namespace {
 
 // 最後の Win32 エラーを添えた例外を作る。呼び出し側が切断と異常を区別できる
@@ -336,13 +336,13 @@ bool PipeClient::ReceiveWithDeadline(TransferMessage* out, uint64_t deadlineUs, 
   return true;
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::ipc
 
 #else
 
 #include <stdexcept>
 
-namespace xrift::transfer {
+namespace xrift::ipc {
 
 PipeClient::PipeClient(const std::string&) {
   throw std::runtime_error("名前付きパイプ転送は Windows のみ（Linux は将来対応）");
@@ -358,6 +358,6 @@ bool PipeClient::ReceiveWithDeadline(TransferMessage*, uint64_t, bool*) {
   throw std::runtime_error("名前付きパイプ転送は Windows のみ（Linux は将来対応）");
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::ipc
 
 #endif

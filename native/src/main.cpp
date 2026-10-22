@@ -45,13 +45,13 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc >= 2 && std::strcmp(argv[1], "--probe") == 0) {
-    return xrift::Probe();
+    return xrift::app::Probe();
   }
   if (argc >= 2 && std::strcmp(argv[1], "--selftest") == 0) {
     return xrift::transfer::RunTransferSelfTest();
   }
   if (argc >= 2 && std::strcmp(argv[1], "--xr-transfer") == 0) {
-    xrift::transfer::XrTransferOptions opts{};
+    xrift::app::XrTransferOptions opts{};
     for (int i = 2; i < argc; ++i) {
       if (StartsWith(argv[i], "--pipe=")) {
         opts.pipeName = argv[i] + std::strlen("--pipe=");
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     // （統計出力と明示 teardown の後に残りの RAII 破棄を飛ばす）。
     int code = 0;
     try {
-      code = xrift::transfer::RunXrTransfer(opts);
+      code = xrift::app::RunXrTransfer(opts);
     } catch (const std::exception& e) {
       xrift::Error("XR転送の異常終了: %s", e.what());
       code = 1;
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   try {
-    xrift::XrApp app;
+    xrift::app::XrApp app;
     return app.Run();
   } catch (const std::exception& e) {
     xrift::Error("%s", e.what());

@@ -7,7 +7,7 @@
 #include "gfx/vulkan_context.h"
 #include "xr/instance.h"
 
-namespace xrift {
+namespace xrift::app {
 
 int Probe() {
   try {
@@ -51,4 +51,4 @@ int Probe() {
   }
 }
 
-}  // namespace xrift
+}  // namespace xrift::app

@@ -8,7 +8,7 @@
 // 転送ループの計測集約。提出・ACK・画像選択には触らず観測だけ行う。
 // xr_transfer_app.cpp から抽出した製品経路固有の定義であり、文面・集計式は変えない。
 
-namespace xrift::transfer {
+namespace xrift::app {
 
 struct XrStats {
   uint64_t frames = 0;
@@ -35,7 +35,7 @@ struct XrStats {
   uint64_t restartAttempts = 0;  // セッション再生成の試行回数。
   uint32_t connEpoch = 1;       // 現在の接続世代。
 
-  void Print(const RenderLedger::Stats& ledger, const xr::InputStats& input) const;
+  void Print(const transfer::RenderLedger::Stats& ledger, const xr::InputStats& input) const;
 };
 
 // 要求→初回提出（A）・paint→初回提出（B）の計測用。
@@ -78,4 +78,4 @@ double UsToMs(uint64_t us);
 // B の内訳平均は B 標本があるときだけ意味を持ち、無いときは 0.0 を出す。
 void PrintLatencyLine(const char* prefix, const LatencyAgg& agg);
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app

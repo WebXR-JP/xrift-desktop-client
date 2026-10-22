@@ -14,7 +14,7 @@
 // 同じオフセットで Buffer を読み書きする。
 // レイアウトを変えたら両側と static_assert を同時に更新する。
 
-namespace xrift::transfer {
+namespace xrift::ipc {
 
 // "XRFT" をリトルエンディアン u32 で読んだ値。
 constexpr uint32_t kMagic = 0x54465258u;
@@ -406,4 +406,4 @@ static_assert(kInputAimRight == kInputGripRight + kInputPoseSize,
 static_assert(kInputAimRight + kInputPoseSize == 216, "pose 領域の末尾は 216 であること");
 static_assert(kInputAimRight + kInputPoseSize <= kMessageSize, "pose 領域はメッセージに収まること");
 
-}  // namespace xrift::transfer
+}  // namespace xrift::ipc

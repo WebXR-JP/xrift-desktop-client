@@ -25,8 +25,8 @@ void Check(bool cond, const char* name) {
   }
 }
 
-EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float ow) {
-  EyePose p{};
+ipc::EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float ow) {
+  ipc::EyePose p{};
   p.position[0] = px;
   p.position[1] = py;
   p.position[2] = pz;
@@ -41,54 +41,54 @@ EyePose Pose(float px, float py, float pz, float ox, float oy, float oz, float o
 
 int RunTransferSelfTest() {
   // 1. 配置の実行時確認（static_assert の相手側。JS との一致は tools/test/client/protocol.test.cjs で行う）。
-  Check(sizeof(TransferMessage) == 256, "メッセージ 256B");
-  Check(offsetof(TransferMessage, renderId) == 40, "renderId オフセット 40");
-  Check(offsetof(TransferMessage, spaceEpoch) == 52, "spaceEpoch オフセット 52");
-  Check(offsetof(TransferMessage, leftPos) == 56, "leftPos オフセット 56");
-  Check(offsetof(TransferMessage, leftFov) == 112, "leftFov オフセット 112");
-  Check(offsetof(TransferMessage, rightFov) == 128, "rightFov オフセット 128");
-  Check(offsetof(TransferMessage, reqWidth) == 144, "reqWidth オフセット 144");
+  Check(sizeof(ipc::TransferMessage) == 256, "メッセージ 256B");
+  Check(offsetof(ipc::TransferMessage, renderId) == 40, "renderId オフセット 40");
+  Check(offsetof(ipc::TransferMessage, spaceEpoch) == 52, "spaceEpoch オフセット 52");
+  Check(offsetof(ipc::TransferMessage, leftPos) == 56, "leftPos オフセット 56");
+  Check(offsetof(ipc::TransferMessage, leftFov) == 112, "leftFov オフセット 112");
+  Check(offsetof(ipc::TransferMessage, rightFov) == 128, "rightFov オフセット 128");
+  Check(offsetof(ipc::TransferMessage, reqWidth) == 144, "reqWidth オフセット 144");
 
   // 2. RenderRequest の往復。
-  const EyePose left = Pose(0.1f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-  const EyePose right = Pose(0.164f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-  const EyeFov lf{0.7f, 0.7f, 0.7f, 0.7f};
-  const EyeFov rf{0.7f, 0.7f, 0.7f, 0.7f};
-  const TransferMessage req = MakeRenderRequest(42, 1, 7, left, right, lf, rf, 2048, 1024);
-  Check(IsValidRenderRequest(req), "RenderRequest 有効");
+  const ipc::EyePose left = Pose(0.1f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+  const ipc::EyePose right = Pose(0.164f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+  const ipc::EyeFov lf{0.7f, 0.7f, 0.7f, 0.7f};
+  const ipc::EyeFov rf{0.7f, 0.7f, 0.7f, 0.7f};
+  const ipc::TransferMessage req = ipc::MakeRenderRequest(42, 1, 7, left, right, lf, rf, 2048, 1024);
+  Check(ipc::IsValidRenderRequest(req), "RenderRequest 有効");
   Check(req.leftPos[0] == 0.1f && req.rightPos[0] == 0.164f, "pose 値の保持");
   Check(req.leftFov[0] == 0.7f && req.spaceEpoch == 7, "fov/世代の保持");
-  TransferMessage bad = req;
+  ipc::TransferMessage bad = req;
   bad.renderId = 0;
-  Check(!IsValidRenderRequest(bad), "renderId 0 の要求は無効");
+  Check(!ipc::IsValidRenderRequest(bad), "renderId 0 の要求は無効");
 
   // 3. 量子化の両端と範囲外の寄せ。
-  Check(QuantizePos(-4.0f) == 0 && QuantizePos(4.0f) == 255, "pos 量子化の両端");
-  Check(QuantizePos(-99.0f) == 0 && QuantizePos(99.0f) == 255, "pos 範囲外は端に寄せる");
-  Check(QuantizeOri(-1.0f) == 0 && QuantizeOri(1.0f) == 255, "ori 量子化の両端");
+  Check(ipc::QuantizePos(-4.0f) == 0 && ipc::QuantizePos(4.0f) == 255, "pos 量子化の両端");
+  Check(ipc::QuantizePos(-99.0f) == 0 && ipc::QuantizePos(99.0f) == 255, "pos 範囲外は端に寄せる");
+  Check(ipc::QuantizeOri(-1.0f) == 0 && ipc::QuantizeOri(1.0f) == 255, "ori 量子化の両端");
 
   // 4. pose タグの決定性と感度。値は JS 側（control-codec.test.cjs）と共有する。
   // 変更時は JS 側の期待値も同時に更新する。
-  const uint16_t tagA = PoseTag(42, 1, 7, left, right);
-  const uint16_t tagA2 = PoseTag(42, 1, 7, left, right);
+  const uint16_t tagA = ipc::PoseTag(42, 1, 7, left, right);
+  const uint16_t tagA2 = ipc::PoseTag(42, 1, 7, left, right);
   Check(tagA == tagA2, "pose タグの決定性");
   std::printf("[transfer-selftest] tag vectors: id=42 tag=0x%04x\n", tagA);
-  const EyePose leftMoved = Pose(0.2f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-  Check(PoseTag(42, 1, 7, leftMoved, right) != tagA, "pose 変化でタグが変わる");
-  Check(PoseTag(43, 1, 7, left, right) != tagA, "ID 変化でタグが変わる");
-  Check(PoseTag(42, 1, 8, left, right) != tagA, "space 世代変化でタグが変わる");
-  const uint16_t tagB = PoseTag(0x123456789ABCDEF0ull, 3, 11, leftMoved, left);
+  const ipc::EyePose leftMoved = Pose(0.2f, 1.6f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+  Check(ipc::PoseTag(42, 1, 7, leftMoved, right) != tagA, "pose 変化でタグが変わる");
+  Check(ipc::PoseTag(43, 1, 7, left, right) != tagA, "ID 変化でタグが変わる");
+  Check(ipc::PoseTag(42, 1, 8, left, right) != tagA, "space 世代変化でタグが変わる");
+  const uint16_t tagB = ipc::PoseTag(0x123456789ABCDEF0ull, 3, 11, leftMoved, left);
   std::printf("[transfer-selftest] tag vectors: id=0x123456789ABCDEF0 tag=0x%04x\n", tagB);
 
   // 4b. 制御ブロックの画素往復（control_blocks.h。GPU コピー経路の CPU 側再現）。
   // JS 側（control-codec.test.cjs）の符号化とセル配置が一致することの相手側である。
   {
-    uint8_t pixels[kControlBlockBytes];
+    uint8_t pixels[ipc::kControlBlockBytes];
     const uint16_t samples[5] = {0, 1, tagA, tagB, 0xFFFF};
     bool roundtrip_ok = true;
     for (uint16_t s : samples) {
-      EncodeBlock16(pixels, s);
-      if (DecodeBlock16(pixels) != s) {
+      ipc::EncodeBlock16(pixels, s);
+      if (ipc::DecodeBlock16(pixels) != s) {
         roundtrip_ok = false;
       }
     }
@@ -101,7 +101,7 @@ int RunTransferSelfTest() {
   const RenderRecord& rec =
       ledger.Issue(42, left, right, lf, rf, 2048, 1024, t0);
   const uint16_t id16 = static_cast<uint16_t>(rec.renderId & 0xFFFFu);
-  const uint16_t tag = PoseTag(rec.renderId, rec.connEpoch, rec.spaceEpoch, rec.left, rec.right);
+  const uint16_t tag = ipc::PoseTag(rec.renderId, rec.connEpoch, rec.spaceEpoch, rec.left, rec.right);
   const RenderRecord* out = nullptr;
   Check(ledger.Accept(id16, tag, 7, t0 + 1000, &out) == RejectReason::Accepted, "一致は受理");
   Check(out != nullptr && out->renderId == 42, "受理レコードの ID");
@@ -110,7 +110,7 @@ int RunTransferSelfTest() {
 
   // 6. 拒否系の 3 種（古い ID・旧世代・期限超過）と pose 不一致。
   Check(ledger.Accept(0x1234, tag, 7, t0 + 2000) == RejectReason::UnknownId, "未知 ID は棄却");
-  const uint16_t staleTag = PoseTag(42, 1, 7, leftMoved, right);
+  const uint16_t staleTag = ipc::PoseTag(42, 1, 7, leftMoved, right);
   Check(ledger.Accept(id16, staleTag, 7, t0 + 3000) == RejectReason::PoseMismatch,
         "古い pose の埋め込みは棄却");
   Check(ledger.Accept(id16, tag, 6, t0 + 4000) == RejectReason::SpaceMismatch,
@@ -143,35 +143,35 @@ int RunTransferSelfTest() {
 
   // 9. HapticCommand の往復と妥当性（配置は protocol.h の定義どおり）。
   {
-    const TransferMessage haptic = MakeHapticCommand(1, 0.8f, 300);
-    Check(IsValidHapticCommand(haptic), "HapticCommand 有効");
-    Check(HapticHand(haptic) == 1 && HapticAmplitude(haptic) == 0.8f &&
-              HapticDurationMs(haptic) == 300,
+    const ipc::TransferMessage haptic = ipc::MakeHapticCommand(1, 0.8f, 300);
+    Check(ipc::IsValidHapticCommand(haptic), "HapticCommand 有効");
+    Check(ipc::HapticHand(haptic) == 1 && ipc::HapticAmplitude(haptic) == 0.8f &&
+              ipc::HapticDurationMs(haptic) == 300,
           "HapticCommand の値の保持");
-    TransferMessage bad_hand = haptic;
+    ipc::TransferMessage bad_hand = haptic;
     bad_hand.renderId = 2;
-    Check(!IsValidHapticCommand(bad_hand), "hand 2 の指令は無効");
-    TransferMessage bad_amp = haptic;
+    Check(!ipc::IsValidHapticCommand(bad_hand), "hand 2 の指令は無効");
+    ipc::TransferMessage bad_amp = haptic;
     bad_amp.leftPos[0] = 1.5f;
-    Check(!IsValidHapticCommand(bad_amp), "振幅 1 超の指令は無効");
-    TransferMessage bad_dur = haptic;
+    Check(!ipc::IsValidHapticCommand(bad_amp), "振幅 1 超の指令は無効");
+    ipc::TransferMessage bad_dur = haptic;
     bad_dur.connEpoch = 0;
-    Check(!IsValidHapticCommand(bad_dur), "持続 0 の指令は無効");
+    Check(!ipc::IsValidHapticCommand(bad_dur), "持続 0 の指令は無効");
   }
 
   // 10. profile 識別子と量子化（JS 側 tools/test/client/protocol.test.cjs と同じ表・同じ式）。
-  Check(ProfileIdFromName("") == 0, "空 profile は未取得");
-  Check(ProfileIdFromName("/interaction_profiles/bytedance/pico4_controller") == 6,
+  Check(ipc::ProfileIdFromName("") == 0, "空 profile は未取得");
+  Check(ipc::ProfileIdFromName("/interaction_profiles/bytedance/pico4_controller") == 6,
         "PICO 4 の識別子");
-  Check(ProfileIdFromName("/interaction_profiles/oculus/touch_controller") == 2,
+  Check(ipc::ProfileIdFromName("/interaction_profiles/oculus/touch_controller") == 2,
         "oculus の識別子");
-  Check(ProfileIdFromName("/interaction_profiles/unknown/future_controller") == 255,
+  Check(ipc::ProfileIdFromName("/interaction_profiles/unknown/future_controller") == 255,
         "未知 profile は 255");
-  Check(QuantizeUnitFloat(0.0f) == 0 && QuantizeUnitFloat(1.0f) == 255, "アナログ量子化の両端");
-  Check(QuantizeStick(-1.0f) == static_cast<uint8_t>(static_cast<int8_t>(-127)) &&
-            QuantizeStick(1.0f) == 127,
+  Check(ipc::QuantizeUnitFloat(0.0f) == 0 && ipc::QuantizeUnitFloat(1.0f) == 255, "アナログ量子化の両端");
+  Check(ipc::QuantizeStick(-1.0f) == static_cast<uint8_t>(static_cast<int8_t>(-127)) &&
+            ipc::QuantizeStick(1.0f) == 127,
         "スティック量子化の両端");
-  Check(sizeof(TransferMessage) == 256, "拡張後もメッセージ 256B");
+  Check(sizeof(ipc::TransferMessage) == 256, "拡張後もメッセージ 256B");
 
   // 11. 入力計測: 押下エッジの検出と 1 秒ラッチ（HMD 無しで形式を確認する）。
   // 実機の取りこぼし（短い押下・primary/menu の未記録）の切り分け用である。
@@ -245,17 +245,17 @@ int RunTransferSelfTest() {
     s.hands[1].secondary.state = xr::FieldState::Active;
     const uint8_t latch0 = xr::InputManager::PressedBits(s.hands[0]);
     const uint8_t latch1 = xr::InputManager::PressedBits(s.hands[1]);
-    Check(latch0 == kBtnPrimary && latch1 == kBtnSecondary, "ラッチ bit は buttons 欄と同じ割付け");
+    Check(latch0 == ipc::kBtnPrimary && latch1 == ipc::kBtnSecondary, "ラッチ bit は buttons 欄と同じ割付け");
     Check(xr::InputManager::FormatLatch(latch0) == "primary", "ラッチの人名（左）");
     Check(xr::InputManager::FormatLatch(0) == "-", "空ラッチは -");
-    const TransferMessage with_latch = MakeInputStateMessage(s, 2, 7, latch0, latch1);
-    Check(with_latch.reserved[0] == kBtnPrimary && with_latch.reserved[1] == kBtnSecondary,
+    const ipc::TransferMessage with_latch = app::MakeInputStateMessage(s, 2, 7, latch0, latch1);
+    Check(with_latch.reserved[0] == ipc::kBtnPrimary && with_latch.reserved[1] == ipc::kBtnSecondary,
           "ラッチは予約先頭 2B（左・右）");
     // ラッチ無し（既定 0）の配置は従来どおりであり、buttons 欄は変わらない。
-    const TransferMessage plain = MakeInputStateMessage(s, 2, 7);
+    const ipc::TransferMessage plain = app::MakeInputStateMessage(s, 2, 7);
     const uint8_t* base = reinterpret_cast<const uint8_t*>(&plain);
     Check(plain.reserved[0] == 0 && plain.reserved[1] == 0, "既定ラッチは 0");
-    Check(base[kInputHand0 + kInputHandButtons] == kBtnPrimary, "buttons 欄は従来どおり");
+    Check(base[ipc::kInputHand0 + ipc::kInputHandButtons] == ipc::kBtnPrimary, "buttons 欄は従来どおり");
   }
 
   // 13b. TTL 設定の上書き（--record-ttl-ms の実行値）。既定 500ms は変えない。
@@ -264,7 +264,7 @@ int RunTransferSelfTest() {
     const RenderRecord& c =
         custom.Issue(43, left, right, lf, rf, 2048, 1024, t0);
     const uint16_t cid16 = static_cast<uint16_t>(c.renderId & 0xFFFFu);
-    const uint16_t ctag = PoseTag(c.renderId, c.connEpoch, c.spaceEpoch, c.left, c.right);
+    const uint16_t ctag = ipc::PoseTag(c.renderId, c.connEpoch, c.spaceEpoch, c.left, c.right);
     Check(custom.maxAgeUs() == 2000000u, "TTL 設定値の保持");
     Check(custom.Accept(cid16, ctag, 7, t0 + 600000) == RejectReason::Accepted,
           "TTL 2s では 600ms の画像も受理");
@@ -289,22 +289,22 @@ int RunTransferSelfTest() {
     s.hands[1].aimValid = true;
     s.hands[1].aim.position = {-0.13f, 1.23f, -0.33f};
     s.hands[1].aim.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    const TransferMessage pose_msg = MakeInputStateMessage(s, 2, 7);
+    const ipc::TransferMessage pose_msg = app::MakeInputStateMessage(s, 2, 7);
     const uint8_t* pbase = reinterpret_cast<const uint8_t*>(&pose_msg);
-    Check((pbase[kInputHand0 + kInputHandFlags] & 0b110) == 0b110, "左の grip/aim 有効 flags");
-    Check((pbase[kInputHand0 + kInputHandStride + kInputHandFlags] & 0b110) == 0b100,
+    Check((pbase[ipc::kInputHand0 + ipc::kInputHandFlags] & 0b110) == 0b110, "左の grip/aim 有効 flags");
+    Check((pbase[ipc::kInputHand0 + ipc::kInputHandStride + ipc::kInputHandFlags] & 0b110) == 0b100,
           "右は aim のみ有効 flags");
-    const ControllerPose lg = ReadInputPose(pose_msg, kInputGripLeft);
+    const ipc::ControllerPose lg = ipc::ReadInputPose(pose_msg, ipc::kInputGripLeft);
     Check(lg.position[0] == 0.11f && lg.position[1] == 1.21f && lg.position[2] == -0.31f &&
               lg.orientation[3] == 1.0f,
           "左 grip pose の往復");
-    const ControllerPose la = ReadInputPose(pose_msg, kInputAimLeft);
+    const ipc::ControllerPose la = ipc::ReadInputPose(pose_msg, ipc::kInputAimLeft);
     Check(la.position[0] == 0.12f && la.orientation[1] == 0.7071f, "左 aim pose の往復");
-    const ControllerPose ra = ReadInputPose(pose_msg, kInputAimRight);
+    const ipc::ControllerPose ra = ipc::ReadInputPose(pose_msg, ipc::kInputAimRight);
     Check(ra.position[0] == -0.13f && ra.position[1] == 1.23f && ra.orientation[3] == 1.0f,
           "右 aim pose の往復");
     // 無効な右 grip の値は 0 のまま（受信側は flags を見て読まない）。
-    const ControllerPose rg = ReadInputPose(pose_msg, kInputGripRight);
+    const ipc::ControllerPose rg = ipc::ReadInputPose(pose_msg, ipc::kInputGripRight);
     Check(rg.position[0] == 0.0f && rg.position[1] == 0.0f && rg.position[2] == 0.0f &&
               rg.orientation[0] == 0.0f && rg.orientation[3] == 0.0f,
           "無効な右 grip pose は 0 のまま");
@@ -324,28 +324,28 @@ int RunTransferSelfTest() {
     // 未接続の両手は flags=0 で pose も 0（0 埋めと区別するため flags を見る）。
     xr::InputSnapshot empty{};
     empty.frameNo = 79;
-    const TransferMessage empty_msg = MakeInputStateMessage(empty, 2, 7);
+    const ipc::TransferMessage empty_msg = app::MakeInputStateMessage(empty, 2, 7);
     const uint8_t* ebase = reinterpret_cast<const uint8_t*>(&empty_msg);
-    Check(ebase[kInputHand0 + kInputHandFlags] == 0, "未接続の左 flags は 0");
-    const ControllerPose eg = ReadInputPose(empty_msg, kInputGripLeft);
+    Check(ebase[ipc::kInputHand0 + ipc::kInputHandFlags] == 0, "未接続の左 flags は 0");
+    const ipc::ControllerPose eg = ipc::ReadInputPose(empty_msg, ipc::kInputGripLeft);
     Check(eg.position[0] == 0.0f && eg.orientation[3] == 0.0f, "未接続の左 grip pose は 0");
   }
 
   // 14. Offer の paint タグ（QPC µs）の往復。reserved 先頭 8B であり、版は上げない。
   {
-    Check(kOfferPaintQpcOffset == 152, "paint タグのオフセット 152");
-    Check(kOfferPaintQpcOffset == offsetof(TransferMessage, reserved),
+    Check(ipc::kOfferPaintQpcOffset == 152, "paint タグのオフセット 152");
+    Check(ipc::kOfferPaintQpcOffset == offsetof(ipc::TransferMessage, reserved),
           "paint タグは reserved の先頭");
-    TransferMessage offer{};
-    offer.magic = kMagic;
-    offer.version = kVersion;
-    offer.type = kTypeOffer;
-    SetOfferPaintQpcUs(offer, 0);
-    Check(OfferPaintQpcUs(offer) == 0, "タグ 0 は欠測として往復");
-    SetOfferPaintQpcUs(offer, 0x1122334455667788ull);
-    Check(OfferPaintQpcUs(offer) == 0x1122334455667788ull, "タグの往復");
+    ipc::TransferMessage offer{};
+    offer.magic = ipc::kMagic;
+    offer.version = ipc::kVersion;
+    offer.type = ipc::kTypeOffer;
+    ipc::SetOfferPaintQpcUs(offer, 0);
+    Check(ipc::OfferPaintQpcUs(offer) == 0, "タグ 0 は欠測として往復");
+    ipc::SetOfferPaintQpcUs(offer, 0x1122334455667788ull);
+    Check(ipc::OfferPaintQpcUs(offer) == 0x1122334455667788ull, "タグの往復");
     // タグ以外の既存欄は変わらない。
-    Check(offer.magic == kMagic && offer.version == kVersion && offer.type == kTypeOffer,
+    Check(offer.magic == ipc::kMagic && offer.version == ipc::kVersion && offer.type == ipc::kTypeOffer,
           "タグ設定で既存欄は変わらない");
     const uint8_t* obase = reinterpret_cast<const uint8_t*>(&offer);
     bool tail_zero = true;
@@ -354,7 +354,7 @@ int RunTransferSelfTest() {
     }
     Check(tail_zero, "タグ外の予約域は 0 のまま");
     // 版は上げない（旧受信側は無視、旧送信側の 0 は欠測）。
-    Check(kVersion == 3, "paint タグ追加で版は上げない");
+    Check(ipc::kVersion == 3, "paint タグ追加で版は上げない");
   }
 
   if (g_failures > 0) {

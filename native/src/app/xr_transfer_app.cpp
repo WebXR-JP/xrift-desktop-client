@@ -30,7 +30,7 @@
 #include "xr/input.h"
 #include "xr/session.h"
 
-namespace xrift::transfer {
+namespace xrift::app {
 namespace {
 
 // Offer 受信ポーリングの待ち上限（1ms は意図的な値であり、仮置きではない）。
@@ -72,8 +72,8 @@ uint64_t NowQpcUs() {
   return static_cast<uint64_t>(us);
 }
 
-EyePose ToEyePose(const XrPosef& p) {
-  EyePose e{};
+ipc::EyePose ToEyePose(const XrPosef& p) {
+  ipc::EyePose e{};
   e.position[0] = p.position.x;
   e.position[1] = p.position.y;
   e.position[2] = p.position.z;
@@ -84,8 +84,8 @@ EyePose ToEyePose(const XrPosef& p) {
   return e;
 }
 
-EyeFov ToEyeFov(const XrFovf& f) {
-  EyeFov e{};
+ipc::EyeFov ToEyeFov(const XrFovf& f) {
+  ipc::EyeFov e{};
   e.left = f.angleLeft;
   e.right = f.angleRight;
   e.up = f.angleUp;
@@ -97,14 +97,14 @@ EyeFov ToEyeFov(const XrFovf& f) {
 // gfx::BlitPass へ値で渡す（gfx 側に ipc を漏らさない）。
 gfx::MarkerLayout MakeMarkerLayout() {
   gfx::MarkerLayout layout{};
-  layout.left.x = kMarkerLeftX;
-  layout.left.y = kMarkerY;
-  layout.left.size = kMarkerSize;
+  layout.left.x = ipc::kMarkerLeftX;
+  layout.left.y = ipc::kMarkerY;
+  layout.left.size = ipc::kMarkerSize;
   // 従来の判定（r>200 && b>200 && g<80）と同値の範囲にする。
   layout.left.color = gfx::MarkerColor{201, 255, 0, 79, 201, 255};
-  layout.right.x = kMarkerRightDx;
-  layout.right.y = kMarkerY;
-  layout.right.size = kMarkerSize;
+  layout.right.x = ipc::kMarkerRightDx;
+  layout.right.y = ipc::kMarkerY;
+  layout.right.size = ipc::kMarkerSize;
   // 従来の判定（g>200 && b>200 && r<80）と同値の範囲にする。
   layout.right.color = gfx::MarkerColor{0, 79, 201, 255, 201, 255};
   return layout;
@@ -133,7 +133,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 転送セッションを先に作る。同一 VkDevice を XR セッションと共有し、
   // 自前イメージから swapchain への blit を同一デバイス内で行う。
   // 別デバイスにするとデバイス間コピーが要るため、この順序を変えないこと。
-  TransferSession transfer;
+  transfer::TransferSession transfer;
   xr::SpacePreference space_pref = xr::SpacePreference::Auto;
   try {
     space_pref = xr::ParseSpacePreference(options.space);
@@ -150,7 +150,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   std::unique_ptr<gfx::BlitPass> blit;
   xr::InputManager input;
   uint32_t conn_epoch = 1;
-  RenderLedger ledger(conn_epoch, 1, options.recordTtlMs * 1000u);
+  transfer::RenderLedger ledger(conn_epoch, 1, options.recordTtlMs * 1000u);
   XrStats stats{};
   stats.connEpoch = conn_epoch;
   try {
@@ -192,20 +192,20 @@ int RunXrTransfer(const XrTransferOptions& options) {
     Info("swapchain が B8G8R8A8_UNORM（受理画像と一致。blit は複写・拡大のみ）");
   }
   blit = std::make_unique<gfx::BlitPass>(transfer.Vulkan(), *swapchains, MakeMarkerLayout());
-  ControlBlockReader reader(transfer.Vulkan());
+  transfer::ControlBlockReader reader(transfer.Vulkan());
   gfx::HoldImage hold(transfer.Vulkan());
   // 接続失敗は例外で返る。統計とメッセージを残してから投げ直す
   // （呼び出し側は 1 に丸めて通常終了させる）。
-  std::unique_ptr<PipeClient> pipe_owned;
+  std::unique_ptr<ipc::PipeClient> pipe_owned;
   try {
-    pipe_owned = std::make_unique<PipeClient>(options.pipeName);
+    pipe_owned = std::make_unique<ipc::PipeClient>(options.pipeName);
   } catch (const std::exception& e) {
     Error("パイプ接続に失敗: %s", e.what());
     stats.Print(ledger.stats(), input.stats());
     throw;
   }
   // 以後は参照で使う（呼び出し側の記述は変えない。破棄順序も変わらない）。
-  PipeClient& pipe = *pipe_owned;
+  ipc::PipeClient& pipe = *pipe_owned;
   Info("パイプ接続: main プロセスと接続した");
 
   XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -222,12 +222,12 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 自前イメージは次の Offer で上書き・棄却画像で汚染されるため、提出の複製元には使わない。
   // 再提出は同じ record の pose/FOV のまま行い、最新 pose への付け替えはしない。
   bool hasFresh = false;
-  RenderRecord freshRecord{};
+  transfer::RenderRecord freshRecord{};
   uint32_t freshW = 0;
   uint32_t freshH = 0;
   // 再提出用の保持。hold イメージと、その画像に対応する受理レコードの複写である。
   // 台帳の掃除・TTL 失効では消さない（黒より古い絵を優先する）。世代進行では消す。
-  RenderRecord holdRecord{};
+  transfer::RenderRecord holdRecord{};
   bool holdHasRecord = false;
   // 要求→初回提出（A）・paint→初回提出（B）の計測状態。提出の挙動は変えず観測だけ行う。
   // ownMeta は自前イメージ（OwnImage）に対応する最後の成功コピーの属性であり、
@@ -280,7 +280,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // それ以外の送信失敗は異常として非ゼロ終了にする。
   // 終了直前の競合（サーバ破棄と次フレーム送信の入れ違い）は切断側に倒す。
   auto note_send_failure = [&](const char* what, const std::exception& e) {
-    const PipeError* pipe_error = dynamic_cast<const PipeError*>(&e);
+    const ipc::PipeError* pipe_error = dynamic_cast<const ipc::PipeError*>(&e);
     // 相手先の破棄に伴う切断コード（いずれも「パイプは閉じられた」の変種）。
     // GetOverlappedResult/WriteFile の失敗理由として実測した 232 を含む。
     const bool graceful = pipe_error != nullptr &&
@@ -463,7 +463,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 受信・ACK は描画可否と無関係に進め、止めるのは提出だけである。
   // 同じパイプで main → exe の HapticCommand も受ける。Offer とは別扱いにする。
   auto drain_offers = [&]() {
-    TransferMessage msg{};
+    ipc::TransferMessage msg{};
     bool have_last = false;
     for (;;) {
       bool timed_out = false;
@@ -498,15 +498,15 @@ int RunXrTransfer(const XrTransferOptions& options) {
       // main → exe の HapticCommand は Offer とは別扱いにする。
       // producer 生存の証拠には数えず、借用台帳にも触れない。
       // セッションが無い・実行中でない場合は inactive として記録する（例外にしない）。
-      if (msg.magic == kMagic && msg.version == kVersion && msg.type == kTypeHapticCommand) {
-        if (!IsValidHapticCommand(msg)) {
+      if (msg.magic == ipc::kMagic && msg.version == ipc::kVersion && msg.type == ipc::kTypeHapticCommand) {
+        if (!ipc::IsValidHapticCommand(msg)) {
           Warn("不正な HapticCommand を破棄（hand/amplitude/duration の不一致）");
           continue;
         }
         ++stats.hapticReceived;
-        const uint32_t hand = HapticHand(msg);
-        const float amp = HapticAmplitude(msg);
-        const uint32_t dur = HapticDurationMs(msg);
+        const uint32_t hand = ipc::HapticHand(msg);
+        const float amp = ipc::HapticAmplitude(msg);
+        const uint32_t dur = ipc::HapticDurationMs(msg);
         // FOCUSED でなければ送らず inactive に数える（入力の sync と同じ基準）。
         const bool haptic_focused =
             session && session->state() == XR_SESSION_STATE_FOCUSED;
@@ -530,7 +530,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         continue;
       }
-      if (!IsValidOffer(msg)) {
+      if (!ipc::IsValidOffer(msg)) {
         Warn("不正な Offer を破棄（magic/version/type/format の不一致）");
         continue;
       }
@@ -543,9 +543,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
       // 誤った標本を作らない。Offer を受信しないフレームでは触らない。
       freshMeta.seq = 0;
       const uint64_t offerRecvQpcUs = NowQpcUs();
-      const uint64_t offerPaintTagUs = OfferPaintQpcUs(msg);
+      const uint64_t offerPaintTagUs = ipc::OfferPaintQpcUs(msg);
       const uint32_t status = transfer.ProcessOffer(msg.handle, msg.width, msg.height);
-      if (status == kStatusOk || status == kStatusVerifyFailed) {
+      if (status == ipc::kStatusOk || status == ipc::kStatusVerifyFailed) {
         const uint64_t copyDoneQpcUs = NowQpcUs();
         ++imageSeq;
         ownMeta.seq = imageSeq;
@@ -559,17 +559,17 @@ int RunXrTransfer(const XrTransferOptions& options) {
         // 画像の受理・提出・棄却は変えない。次の成功コピーで再開する。
         ownMeta.seq = 0;
       }
-      if (status == kStatusNoAck) {
+      if (status == ipc::kStatusNoAck) {
         Error("GPU 完了未確認のため受付を停止して終了する（borrow への ACK なし）");
         pipeAlive = false;
         exitCode = 2;
         quit = true;
         return;
       }
-      if (status == kStatusOk) {
+      if (status == ipc::kStatusOk) {
         ++stats.doneOk;
       }
-      const TransferMessage done = MakeDone(msg.borrowId, status);
+      const ipc::TransferMessage done = ipc::MakeDone(msg.borrowId, status);
       try {
         pipe.Send(done);
       } catch (const std::exception& e) {
@@ -599,21 +599,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
       Warn("制御ブロック readback に失敗: %s", e.what());
       return;
     }
-    const RenderRecord* hit = nullptr;
-    const RejectReason reason = ledger.Accept(id16, tag, ledger.spaceEpoch(), NowUs(), &hit);
-    if (reason != RejectReason::Accepted || hit == nullptr) {
+    const transfer::RenderRecord* hit = nullptr;
+    const transfer::RejectReason reason = ledger.Accept(id16, tag, ledger.spaceEpoch(), NowUs(), &hit);
+    if (reason != transfer::RejectReason::Accepted || hit == nullptr) {
       // pose 不一致の切り分け用に先頭 5 件だけ詳報する。復号値と、同じ id16 を持つ
       // 台帳レコードの期待値を並べ、shim 側の付番・pipe 経由の取り違え・画像破損を区別する。
       // 毎回は出さない（72Hz でのログ肥大の防止）。
       if (mismatchLogCount < 5 &&
-          (reason == RejectReason::PoseMismatch || reason == RejectReason::UnknownId)) {
-        const RenderRecord* cand = nullptr;
+          (reason == transfer::RejectReason::PoseMismatch || reason == transfer::RejectReason::UnknownId)) {
+        const transfer::RenderRecord* cand = nullptr;
         uint16_t want = 0;
         if (ledger.LookupById16(id16, &cand, &want) && cand != nullptr) {
           Info("XR 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳 renderId=%llu"
                " wantTag=0x%04x conn=%u space=%u（台帳現世代 conn=%u space=%u）/ ledger最新=%llu",
                static_cast<unsigned long long>(mismatchLogCount),
-               RejectReasonName(reason), id16, tag,
+               transfer::RejectReasonName(reason), id16, tag,
                static_cast<unsigned long long>(cand->renderId), want, cand->connEpoch,
                cand->spaceEpoch, ledger.connEpoch(), ledger.spaceEpoch(),
                static_cast<unsigned long long>(ledger.latestRenderId()));
@@ -621,12 +621,12 @@ int RunXrTransfer(const XrTransferOptions& options) {
           Info("XR 棄却診断[%llu]: %s decoded id16=0x%04x tag=0x%04x / 台帳にid16一致なし"
                "（現世代 conn=%u space=%u）/ ledger最新=%llu",
                static_cast<unsigned long long>(mismatchLogCount),
-               RejectReasonName(reason), id16, tag, ledger.connEpoch(), ledger.spaceEpoch(),
+               transfer::RejectReasonName(reason), id16, tag, ledger.connEpoch(), ledger.spaceEpoch(),
                static_cast<unsigned long long>(ledger.latestRenderId()));
         }
         ++mismatchLogCount;
       }
-      Info("XR 棄却: %s（id16=0x%04x tag=0x%04x）", RejectReasonName(reason), id16, tag);
+      Info("XR 棄却: %s（id16=0x%04x tag=0x%04x）", transfer::RejectReasonName(reason), id16, tag);
       return;
     }
     freshRecord = *hit;
@@ -728,10 +728,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
         const uint32_t half_h0 = scaled(eye0.height, options.renderScale);
         const uint32_t half_h1 = scaled(eye1.height, options.renderScale);
         const uint32_t req_h = half_h0 > half_h1 ? half_h0 : half_h1;
-        const EyePose left = ToEyePose(views[0].pose);
-        const EyePose right = ToEyePose(views[1].pose);
-        const EyeFov lf = ToEyeFov(views[0].fov);
-        const EyeFov rf = ToEyeFov(views[1].fov);
+        const ipc::EyePose left = ToEyePose(views[0].pose);
+        const ipc::EyePose right = ToEyePose(views[1].pose);
+        const ipc::EyeFov lf = ToEyeFov(views[0].fov);
+        const ipc::EyeFov rf = ToEyeFov(views[1].fov);
         // 発行フロー制御: 未処理の画像がある間は新しいレコードを発行しない
         // （RenderRequest を送らない）。Offer 処理後の次のフレームで発行する。
         // 応答が無いまま 500ms 経過したら同じレコードの再送ではなく新しい
@@ -749,9 +749,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         if (issue_record) {
           const uint64_t render_id = frame_no;  // 0 を避けるため 1 起点の通番を使う。
-          const RenderRecord& rec =
+          const transfer::RenderRecord& rec =
               ledger.Issue(render_id, left, right, lf, rf, req_w, req_h, NowUs());
-          TransferMessage req = MakeRenderRequest(rec.renderId, rec.connEpoch, rec.spaceEpoch,
+          ipc::TransferMessage req = ipc::MakeRenderRequest(rec.renderId, rec.connEpoch, rec.spaceEpoch,
                                                   rec.left, rec.right, rec.leftFov, rec.rightFov,
                                                   req_w, req_h);
           try {
@@ -830,7 +830,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     // record の pose/FOV を提出層に載せる。新規受理と再提出で共用する。
     // 失敗時は例外にする（呼び出し側は空フレームで終える）。
     auto submit_image = [&](vk::Image src, uint32_t srcW, uint32_t srcH,
-                            const RenderRecord& rec) {
+                            const transfer::RenderRecord& rec) {
       const gfx::BlitPass::Result r0 = blit->Blit(0, src, srcW, srcH, 0);
       const gfx::BlitPass::Result r1 = blit->Blit(1, src, srcW, srcH, 1);
       const uint64_t blit_us = r0.blitUs + r1.blitUs;
@@ -845,8 +845,8 @@ int RunXrTransfer(const XrTransferOptions& options) {
         ++stats.verifyNg;
       }
       for (uint32_t eye = 0; eye < 2; ++eye) {
-        const EyePose& p = (eye == 0) ? rec.left : rec.right;
-        const EyeFov& f = (eye == 0) ? rec.leftFov : rec.rightFov;
+        const ipc::EyePose& p = (eye == 0) ? rec.left : rec.right;
+        const ipc::EyeFov& f = (eye == 0) ? rec.leftFov : rec.rightFov;
         proj_views[eye].pose.position.x = p.position[0];
         proj_views[eye].pose.position.y = p.position[1];
         proj_views[eye].pose.position.z = p.position[2];
@@ -885,7 +885,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
     bool fresh_failed = false;
     // 計測は観測だけであり、提出・blit の挙動は変えない。候補の選択だけ行う。
     ImageMeta submitCandidate{};
-    RenderRecord submitRec{};
+    transfer::RenderRecord submitRec{};
     bool haveSubmitCandidate = false;
     uint64_t submitSteadyUs = 0;
     uint64_t submitQpcUs = 0;
@@ -1069,7 +1069,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   return exitCode;
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app
 
 #else
 
@@ -1078,13 +1078,13 @@ int RunXrTransfer(const XrTransferOptions& options) {
 #include "common/log.h"
 #include "app/xr_transfer_app.h"
 
-namespace xrift::transfer {
+namespace xrift::app {
 
 int RunXrTransfer(const XrTransferOptions&) {
   Error("--xr-transfer は Windows のみ（Linux は将来対応）");
   return 1;
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app
 
 #endif

@@ -52,10 +52,10 @@ struct RenderRecord {
   uint64_t renderId = 0;
   uint32_t connEpoch = 0;
   uint32_t spaceEpoch = 0;
-  EyePose left{};
-  EyePose right{};
-  EyeFov leftFov{};
-  EyeFov rightFov{};
+  ipc::EyePose left{};
+  ipc::EyePose right{};
+  ipc::EyeFov leftFov{};
+  ipc::EyeFov rightFov{};
   uint32_t reqWidth = 0;
   uint32_t reqHeight = 0;
   // 発行時刻（steady_clock の us）。年齢判定の起点である。
@@ -105,8 +105,8 @@ class RenderLedger {
   }
 
   // レコードを発行して保持する。renderId 0 は使わない（画像の未初期値と区別する）。
-  const RenderRecord& Issue(uint64_t renderId, const EyePose& left, const EyePose& right,
-                            const EyeFov& leftFov, const EyeFov& rightFov, uint32_t reqWidth,
+  const RenderRecord& Issue(uint64_t renderId, const ipc::EyePose& left, const ipc::EyePose& right,
+                            const ipc::EyeFov& leftFov, const ipc::EyeFov& rightFov, uint32_t reqWidth,
                             uint32_t reqHeight, uint64_t nowUs) {
     if (renderId == 0) {
       renderId = 1;
@@ -150,7 +150,7 @@ class RenderLedger {
         ++stats_.expired;
         return RejectReason::Expired;
       }
-      const uint16_t want = PoseTag(it->renderId, it->connEpoch, it->spaceEpoch, it->left,
+      const uint16_t want = ipc::PoseTag(it->renderId, it->connEpoch, it->spaceEpoch, it->left,
                                     it->right);
       if (want != poseTag) {
         ++stats_.poseMismatch;
@@ -190,7 +190,7 @@ class RenderLedger {
         continue;
       }
       if (wantTag != nullptr) {
-        *wantTag = PoseTag(it->renderId, it->connEpoch, it->spaceEpoch, it->left, it->right);
+        *wantTag = ipc::PoseTag(it->renderId, it->connEpoch, it->spaceEpoch, it->left, it->right);
       }
       if (out != nullptr) {
         auto fwd = it.base();

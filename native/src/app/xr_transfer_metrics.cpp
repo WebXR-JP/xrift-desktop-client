@@ -4,9 +4,9 @@
 
 #include "common/log.h"
 
-namespace xrift::transfer {
+namespace xrift::app {
 
-void XrStats::Print(const RenderLedger::Stats& ledger, const xr::InputStats& input) const {
+void XrStats::Print(const transfer::RenderLedger::Stats& ledger, const xr::InputStats& input) const {
   const double spanS =
       firstUs != 0 && lastUs > firstUs ? static_cast<double>(lastUs - firstUs) / 1e6 : 0.0;
   const double fps = spanS > 0.0 ? static_cast<double>(frames) / spanS : 0.0;
@@ -87,4 +87,4 @@ void PrintLatencyLine(const char* prefix, const LatencyAgg& agg) {
   Info("%s", buf);
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app

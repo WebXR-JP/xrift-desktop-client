@@ -453,7 +453,7 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     ownDefined_ = true;
     // コピー完了を確認できたため、保留していた import 資源を即座に破棄する（従来どおり）。
     ReleaseUnconfirmedCounted();
-    return kStatusOk;
+    return ipc::kStatusOk;
   } catch (const UnconfirmedCompletion& e) {
     // 完了を確認できない。Done を送ると main が release してしまうため、
     // 内部番兵で返し、呼び出し側に受付停止・切断・非ゼロ終了させる。
@@ -463,12 +463,12 @@ uint32_t TransferSession::ProcessOffer(uint64_t remoteHandle, uint32_t width, ui
     if (unconfirmedImage_ || unconfirmedMemory_) {
       Error("import 資源を保持したまま終了する（完了未確認のため破棄しない）");
     }
-    return kStatusNoAck;
+    return ipc::kStatusNoAck;
   } catch (const std::exception& e) {
     // submit 前の失敗（GPU は触っていない）のため、保留資源があれば破棄してよい。
     ReleaseUnconfirmedCounted();
     Warn("Offer 処理に失敗: %s", e.what());
-    return kStatusCopyFailed;
+    return ipc::kStatusCopyFailed;
   }
 }
 

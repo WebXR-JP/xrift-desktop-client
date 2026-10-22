@@ -12,7 +12,7 @@
 // BGRA バイト順・白黒二値・中心画素判定。JS 側（client/src/control-codec.ts の
 // encodeBlock16/decodeBlock16、tools/pages/xr-smoke.html の刻み）と一致させること。
 
-namespace xrift::transfer {
+namespace xrift::ipc {
 
 constexpr uint32_t kControlBlockPixels = 32;
 constexpr uint32_t kControlBlockCell = 4;
@@ -128,4 +128,4 @@ inline uint16_t DecodeBlock16(const uint8_t* rgba) {
   return v;
 }
 
-}  // namespace xrift::transfer
+}  // namespace xrift::ipc

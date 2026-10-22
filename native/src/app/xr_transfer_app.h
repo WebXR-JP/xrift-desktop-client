@@ -7,7 +7,7 @@
 // 発行して RenderRequest を送り、受理した画像だけを左右 swapchain へ blit して
 // そのレコードの pose/FOV で xrEndFrame する（docs/architecture.md「経路」「再提出」）。
 
-namespace xrift::transfer {
+namespace xrift::app {
 
 struct XrTransferOptions {
   std::string pipeName;         // `\\.\pipe\<name>` 形式。必須。
@@ -30,4 +30,4 @@ struct XrTransferOptions {
 // XR 提出ループを実行する。成功時は 0 を返す。
 int RunXrTransfer(const XrTransferOptions& options);
 
-}  // namespace xrift::transfer
+}  // namespace xrift::app

@@ -10,7 +10,7 @@
 // 受信はブロッキングでよい（受信ループは専用スレッド相当の main スレッドで行う）。
 // Windows 専用。Linux 対応時に FD 転送へ差し替える境界がこのクラスである。
 
-namespace xrift::transfer {
+namespace xrift::ipc {
 
 // 送受信の失敗理由付き例外。Win32 エラーを運び、呼び出し側が切断
 // （相手先の正常な破棄。統計付きの正常終了にする）と異常を区別できるようにする。
@@ -49,4 +49,4 @@ class PipeClient {
   void* io_ = nullptr;      // IoState*（OVERLAPPED・イベント・受信ステージング）。同上。
 };
 
-}  // namespace xrift::transfer
+}  // namespace xrift::ipc

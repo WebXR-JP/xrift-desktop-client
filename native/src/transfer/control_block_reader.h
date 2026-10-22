@@ -26,7 +26,7 @@ class ControlBlockReader {
   void Decode(vk::Image own, uint16_t* renderId16, uint16_t* poseTag);
 
  private:
-  static constexpr size_t kStageSize = 2 * kControlBlockBytes;
+  static constexpr size_t kStageSize = 2 * ipc::kControlBlockBytes;
 
   const vk::raii::Device* device_;
   const vk::raii::Queue* queue_;

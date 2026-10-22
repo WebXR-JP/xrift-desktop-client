@@ -6,7 +6,7 @@
 #include "common/log.h"
 #include "common/xr_result.h"
 
-namespace xrift {
+namespace xrift::app {
 
 XrApp::XrApp() { views_.resize(2, {XR_TYPE_VIEW}); }
 
@@ -155,4 +155,4 @@ void XrApp::Shutdown() {
   instance_.reset();
 }
 
-}  // namespace xrift
+}  // namespace xrift::app
