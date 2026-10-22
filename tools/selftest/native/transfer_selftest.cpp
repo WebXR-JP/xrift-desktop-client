@@ -331,6 +331,32 @@ int RunTransferSelfTest() {
     Check(eg.position[0] == 0.0f && eg.orientation[3] == 0.0f, "未接続の左 grip pose は 0");
   }
 
+  // 14. Offer の paint タグ（QPC µs）の往復。reserved 先頭 8B であり、版は上げない。
+  {
+    Check(kOfferPaintQpcOffset == 152, "paint タグのオフセット 152");
+    Check(kOfferPaintQpcOffset == offsetof(TransferMessage, reserved),
+          "paint タグは reserved の先頭");
+    TransferMessage offer{};
+    offer.magic = kMagic;
+    offer.version = kVersion;
+    offer.type = kTypeOffer;
+    SetOfferPaintQpcUs(offer, 0);
+    Check(OfferPaintQpcUs(offer) == 0, "タグ 0 は欠測として往復");
+    SetOfferPaintQpcUs(offer, 0x1122334455667788ull);
+    Check(OfferPaintQpcUs(offer) == 0x1122334455667788ull, "タグの往復");
+    // タグ以外の既存欄は変わらない。
+    Check(offer.magic == kMagic && offer.version == kVersion && offer.type == kTypeOffer,
+          "タグ設定で既存欄は変わらない");
+    const uint8_t* obase = reinterpret_cast<const uint8_t*>(&offer);
+    bool tail_zero = true;
+    for (size_t i = 160; i < 256; ++i) {
+      tail_zero = tail_zero && (obase[i] == 0);
+    }
+    Check(tail_zero, "タグ外の予約域は 0 のまま");
+    // 版は上げない（旧受信側は無視、旧送信側の 0 は欠測）。
+    Check(kVersion == 3, "paint タグ追加で版は上げない");
+  }
+
   if (g_failures > 0) {
     std::printf("[transfer-selftest] FAIL %d 件\n", g_failures);
     return 1;

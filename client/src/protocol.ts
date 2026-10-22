@@ -212,8 +212,9 @@ export function decodeInput(m: Buffer): InputSnapshot | null {
  * @param width - 画像幅。
  * @param height - 画像高さ。
  * @param duplicated - exe プロセスへ複製済みのハンドル値。
+ * @param paintQpcUs - `onPaint()` 入口で取得した QPC 時刻（µs）。既定 0 は欠測であり、exe 側で標本から外す。
  */
-export function makeOffer(borrowId: number, width: number, height: number, duplicated: bigint): Buffer {
+export function makeOffer(borrowId: number, width: number, height: number, duplicated: bigint, paintQpcUs: bigint = 0n): Buffer {
   const buf = Buffer.alloc(MSG_LEN);
   buf.writeUInt32LE(MAGIC, 0);
   buf.writeUInt16LE(VERSION, 4);
@@ -224,6 +225,7 @@ export function makeOffer(borrowId: number, width: number, height: number, dupli
   buf.writeUInt32LE(FORMAT_BGRA, 24);
   buf.writeBigUInt64LE(duplicated, 28);
   buf.writeUInt32LE(0, 36);
+  buf.writeBigUInt64LE(paintQpcUs, 152);
   return buf;
 }
 

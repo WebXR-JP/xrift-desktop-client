@@ -17,6 +17,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import {
   MSG_LEN, MAGIC, VERSION,
   TYPE_DONE, TYPE_RENDER_REQUEST, TYPE_INPUT_STATE,
@@ -192,11 +193,15 @@ process.on('uncaughtException', (e: unknown) => {
 // ---- transfer-addon の読み込み（境界で unknown として受け、形状を検証する）
 interface TransferAddon {
   duplicateHandle(handle: Buffer, targetPid: number): { ok: boolean; handle?: bigint };
+  // onPaint() 入口の QPC 時刻源（整数 µs）。旧 addon 互換のため任意である。
+  nowQpcUs?: () => bigint;
 }
 function asTransferAddon(v: unknown): TransferAddon | null {
   if (v === null || typeof v !== 'object') return null;
   const dup = (v as Record<string, unknown>).duplicateHandle;
   if (typeof dup !== 'function') return null;
+  const qpc = (v as Record<string, unknown>).nowQpcUs;
+  if (qpc !== undefined && typeof qpc !== 'function') return null;
   return v as TransferAddon;
 }
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- preload と同じく main でのみ addon を読む
@@ -269,7 +274,10 @@ const stats = {
   inputForwarded: 0, // OSR へ転送した入力イベントの件数。
   inputErrors: 0, // 破棄・失敗した入力転送の件数。
   releaseAttempts: 0, // release() の試行回数。
+  paintTagMissing: 0, // paint タグを取得できなかった paint の件数（計測除外。失敗判定に加えない）。
 };
+// paint タグ欠測の初回ログ済み旗。欠測のたびにログを出すと paint 毎に肥大するため。
+let paintTagMissingLogged = false;
 const handleCounts = new Map<string, number>();
 const paintTimes: number[] = [];
 let exeProc: ChildProcess | null = null;
@@ -287,6 +295,11 @@ let shutdownStarted = false;
 // exe の stdout/stderr の行バッファ。チャンク境界で行が切れるため、
 // 改行で区切れた完成行だけを統計抽出に使う。残りは finish 時に掃き出す。
 let exeLineBuf = '';
+// exe の stdout/stderr を UTF-8 で復元する decoder。日本語（`[XR計測]` 等）が
+// チャンク境界で分割されても置換文字にせず復元するため、ストリームごとに保持する。
+// 共有すると分割状態が混ざるため分け、モジュールスコープに置いて finish からも触る。
+let exeStdoutDecoder: StringDecoder | null = null;
+let exeStderrDecoder: StringDecoder | null = null;
 // exe の終了統計（XR転送統計）を app ログに残したか。終了時の必須証拠である。
 let exeStatsLogged = false;
 // ---- C 案のミラー状態。OSR（不可視）の capturePage をタイマーで拾い、
@@ -352,12 +365,13 @@ function countExeMeterChunk(text: string): void {
     }
   }
 }
-// exe の stdout/stderr チャンクから `XR転送統計` の完成行を抜き出して app ログに残す。
+// exe の stdout/stderr チャンクから `XR転送統計`・`[XR計測]` の完成行を抜き出して app ログに残す。
 // 終了証拠としてウィンドウ close・--seconds のいずれでも必須であるため、
 // 行の途中で切れた分は exeLineBuf に溜め、finish 時の掃き出しで回収する。
 // 前提: exe の統計行は `XR転送統計:` を含む 1 行である（XrStats::Print の形式）。
+// 計測行は `[XR計測]` を含む 1 行であり、`exe計測:` として中継する（新しいパーサや別集計機構は作らない）。
 function noteExeStatsChunk(text: string): void {
-  if (!text.includes('XR転送統計') && !text.includes('\n')) {
+  if (!text.includes('XR転送統計') && !text.includes('[XR計測]') && !text.includes('\n')) {
     exeLineBuf += text;
     return;
   }
@@ -369,16 +383,36 @@ function noteExeStatsChunk(text: string): void {
     if (line.includes('XR転送統計')) {
       exeStatsLogged = true;
       log(`exe統計: ${line.slice(0, 2000)}`);
+    } else if (line.includes('[XR計測]')) {
+      log(`exe計測: ${line.slice(0, 2000)}`);
     }
   }
 }
-// finish 時の掃き出し。close（EOF）までに届いた末尾の断片を回収する。
+// finish 時の掃き出し。decoder の残りを行バッファ処理へ流してから `exeLineBuf` を掃き出す。
+// close（EOF）までに届いた末尾の断片を回収する。既存の取りこぼし防止の挙動は変えない。
 function flushExeStats(): void {
+  for (const decoder of [exeStdoutDecoder, exeStderrDecoder]) {
+    if (decoder === null) continue;
+    let tail = '';
+    try {
+      tail = decoder.end();
+    } catch { /* 計測の失敗は本線にしない */ }
+    if (tail !== '') {
+      try {
+        countExeMeterChunk(tail);
+      } catch { /* 計測の失敗は本線にしない */ }
+      try {
+        noteExeStatsChunk(tail);
+      } catch { /* 計測の失敗は本線にしない */ }
+    }
+  }
   const line = exeLineBuf.replace(/\r$/, '');
   exeLineBuf = '';
   if (line.includes('XR転送統計')) {
     exeStatsLogged = true;
     log(`exe統計: ${line.slice(0, 2000)}`);
+  } else if (line.includes('[XR計測]')) {
+    log(`exe計測: ${line.slice(0, 2000)}`);
   }
 }
 // VR 中の 5 秒計測。paint レート（描画が遅いか）と受理率（転送が遅いか）を切り分ける。
@@ -505,7 +539,7 @@ function currentGpuPid(): number | null {
   }
 }
 
-function makeOfferToExe(borrowId: number, width: number, height: number, ntHandle: Buffer): boolean {
+function makeOfferToExe(borrowId: number, width: number, height: number, ntHandle: Buffer, paintQpcUs: bigint): boolean {
   if (addon === null || exeProc === null || exeProc.pid === undefined) {
     stats.offerFailures++;
     log(`offer 不能 borrow=${borrowId}（addon/exe が無い）`);
@@ -529,7 +563,7 @@ function makeOfferToExe(borrowId: number, width: number, height: number, ntHandl
     return false;
   }
   try {
-    socket?.write(makeOffer(borrowId, width, height, dup.handle));
+    socket?.write(makeOffer(borrowId, width, height, dup.handle, paintQpcUs));
   } catch (e) {
     stats.offerFailures++;
     log(`offer send FAILED borrow=${borrowId}: ${e instanceof Error ? e.message : String(e)}`);
@@ -541,6 +575,25 @@ function makeOfferToExe(borrowId: number, width: number, height: number, ntHandl
 }
 
 function onPaint(details: unknown): void {
+  // 計測タグは入口で取得する（QPC と steady_clock を混ぜない。失敗しても paint を落とさない）。
+  let paintQpcUs = 0n;
+  try {
+    const fn = addon?.nowQpcUs;
+    if (typeof fn === 'function') {
+      const v: unknown = fn();
+      if (typeof v === 'bigint') paintQpcUs = v;
+      else throw new Error('nowQpcUs が bigint を返さない');
+    } else {
+      throw new Error('nowQpcUs が無い（旧 addon）');
+    }
+  } catch (e) {
+    stats.paintTagMissing++;
+    if (!paintTagMissingLogged) {
+      paintTagMissingLogged = true;
+      log(`paint タグ欠測（QPC 取得失敗のため 0 で送る）: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    paintQpcUs = 0n;
+  }
   paintTimes.push(Date.now());
   // 初回だけ paint の形状を記録する（版差の観測用。以後は出さない）。
   if (!paintShapeLogged) {
@@ -619,7 +672,7 @@ function onPaint(details: unknown): void {
     releaseOnce(borrowId, 'not-connected');
     return;
   }
-  if (makeOfferToExe(borrowId, coded.width, coded.height, Buffer.from(nt as Buffer))) {
+  if (makeOfferToExe(borrowId, coded.width, coded.height, Buffer.from(nt as Buffer), paintQpcUs)) {
     inFlight = borrowId;
   }
   // makeOfferToExe の失敗時は内部で release 済みのため何もしない。
@@ -1661,14 +1714,20 @@ function start(): void {
   exeProc = spawn(EXE_PATH, exeArgs, { stdio: ['ignore', exeStdio, exeStdio] });
   if (exeStdio === 'pipe' && exeLogStream !== null) {
     const stream: fs.WriteStream = exeLogStream;
-    const forward = (chunk: Buffer): void => {
+    exeStdoutDecoder = new StringDecoder('utf8');
+    exeStderrDecoder = new StringDecoder('utf8');
+    const forwardStdout = (chunk: Buffer): void => {
       stream.write(chunk);
       // VR 計測用に提出・棄却の行を数える（描画経路には触らない）。
       // 終了統計（XR転送統計）は app ログにも残す（終了証拠として必須）。
+      // chunk ごとの toString だと日本語の途中で分割されたときに欠落するため、
+      // ストリーム専用の decoder で復元してから渡す。
       try {
-        const text = chunk.toString('utf8');
-        countExeMeterChunk(text);
-        noteExeStatsChunk(text);
+        const text = exeStdoutDecoder !== null ? exeStdoutDecoder.write(chunk) : '';
+        if (text !== '') {
+          countExeMeterChunk(text);
+          noteExeStatsChunk(text);
+        }
       } catch { /* 計測の失敗は本線にしない */ }
       try {
         process.stdout.write(chunk);
@@ -1676,8 +1735,23 @@ function start(): void {
         // 親パイプ切断時（EPIPE）はファイル側の記録を優先し、落とさない
       }
     };
-    exeProc.stdout?.on('data', forward);
-    exeProc.stderr?.on('data', forward);
+    const forwardStderr = (chunk: Buffer): void => {
+      stream.write(chunk);
+      try {
+        const text = exeStderrDecoder !== null ? exeStderrDecoder.write(chunk) : '';
+        if (text !== '') {
+          countExeMeterChunk(text);
+          noteExeStatsChunk(text);
+        }
+      } catch { /* 計測の失敗は本線にしない */ }
+      try {
+        process.stdout.write(chunk);
+      } catch {
+        // 親パイプ切断時（EPIPE）はファイル側の記録を優先し、落とさない
+      }
+    };
+    exeProc.stdout?.on('data', forwardStdout);
+    exeProc.stderr?.on('data', forwardStderr);
     // ADR: ストリームの end は finish が引き取る（close 待ち後の書き切り用）。
     // ここで end すると finish 側の flush 待ちが空振りして遅延するため触らない。
   }

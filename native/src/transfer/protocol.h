@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 // 転送プロトコル（Electron main ⇔ xrift_native.exe）の固定長バイナリ形式。
 // main がサーバ、exe がクライアント。1 メッセージ 256 バイト、リトルエンディアン。
@@ -63,6 +64,9 @@ struct EyeFov {
 // leftPos 56, leftOri 68, rightPos 84, rightOri 96, leftFov 112, rightFov 128,
 // reqWidth 144, reqHeight 148, reserved 152。合計 256 バイト。
 // Offer/Done では 40 以降を 0 で送り、受信側は読まない（旧経路の挙動は変えない）。
+// ただし Offer のみ reserved[0..7]（152〜159B）に paint タグ（main の onPaint 入口で
+// 取得した QPC µs、uint64 LE、0=欠測）を載せる。旧受信側は reserved を読まないため
+// 無視し、旧送信側の 0 は欠測として扱うため版は上げない。
 // RenderRequest（exe→main）では borrowId/handle/status を 0 にし、renderId 以降を使う。
 // width/height は RenderRequest では要求アトラス寸法（横並び全体）を入れる。
 // InputState（exe→main）では予約先頭 2B（reserved[0]=左、[1]=右）に押下ラッチ
@@ -107,6 +111,27 @@ static_assert(offsetof(TransferMessage, leftFov) == 112, "leftFov の位置は N
 static_assert(offsetof(TransferMessage, rightFov) == 128, "rightFov の位置は Node 側と一致すること");
 static_assert(offsetof(TransferMessage, reqWidth) == 144, "reqWidth の位置は Node 側と一致すること");
 static_assert(offsetof(TransferMessage, reserved) == 152, "予約領域の位置は Node 側と一致すること");
+
+// Offer の paint タグ（QPC µs）の配置。reserved の先頭 8B である。
+// InputState の予約先頭 2B（reserved[0]=左、[1]=右の押下ラッチ）とは type で区別する再利用であり、
+// 版は上げない（旧受信側は reserved を読まず、旧送信側の 0 は欠測扱い）。
+constexpr size_t kOfferPaintQpcOffset = 152;
+static_assert(kOfferPaintQpcOffset == offsetof(TransferMessage, reserved),
+              "paint タグは reserved の先頭であること");
+
+// paint タグを設定する。packed 領域への型ポインタキャストは行わず memcpy で書く。
+inline void SetOfferPaintQpcUs(TransferMessage& m, uint64_t qpcUs) {
+  uint8_t* base = reinterpret_cast<uint8_t*>(&m);
+  std::memcpy(base + kOfferPaintQpcOffset, &qpcUs, sizeof(qpcUs));
+}
+
+// paint タグを読む。0 は欠測である。
+inline uint64_t OfferPaintQpcUs(const TransferMessage& m) {
+  const uint8_t* base = reinterpret_cast<const uint8_t*>(&m);
+  uint64_t qpcUs = 0;
+  std::memcpy(&qpcUs, base + kOfferPaintQpcOffset, sizeof(qpcUs));
+  return qpcUs;
+}
 
 // Offer として受信したメッセージの最低限の正当性を確認する。
 // 借用の実体（ハンドルの有効性）は呼び出し側が D3D11/Vulkan で確認する。

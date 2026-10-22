@@ -4,7 +4,7 @@
 'use strict';
 const assert = require('node:assert');
 const protocol = require('../../../client/dist/protocol.js');
-const { MSG_LEN, MAGIC, VERSION, TYPE_INPUT_STATE, decodeInput } = protocol;
+const { MSG_LEN, MAGIC, VERSION, TYPE_INPUT_STATE, TYPE_OFFER, FORMAT_BGRA, decodeInput, makeOffer } = protocol;
 
 // 固定長と版。C++ の kMessageSize・kVersion と一致すること。
 assert.strictEqual(MSG_LEN, 256, 'C++ の kMessageSize と一致');
@@ -70,5 +70,32 @@ assert.strictEqual(emptySnap.right.grip.valid, false, '未接続の右 grip は�
 
 // 短いメッセージは拒否する。
 assert.strictEqual(decodeInput(Buffer.alloc(192)), null, '192B は旧枠のため拒否');
+
+// Offer の paint タグ（152..159）は既存欄を変えず、LE で載る。
+// 既定 0 は欠測であり、InputState の 152/153 ラッチとは種別で区別する。
+assert.strictEqual(typeof makeOffer, 'function', 'makeOffer がある');
+const offerDefault = makeOffer(7, 640, 480, 12345678n);
+assert.strictEqual(offerDefault.length, MSG_LEN, 'Offer は 256B');
+assert.strictEqual(offerDefault.readUInt32LE(0), MAGIC, 'Offer の magic');
+assert.strictEqual(offerDefault.readUInt16LE(4), VERSION, 'Offer の版は上げない');
+assert.strictEqual(offerDefault.readUInt16LE(6), TYPE_OFFER, 'Offer の種別');
+assert.strictEqual(offerDefault.readBigUInt64LE(8), 7n, 'Offer の借用番号');
+assert.strictEqual(offerDefault.readUInt32LE(16), 640, 'Offer の幅');
+assert.strictEqual(offerDefault.readUInt32LE(20), 480, 'Offer の高さ');
+assert.strictEqual(offerDefault.readUInt32LE(24), FORMAT_BGRA, 'Offer の形式');
+assert.strictEqual(offerDefault.readBigUInt64LE(28), 12345678n, 'Offer の複製ハンドル');
+assert.strictEqual(offerDefault.readUInt32LE(36), 0, 'Offer の状態は 0');
+assert.strictEqual(offerDefault.readBigUInt64LE(152), 0n, '既定タグ 0 は欠測');
+const tagValue = 0x1122334455667788n;
+const offerTagged = makeOffer(7, 640, 480, 12345678n, tagValue);
+assert.strictEqual(offerTagged.readBigUInt64LE(152), tagValue, '指定タグが 152..159 に LE で入る');
+// タグ以外の既存欄は変わらない（152..159 以外の全体）。
+for (const [off, len] of [[0, 152], [160, 96]]) {
+  assert.ok(offerDefault.subarray(off, off + len).equals(offerTagged.subarray(off, off + len)), `タグ外の欄は変わらない off=${off}`);
+}
+// 明示的に予約域全体を比べ、152..159 以外が 0 のままである。
+for (let i = 160; i < MSG_LEN; i++) {
+  assert.strictEqual(offerTagged[i], 0, `予約域の 152..159 以外は 0 のまま i=${i}`);
+}
 
 console.log('protocol.test: ok（配置 256B・既存オフセット不変・pose 往復・無効時 null 相当を確認）');

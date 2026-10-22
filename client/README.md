@@ -49,9 +49,10 @@ npx electron client --url=<絶対パス>/tools/pages/xr-smoke.html --seconds=20
 
 ## ログ
 
-- `logs/client.log`（stdout とファイルの両方。`[描画要求]`・`[VR計測]`・`[入力]`・`exe統計: XR転送統計:` 等）
-- `logs/stats.json`（`offers`・`dones`・`statusOk`・`droppedStale` 等）
+- `logs/client.log`（stdout とファイルの両方。`[描画要求]`・`[VR計測]`・`[入力]`・`exe統計: XR転送統計:`・`exe計測: [XR計測]` 等）
+- `logs/stats.json`（`offers`・`dones`・`statusOk`・`droppedStale`・`paintTagMissing` 等）
 - VR 中は 5 秒ごとに `[VR計測]` を出す（paint レートと exe の受理率の内訳。描画と転送の切り分け用）。
+- `exe計測: [XR計測]` は 5 秒ごと・終了時に出る（paint 起点＝転送路、要求起点＝描画〜提出の全体。同じ画像の二重提出は最初の 1 回だけ数える）。
 
 ## テスト
 

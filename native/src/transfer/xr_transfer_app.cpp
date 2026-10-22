@@ -62,6 +62,25 @@ uint64_t NowUs() {
           .count());
 }
 
+// QPC 時刻（整数 µs）。paint タグ（addon の nowQpcUs）と同じ時計であり、
+// steady_clock（NowUs）と混ぜないことが呼び出し側の契約である。
+uint64_t NowQpcUs() {
+  static LARGE_INTEGER freq = {0};
+  static int freq_once = 0;
+  if (!freq_once) {
+    QueryPerformanceFrequency(&freq);
+    freq_once = 1;
+  }
+  LARGE_INTEGER now = {0};
+  QueryPerformanceCounter(&now);
+  if (freq.QuadPart <= 0) {
+    return 0;
+  }
+  const double us =
+      (static_cast<double>(now.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+  return static_cast<uint64_t>(us);
+}
+
 void CheckVk(vk::Result result, const char* what) {
   if (result == vk::Result::eSuccess) {
     return;
@@ -756,6 +775,74 @@ struct XrStats {
   }
 };
 
+// 要求→初回提出（A）・paint→初回提出（B）の計測用。
+// A は exe 内で閉じる（RenderRecord::issuedUs と提出直前の NowUs）。
+// B は QPC で閉じる（paint タグと提出直前の NowQpcUs）。両時計を混ぜない。
+// 同じ受理画像は hold 経由の resubmit→次フレームの fresh 提出の順で 2 回載り得るため、
+// 画像ごとのローカル通番（成功コピーごとの +1）で最初の 1 回だけ数える。
+struct ImageMeta {
+  uint64_t seq = 0;  // 0 は無効。成功コピーごとに +1 する通番である。
+  uint64_t paintTagUs = 0;  // Offer の reserved 先頭 8B（0=欠測）。
+  uint64_t offerRecvQpcUs = 0;  // 各 Offer 受信直前の QPC。
+  uint64_t copyDoneQpcUs = 0;  // コピー成功直後の QPC。
+};
+
+// 5 秒窓と累計で別々に持つ集計。窓と累計は同じ形であり、窓は出力後に破棄する。
+struct LatencyAgg {
+  uint64_t aCount = 0;
+  uint64_t aSumUs = 0;
+  uint64_t aMaxUs = 0;
+  uint64_t bCount = 0;
+  uint64_t bSumUs = 0;
+  uint64_t bMaxUs = 0;
+  uint64_t bPaintToOfferSumUs = 0;
+  uint64_t bOfferToCopySumUs = 0;
+  uint64_t bCopyToSubmitSumUs = 0;
+  uint64_t endFrameCount = 0;
+  uint64_t endFrameSumUs = 0;
+  uint64_t endFrameMaxUs = 0;
+  uint64_t tagMissing = 0;
+  uint64_t tagFuture = 0;
+  uint64_t orderMismatch = 0;
+  uint64_t duplicateSkip = 0;
+  void Reset() { *this = LatencyAgg{}; }
+};
+
+// ms 1 桁の表示用。us を ms に直す（表示だけであり、集計は us のまま）。
+inline double UsToMs(uint64_t us) { return static_cast<double>(us) / 1000.0; }
+
+// 集計 1 件分の [XR計測] 行を出す。窓と累計で共用する（prefix は空または「累計 」）。
+// B の内訳平均は B 標本があるときだけ意味を持ち、無いときは 0.0 を出す。
+inline void PrintLatencyLine(const char* prefix, const LatencyAgg& agg) {
+  const double aAvg = agg.aCount > 0 ? UsToMs(agg.aSumUs) / static_cast<double>(agg.aCount) : 0.0;
+  const double aMax = UsToMs(agg.aMaxUs);
+  const double bAvg = agg.bCount > 0 ? UsToMs(agg.bSumUs) / static_cast<double>(agg.bCount) : 0.0;
+  const double bMax = UsToMs(agg.bMaxUs);
+  const double bDen = agg.bCount > 0 ? static_cast<double>(agg.bCount) : 1.0;
+  const double bOffer = UsToMs(agg.bPaintToOfferSumUs) / bDen;
+  const double bCopy = UsToMs(agg.bOfferToCopySumUs) / bDen;
+  const double bSubmit = UsToMs(agg.bCopyToSubmitSumUs) / bDen;
+  const double efAvg = agg.endFrameCount > 0
+                          ? UsToMs(agg.endFrameSumUs) / static_cast<double>(agg.endFrameCount)
+                          : 0.0;
+  const double efMax = UsToMs(agg.endFrameMaxUs);
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "[XR計測] %s要求→初回提出 平均=%.1fms 最大=%.1fms n=%llu | "
+                "paint→初回提出 平均=%.1fms 最大=%.1fms n=%llu"
+                "（paint→受信=%.1f 受信→コピー=%.1f コピー→提出=%.1f）| "
+                "xrEndFrame 平均=%.1fms 最大=%.1fms n=%llu | "
+                "タグ欠測=%llu 未来=%llu 順序不正=%llu 重複skip=%llu",
+                prefix, aAvg, aMax, static_cast<unsigned long long>(agg.aCount), bAvg, bMax,
+                static_cast<unsigned long long>(agg.bCount), bOffer, bCopy, bSubmit, efAvg, efMax,
+                static_cast<unsigned long long>(agg.endFrameCount),
+                static_cast<unsigned long long>(agg.tagMissing),
+                static_cast<unsigned long long>(agg.tagFuture),
+                static_cast<unsigned long long>(agg.orderMismatch),
+                static_cast<unsigned long long>(agg.duplicateSkip));
+  Info("%s", buf);
+}
+
 }  // namespace
 
 int RunXrTransfer(const XrTransferOptions& options) {
@@ -874,6 +961,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
   // 台帳の掃除・TTL 失効では消さない（黒より古い絵を優先する）。世代進行では消す。
   RenderRecord holdRecord{};
   bool holdHasRecord = false;
+  // 要求→初回提出（A）・paint→初回提出（B）の計測状態。提出の挙動は変えず観測だけ行う。
+  // ownMeta は自前イメージ（OwnImage）に対応する最後の成功コピーの属性であり、
+  // 照合成功時に freshMeta へ、hold 複製成功時に holdMeta へ写す。
+  // 世代進行（再生成・loss・space 変更）では 3 つとも seq=0 に無効化する。
+  // lastCountedSeq は二重提出の重複判定用であり、世代進行でも保つ。
+  uint64_t imageSeq = 0;
+  ImageMeta ownMeta{};
+  ImageMeta freshMeta{};
+  ImageMeta holdMeta{};
+  uint64_t lastCountedSeq = 0;
+  LatencyAgg latencyWindow{};
+  LatencyAgg latencyTotal{};
+  uint64_t lastLatencyLogUs = NowUs();
+  // 5 秒窓のしきい値（意図的な値であり、仮置きではない。既存の 5 秒計測に合わせる）。
+  constexpr uint64_t kLatencyWindowUs = 5000000u;
   // pose 不一致診断の出力済み件数。先頭 5 件だけ詳報し、以後は集計のみにする。
   uint64_t mismatchLogCount = 0;
   // 再提出ログの前回出力時刻。毎フレーム出すと膨大になるため 1 秒に抑える。
@@ -954,6 +1056,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
     hasFresh = false;
     hold.Invalidate();
     holdHasRecord = false;
+    ownMeta.seq = 0;
+    freshMeta.seq = 0;
+    holdMeta.seq = 0;
     ++conn_epoch;
     ledger.AdvanceConnEpoch(conn_epoch);
     stats.connEpoch = conn_epoch;
@@ -997,6 +1102,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
       hasFresh = false;
       hold.Invalidate();
       holdHasRecord = false;
+      ownMeta.seq = 0;
+      freshMeta.seq = 0;
+      holdMeta.seq = 0;
       ++stats.spaceChanges;
       Info("reference space 変更を適用: spaceEpoch=%u（旧レコードを失効）", ledger.spaceEpoch());
     } else {
@@ -1049,6 +1157,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
               hasFresh = false;
               hold.Invalidate();
               holdHasRecord = false;
+              ownMeta.seq = 0;
+              freshMeta.seq = 0;
+              holdMeta.seq = 0;
               needs_rebuild = true;
               rebuild_attempts_left = kRebuildMaxAttempts;
               last_rebuild_try_us = 0;
@@ -1156,7 +1267,30 @@ int RunXrTransfer(const XrTransferOptions& options) {
         continue;
       }
       ++stats.offers;
+      // 計測は観測だけであり、受信・ACK の挙動は変えない。
+      // msg はバッチ内で上書きされ得るため、タグはこの反復で読み切る。
+      // ProcessOffer は成功・失敗を問わず OwnImage を作り直し得るため、
+      // 処理の前に pending の freshMeta の対応付けを切る。照合成功時に
+      // freshMeta = ownMeta で再関連付けされる。早期 return でも 0 のままなので
+      // 誤った標本を作らない。Offer を受信しないフレームでは触らない。
+      freshMeta.seq = 0;
+      const uint64_t offerRecvQpcUs = NowQpcUs();
+      const uint64_t offerPaintTagUs = OfferPaintQpcUs(msg);
       const uint32_t status = transfer.ProcessOffer(msg.handle, msg.width, msg.height);
+      if (status == kStatusOk || status == kStatusVerifyFailed) {
+        const uint64_t copyDoneQpcUs = NowQpcUs();
+        ++imageSeq;
+        ownMeta.seq = imageSeq;
+        ownMeta.paintTagUs = offerPaintTagUs;
+        ownMeta.offerRecvQpcUs = offerRecvQpcUs;
+        ownMeta.copyDoneQpcUs = copyDoneQpcUs;
+      } else {
+        // コピー失敗時は OwnImage と属性の対応を保証できない。
+        // 寸法変更時は自前イメージを作り直してからコピーするため、
+        // 失敗後の OwnImage が前回成功画像とは限らない。保守的に B の標本だけ落とし、
+        // 画像の受理・提出・棄却は変えない。次の成功コピーで再開する。
+        ownMeta.seq = 0;
+      }
       if (status == kStatusNoAck) {
         Error("GPU 完了未確認のため受付を停止して終了する（borrow への ACK なし）");
         pipeAlive = false;
@@ -1231,6 +1365,10 @@ int RunXrTransfer(const XrTransferOptions& options) {
     freshW = transfer.OwnWidth();
     freshH = transfer.OwnHeight();
     hasFresh = true;
+    // 照合成功時の画像は ownMeta（最後に成功したコピー）に対応する。
+    // TTL 失効等の棄却時は hasFresh=false のままで、ownMeta は保持する
+    // （OwnImage と一致しているため）。
+    freshMeta = ownMeta;
   };
 
   // XRループの例外（xrWaitFrame 等の CheckXr 失敗）は統計付きで終了する。
@@ -1468,13 +1606,21 @@ int RunXrTransfer(const XrTransferOptions& options) {
         hold.SaveFrom(transfer.OwnImage(), freshW, freshH);
         holdRecord = freshRecord;
         holdHasRecord = true;
+        holdMeta = freshMeta;
       } catch (const std::exception& e) {
         Warn("hold 複製に失敗したため再提出はできない: %s", e.what());
         hold.Invalidate();
         holdHasRecord = false;
+        holdMeta.seq = 0;
       }
     }
     bool fresh_failed = false;
+    // 計測は観測だけであり、提出・blit の挙動は変えない。候補の選択だけ行う。
+    ImageMeta submitCandidate{};
+    RenderRecord submitRec{};
+    bool haveSubmitCandidate = false;
+    uint64_t submitSteadyUs = 0;
+    uint64_t submitQpcUs = 0;
     if (rendered && hasFresh) {
       const uint64_t age = NowUs() - freshRecord.issuedUs;
       if (age <= ledger.maxAgeUs()) {
@@ -1484,6 +1630,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
                static_cast<unsigned long long>(freshRecord.renderId),
                static_cast<unsigned long long>(age));
           submit_layer = true;
+          submitCandidate = freshMeta;
+          submitRec = freshRecord;
+          haveSubmitCandidate = true;
           hasFresh = false;
         } catch (const std::exception& e) {
           Warn("blit に失敗したため空フレームで終える: %s", e.what());
@@ -1510,6 +1659,9 @@ int RunXrTransfer(const XrTransferOptions& options) {
         }
         submit_layer = true;
         is_resubmit = true;
+        submitCandidate = holdMeta;
+        submitRec = holdRecord;
+        haveSubmitCandidate = true;
       } catch (const std::exception& e) {
         Warn("再提出の blit に失敗したため空フレームで終える: %s", e.what());
       }
@@ -1525,7 +1677,100 @@ int RunXrTransfer(const XrTransferOptions& options) {
       end_info.layerCount = 0;
       ++stats.emptyFrames;
     }
+    // 計測終点は xrEndFrame 直前で取る（blit の 2 眼分コピーとフェンス待ちを含む）。
+    // 層の提出が確定した後・xrEndFrame 呼出しの直前であり、A/B の終点を一致させる。
+    // xrEndFrame の呼出し時間計測（efBegin/efEnd）はそのまま行う。
+    if (submit_layer && haveSubmitCandidate) {
+      submitSteadyUs = NowUs();
+      submitQpcUs = NowQpcUs();
+    }
+    // xrEndFrame の呼出し時間（QPC 前後差）を全フレームで別集計する。
+    // 失敗（例外）時は記録しない。計測のために画像を棄却・遅延しない。
+    const uint64_t efBeginQpcUs = NowQpcUs();
     CheckXr(xrEndFrame(session->handle(), &end_info), "xrEndFrame");
+    const uint64_t efEndQpcUs = NowQpcUs();
+    const uint64_t efUs = efEndQpcUs >= efBeginQpcUs ? efEndQpcUs - efBeginQpcUs : 0;
+    latencyWindow.endFrameCount += 1;
+    latencyWindow.endFrameSumUs += efUs;
+    if (efUs > latencyWindow.endFrameMaxUs) {
+      latencyWindow.endFrameMaxUs = efUs;
+    }
+    latencyTotal.endFrameCount += 1;
+    latencyTotal.endFrameSumUs += efUs;
+    if (efUs > latencyTotal.endFrameMaxUs) {
+      latencyTotal.endFrameMaxUs = efUs;
+    }
+    // 初回提出だけを標本にする。同じ seq の再提出は重複スキップに数える。
+    if (submit_layer && haveSubmitCandidate && submitCandidate.seq != 0) {
+      if (lastCountedSeq == submitCandidate.seq) {
+        latencyWindow.duplicateSkip += 1;
+        latencyTotal.duplicateSkip += 1;
+      } else {
+        lastCountedSeq = submitCandidate.seq;
+        const uint64_t reqToSubmitUs =
+            submitSteadyUs >= submitRec.issuedUs ? submitSteadyUs - submitRec.issuedUs : 0;
+        latencyWindow.aCount += 1;
+        latencyWindow.aSumUs += reqToSubmitUs;
+        if (reqToSubmitUs > latencyWindow.aMaxUs) {
+          latencyWindow.aMaxUs = reqToSubmitUs;
+        }
+        latencyTotal.aCount += 1;
+        latencyTotal.aSumUs += reqToSubmitUs;
+        if (reqToSubmitUs > latencyTotal.aMaxUs) {
+          latencyTotal.aMaxUs = reqToSubmitUs;
+        }
+        // QPC 標本は順序を検証し、欠測・未来・順序不正は B から外す（A には含める）。
+        // 負値の丸めはしない（順序違反として数える）。
+        const uint64_t tag = submitCandidate.paintTagUs;
+        const uint64_t recv = submitCandidate.offerRecvQpcUs;
+        const uint64_t copy = submitCandidate.copyDoneQpcUs;
+        if (tag == 0) {
+          latencyWindow.tagMissing += 1;
+          latencyTotal.tagMissing += 1;
+        } else if (tag > recv) {
+          latencyWindow.tagFuture += 1;
+          latencyTotal.tagFuture += 1;
+        } else if (!(recv <= copy && copy <= submitQpcUs && tag <= submitQpcUs)) {
+          latencyWindow.orderMismatch += 1;
+          latencyTotal.orderMismatch += 1;
+        } else {
+          const uint64_t paintToSubmitUs = submitQpcUs - tag;
+          const uint64_t paintToOfferUs = recv - tag;
+          const uint64_t offerToCopyUs = copy - recv;
+          const uint64_t copyToSubmitUs = submitQpcUs - copy;
+          latencyWindow.bCount += 1;
+          latencyWindow.bSumUs += paintToSubmitUs;
+          if (paintToSubmitUs > latencyWindow.bMaxUs) {
+            latencyWindow.bMaxUs = paintToSubmitUs;
+          }
+          latencyWindow.bPaintToOfferSumUs += paintToOfferUs;
+          latencyWindow.bOfferToCopySumUs += offerToCopyUs;
+          latencyWindow.bCopyToSubmitSumUs += copyToSubmitUs;
+          latencyTotal.bCount += 1;
+          latencyTotal.bSumUs += paintToSubmitUs;
+          if (paintToSubmitUs > latencyTotal.bMaxUs) {
+            latencyTotal.bMaxUs = paintToSubmitUs;
+          }
+          latencyTotal.bPaintToOfferSumUs += paintToOfferUs;
+          latencyTotal.bOfferToCopySumUs += offerToCopyUs;
+          latencyTotal.bCopyToSubmitSumUs += copyToSubmitUs;
+        }
+      }
+    }
+    // 5 秒窓の出力。初回提出が無くても xrEndFrame の窓は出す。
+    // 新規画像が止まり hold 再提出だけが続く間も、xrEndFrame 時間や重複 skip の
+    // 蓄積が見えないと停止時の切り分けに困るため、endFrame の標本でも出力する。
+    // セッション非実行中はフレーム自体が回らないため、従来どおりログは出ない。
+    {
+      const uint64_t nowLatUs = NowUs();
+      if (nowLatUs - lastLatencyLogUs >= kLatencyWindowUs) {
+        lastLatencyLogUs = nowLatUs;
+        if (latencyWindow.aCount > 0 || latencyWindow.endFrameCount > 0) {
+          PrintLatencyLine("", latencyWindow);
+        }
+        latencyWindow.Reset();
+      }
+    }
   }
   } catch (const std::exception& e) {
     Error("XRループの異常終了: %s（統計を出して終了する）", e.what());
@@ -1534,6 +1779,7 @@ int RunXrTransfer(const XrTransferOptions& options) {
   }
 
   stats.Print(ledger.stats(), input.stats());
+  PrintLatencyLine("累計 ", latencyTotal);
   Info("XR 中間破棄: %llu（最新優先のため Done のみ返した件数）",
        static_cast<unsigned long long>(droppedIntermediate));
   if (stats.submitLayers == 0 && stats.resubmits == 0) {

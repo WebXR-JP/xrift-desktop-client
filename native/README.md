@@ -49,7 +49,8 @@ native/build/windows/Release/xrift_native.exe --xr-transfer --pipe=\\.\pipe\<名
 - import 側イメージのレイアウト遷移は内容を破棄しない（GENERAL 経由の 2 段階遷移）。
 - 受理条件：renderId 照合・pose タグ一致・space 世代一致・TTL 内。棄却は `不明ID`・`pose不一致`・`space世代不一致`・`失効`に数える。
 - 受理画像は hold イメージへ GPU 複製し、新規受理が無いフレームでも同じ pose/FOV で再提出する。
-- 終了統計（`XR転送統計`・`入力統計`）を出した後、明示 teardown を済ませて `_Exit` で終わる（quick exit。理由は `../docs/architecture.md`）。
+- 終了統計（`XR転送統計`・`入力統計`）を出した後、計測の累計（`[XR計測] 累計 ...`）を 1 行出してから明示 teardown を済ませて `_Exit` で終わる（quick exit。理由は `../docs/architecture.md`）。
+- `[XR計測]` の累計行は要求→初回提出（A）と paint→初回提出（B）の平均・最大・件数、内訳（paint→受信・受信→コピー・コピー→提出）、`xrEndFrame` 時間、タグ欠測・未来・順序不正・重複 skip を載せる。main が `exe計測:` として `client.log` に中継する。
 
 ## ディレクトリ構成
 

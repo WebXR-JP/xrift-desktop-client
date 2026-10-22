@@ -274,10 +274,37 @@ static napi_value SteamVRManifest(napi_env env, napi_callback_info info) {
   return out;
 }
 
+// nowQpcUs()
+// onPaint() 入口の時刻源。QueryPerformanceCounter を整数 µs で返す。
+// QPC と steady_clock を混ぜないことが呼び出し側の契約である（docs/architecture.md「計測」）。
+static napi_value NowQpcUs(napi_env env, napi_callback_info info) {
+  (void)info;
+  static LARGE_INTEGER freq = {0};
+  static int freq_once = 0;
+  if (!freq_once) {
+    QueryPerformanceFrequency(&freq);
+    freq_once = 1;
+  }
+  LARGE_INTEGER now = {0};
+  QueryPerformanceCounter(&now);
+  uint64_t us = 0;
+  if (freq.QuadPart > 0) {
+    const double us_d =
+        (static_cast<double>(now.QuadPart) * 1000000.0) / static_cast<double>(freq.QuadPart);
+    us = static_cast<uint64_t>(us_d);
+  }
+  napi_value out;
+  napi_create_bigint_uint64(env, us, &out);
+  return out;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_value fn;
   napi_create_function(env, "duplicateHandle", NAPI_AUTO_LENGTH, DuplicateHandle, NULL, &fn);
   napi_set_named_property(env, exports, "duplicateHandle", fn);
+  napi_value fnQpc;
+  napi_create_function(env, "nowQpcUs", NAPI_AUTO_LENGTH, NowQpcUs, NULL, &fnQpc);
+  napi_set_named_property(env, exports, "nowQpcUs", fnQpc);
   napi_value fnManifest;
   napi_create_function(env, "steamvrManifest", NAPI_AUTO_LENGTH, SteamVRManifest, NULL, &fnManifest);
   napi_set_named_property(env, exports, "steamvrManifest", fnManifest);

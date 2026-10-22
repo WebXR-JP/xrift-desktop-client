@@ -9,6 +9,7 @@ SteamVR のマニフェスト登録・確認・解除（`steamvrManifest`）も�
 
 - `duplicateHandle(ntHandleBuffer, targetPid)` → `{ok:true, handle: BigInt}`。
   `handle` は複製先プロセスで有効なハンドル値。
+- `nowQpcUs()` → `BigInt`（QPC 時刻の整数 µs。`onPaint()` 入口の paint タグ用。QPC と steady_clock を混ぜない）。
 - `steamvrManifest(op, dllPath, manifestPath|appKey)` → 登録・確認・解除の結果。
   `client/scripts/register-steamvr.cjs` から使う。
 - 失敗時は例外ではなく `{ok:false, error, hresult}` を返す。
