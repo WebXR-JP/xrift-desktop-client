@@ -4,6 +4,8 @@ native/out/
 native/transfer-addon/build/
 client/dist/
 client/logs/
+# 検証時にログを退避したディレクトリ（リポジトリ外へ移すのが基本だが、誤混入を防ぐ）
+client/logs_backup*/
 client/dist-package/
 client/xrift.vrmanifest
 client/xrift-packaged.vrmanifest
