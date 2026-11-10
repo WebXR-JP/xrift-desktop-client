@@ -37,6 +37,8 @@ const world = opt('world')
 const startUrl = opt('url') ?? (world ? `${APP_ORIGIN}/world/${encodeURIComponent(world)}` : `${APP_ORIGIN}/`)
 const scale = opt('scale') ?? '1'
 const backend = opt('backend') ?? 'openvr'
+const stereoOffset = opt('stereo-offset') ?? '0'
+const stereoVertical = opt('stereo-vertical') ?? '0'
 const selftest = argv.includes('--selftest')
 const forceRender = selftest || argv.includes('--force-render')
 
@@ -179,7 +181,11 @@ async function createWindow() {
       // preload でネイティブアドオンを読むため（ページ側には Node を出さない）
       sandbox: false,
       backgroundThrottling: false,
-      additionalArguments: [`--xrift-scale=${scale}`, `--xrift-force-render=${forceRender ? 1 : 0}`, `--xrift-backend=${backend}`],
+      additionalArguments: [
+        `--xrift-scale=${scale}`, `--xrift-force-render=${forceRender ? 1 : 0}`,
+        `--xrift-backend=${backend}`, `--xrift-stereo-offset=${stereoOffset}`,
+        `--xrift-stereo-vertical=${stereoVertical}`,
+      ],
     },
   })
   Menu.setApplicationMenu(buildMenu(win))
@@ -200,7 +206,7 @@ async function createWindow() {
   })
   win.webContents.on('render-process-gone', (_e, d) => logLine(`[xrift] renderer gone: ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
   app.on('child-process-gone', (_e, d) => logLine(`[xrift] child process gone: ${d.type} ${d.reason} exitCode=${d.exitCode} (0x${(d.exitCode >>> 0).toString(16)})`))
-  logLine(`[xrift] start url=${startUrl} backend=${backend} scale=${scale}`)
+  logLine(`[xrift] start url=${startUrl} backend=${backend} scale=${scale} stereoOffset=${stereoOffset} stereoVertical=${stereoVertical}`)
   // VR の 1 フレームの持ち時間（72Hz なら 13.9ms）に収まるよう、ページと GPU のプロセスを優先度「高」にする
   const os = require('node:os')
   const boost = () => {

@@ -61,11 +61,12 @@ module.exports = function installXRiftWebXR() {
     return { pos: [m[12], m[13], m[14]], quat: [x, y, z, w] }
   }
   // WebGL（クリップ深度 [-1, 1]）用の非対称投影
-  function projectionFromFov(fov, near, far) {
+  function projectionFromFov(fov, near, far, horizontal, vertical) {
     const l = Math.tan(fov[0]), r = Math.tan(fov[1]), u = Math.tan(fov[2]), d = Math.tan(fov[3])
     const w = r - l, h = u - d
     const o = new Float32Array(16)
-    o[0] = 2 / w; o[5] = 2 / h; o[8] = (r + l) / w; o[9] = (u + d) / h; o[11] = -1
+    // 補正量は片眼の画像幅・高さに対する割合。NDC の幅・高さは 2。
+    o[0] = 2 / w; o[5] = 2 / h; o[8] = (r + l) / w - 2 * horizontal; o[9] = (u + d) / h - 2 * vertical; o[11] = -1
     if (far === Infinity) { o[10] = -1; o[14] = -2 * near } else { o[10] = -(far + near) / (far - near); o[14] = -(2 * far * near) / (far - near) }
     return o
   }
@@ -340,7 +341,15 @@ module.exports = function installXRiftWebXR() {
       const lv = B.locateViews()
       const input = B.syncInput()
       const near = this.renderState.depthNear, far = this.renderState.depthFar
-      const views = lv.views.map((v) => ({ matrix: quatToMat(v.position, v.orientation), projection: projectionFromFov(v.fov, near, far) }))
+      const horizontal = this._info.stereoOffset ?? 0
+      const vertical = this._info.stereoVertical ?? 0
+      const views = lv.views.map((v, i) => {
+        const sign = i === 0 ? 1 : -1
+        return {
+          matrix: quatToMat(v.position, v.orientation),
+          projection: projectionFromFov(v.fov, near, far, sign * horizontal, sign * vertical),
+        }
+      })
       const a = lv.views[0].position, b = lv.views[1].position
       const head = quatToMat([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2], lv.views[0].orientation)
       const hands = input.map((h) => ({
