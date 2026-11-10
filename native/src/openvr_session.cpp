@@ -20,6 +20,8 @@
 #include <napi.h>
 #include <openvr.h>
 
+#include "openvr_projection.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -265,13 +267,8 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
 
     for (int eye = 0; eye < 2; ++eye) {
       eyeToHead_[eye] = system_->GetEyeToHeadTransform(static_cast<vr::EVREye>(eye));
-      float l, r, t, b;
-      system_->GetProjectionRaw(static_cast<vr::EVREye>(eye), &l, &r, &t, &b);
-      // OpenVR は tan 値（上が負）。OpenXR 形式の角度（左, 右, 上, 下）にそろえる
-      fov_[eye][0] = std::atan(l);
-      fov_[eye][1] = std::atan(r);
-      fov_[eye][2] = std::atan(-t);
-      fov_[eye][3] = std::atan(-b);
+      fov_[eye] = OpenVrFovFromProjection(
+          system_->GetProjectionMatrix(static_cast<vr::EVREye>(eye), 0.1f, 100.0f));
     }
     return "";
   }
@@ -968,7 +965,7 @@ class VrSessionWrap : public Napi::ObjectWrap<VrSessionWrap> {
   vr::TrackedDevicePose_t poses_[vr::k_unMaxTrackedDeviceCount] = {};
   vr::HmdMatrix34_t hmdRing_[kRing] = {};
   vr::HmdMatrix34_t eyeToHead_[2] = {};
-  double fov_[2][4] = {};
+  std::array<double, 4> fov_[2] = {};
   vr::TrackedDeviceIndex_t hand_[2] = {vr::k_unTrackedDeviceIndexInvalid, vr::k_unTrackedDeviceIndexInvalid};
   uint64_t seq_ = 0;
   ID3D11Device* device_ = nullptr;
